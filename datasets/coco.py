@@ -120,7 +120,7 @@ def make_coco_transforms(image_set):
     raise ValueError(f'unknown {image_set}')
 
 
-def make_coco_transforms_square_div_64(image_set):
+def make_coco_transforms_square_div_64(image_set, encoder="vit_tiny"):
     """
     """
 
@@ -129,8 +129,12 @@ def make_coco_transforms_square_div_64(image_set):
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-
-    scales = [448, 512, 576, 640, 704, 768, 832, 896]
+    if "dinov2" in encoder:
+        scales = [392, 448, 504, 560, 616, 672, 728, 784]
+        square_scale = 560
+    else:
+        scales = [448, 512, 576, 640, 704, 768, 832, 896]
+        square_scale = 640
 
     if image_set == 'train':
         return T.Compose([
@@ -148,12 +152,12 @@ def make_coco_transforms_square_div_64(image_set):
 
     if image_set == 'val':
         return T.Compose([
-            T.SquareResize([640]),
+            T.SquareResize([square_scale]),
             normalize,
         ])
     if image_set == 'val_speed':
         return T.Compose([
-            T.SquareResize([640]),
+            T.SquareResize([square_scale]),
             normalize,
         ])
 
@@ -184,7 +188,7 @@ def build(image_set, args):
 
     
     if square_resize_div_64:
-        dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms_square_div_64(image_set))
+        dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms_square_div_64(image_set, args.encoder))
     else:
         dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set))
     return dataset
