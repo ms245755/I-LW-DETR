@@ -23,6 +23,7 @@ from collections import defaultdict, deque
 import datetime
 import pickle
 from typing import Optional, List
+import psutil
 
 import torch
 import torch.distributed as dist
@@ -218,7 +219,14 @@ class MetricLogger(object):
                 '{meters}',
                 'time: {time}',
                 'data: {data}',
-                'max mem: {memory:.0f}'
+                'max mem: {memory:.0f}',
+                'allocate mem: {allo_mem:.0f}',
+                'reserved mem: {reseved_mem:.0f}',
+                'total_mem_cpu: {total_mem_cpu:.0f}',
+                'used_mem_cpu: {used_mem_cpu:.0f}',
+                'free_mem_cpu: {free_mem_cpu:.0f}',
+                'avail_mem_cpu: {avail_mem_cpu:.0f}',
+                'mem_rss: {mem_rss:.0f}'
             ])
         else:
             log_msg = self.delimiter.join([
@@ -230,6 +238,8 @@ class MetricLogger(object):
                 'data: {data}'
             ])
         MB = 1024.0 * 1024.0
+        pid = os.getpid()
+        process_pid = psutil.Process(pid)
         for obj in iterable:
             data_time.update(time.time() - end)
             yield obj
@@ -237,12 +247,24 @@ class MetricLogger(object):
             if i % print_freq == 0 or i == len(iterable) - 1:
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                memory_info = psutil.virtual_memory()
+                memory_info_process = process_pid.memory_info()
                 if torch.cuda.is_available():
                     print(log_msg.format(
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time),
-                        memory=torch.cuda.max_memory_allocated() / MB))
+                        memory=torch.cuda.max_memory_allocated() / MB,
+                        allo_mem=torch.torch.cuda.memory_allocated() / MB,
+                        reseved_mem=torch.cuda.memory_reserved() / MB,
+                        total_mem_cpu=memory_info.total / MB,
+                        used_mem_cpu=memory_info.used / MB,
+                        free_mem_cpu=memory_info.free / MB,
+                        avail_mem_cpu=memory_info.available / MB,
+                        mem_rss=memory_info_process.rss / MB
+                        )
+                    )
+                        
                 else:
                     print(log_msg.format(
                         i, len(iterable), eta=eta_string,
