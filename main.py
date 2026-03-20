@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.amp import GradScaler
 
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
@@ -215,14 +216,10 @@ def main(args):
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, 
                                 weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    scaler = GradScaler('cuda') if torch.cuda.is_available() else None
 
-    print("before build dataset")
-    print(torch.cuda.memory_summary())
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
-
-    print("after build dataset")
-    print(torch.cuda.memory_summary())
 
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
@@ -242,8 +239,6 @@ def main(args):
 
     base_ds = get_coco_api_from_dataset(dataset_val)
 
-    print("before load checkpoint")
-    print(torch.cuda.memory_summary())
 
     if args.pretrain_weights is not None:
         checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
@@ -265,8 +260,6 @@ def main(args):
         if args.use_ema:
             del ema_m
             ema_m = ModelEma(model_without_ddp)
-    print("after load checkpoint")
-    print(torch.cuda.memory_summary())
     output_dir = Path(args.output_dir)
     
     #### this took a lot of gpu resource
@@ -277,8 +270,6 @@ def main(args):
         print(json.dumps(bm, indent=2))
         del benchmark_model
 
-    print("after is main process")
-    print(torch.cuda.memory_summary())
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
@@ -321,7 +312,6 @@ def main(args):
         print("Min DP = %.7f, Max DP = %.7f" % (min(schedules['dp']), max(schedules['dp'])))
 
     print("Start training")
-    print(torch.cuda.memory_summary())
     
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
@@ -337,9 +327,6 @@ def main(args):
         train_epoch_time = time.time() - epoch_start_time
         train_epoch_time_str = str(datetime.timedelta(seconds=int(train_epoch_time)))
         
-        # memory summary LTC
-        print(torch.cuda.memory_summary())
-
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -365,7 +352,6 @@ def main(args):
             model, criterion, postprocessors, data_loader_val, base_ds, device, args=args
         )
 
-        print(torch.cuda.memory_summary())
 
         map_regular = test_stats['coco_eval_bbox'][0]
         _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
@@ -383,14 +369,10 @@ def main(args):
                     'epoch': epoch,
                     'n_parameters': n_parameters}
         
-        print(torch.cuda.memory_summary())
-
         if args.use_ema:
             ema_test_stats, _ = evaluate(
                 ema_m.module, criterion, postprocessors, data_loader_val, base_ds, device, args=args
             )
-            print("After evaluating EMA model:")
-            print(torch.cuda.memory_summary())
 
             log_stats.update({f'ema_test_{k}': v for k,v in ema_test_stats.items()})
             map_ema = ema_test_stats['coco_eval_bbox'][0]
