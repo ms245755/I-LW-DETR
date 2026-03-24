@@ -71,7 +71,7 @@ def build_backbone(args):
             projector_scale=args_dict.get("projector_scale", "P4"),
             use_cls_token=args_dict.get("use_cls_token", False),
             layer_norm=args_dict.get("layer_norm", False),
-            freeze_encoder=args_dict.get("freeze_encoder", True), ### Cong: freeze the Backbone part
+            freeze_encoder=args_dict.get("freeze_encoder", False), ### Cong: freeze the Backbone part
         )
 
     model = Joiner(backbone, position_embedding)
