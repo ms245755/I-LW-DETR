@@ -2,12 +2,12 @@ model_name='lwdetr_tiny_coco'
 coco_path=$1
 
 python -u -m torch.distributed.launch \
-    --nproc_per_node=8 \
+    --nproc_per_node=4 \
     --use_env \
     main.py \
     --lr 1e-4 \
     --lr_encoder 1.5e-4 \
-    --batch_size 4 \
+    --batch_size 2 \
     --weight_decay 1e-4 \
     --epochs 60 \
     --lr_drop 60 \

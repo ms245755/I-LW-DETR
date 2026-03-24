@@ -1,9 +1,10 @@
+# bash scripts/lwdetr_tiny_coco_eval.sh coco_path[0] checkpoint[1]
 model_name='lwdetr_tiny_coco'
 coco_path=$1
 checkpoint=$2
 
 python -u -m torch.distributed.launch \
-    --nproc_per_node=8 \
+    --nproc_per_node=4 \
     --use_env \
     main.py \
     --batch_size 4 \

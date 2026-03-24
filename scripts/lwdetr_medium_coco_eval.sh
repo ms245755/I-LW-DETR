@@ -3,7 +3,7 @@ coco_path=$1
 checkpoint=$2
 
 python -u -m torch.distributed.launch \
-    --nproc_per_node=8 \
+    --nproc_per_node=4 \
     --use_env \
     main.py \
     --batch_size 2 \
