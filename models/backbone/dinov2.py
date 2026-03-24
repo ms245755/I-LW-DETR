@@ -65,7 +65,8 @@ class DinoV2(nn.Module):
     ):
         super().__init__()
 
-        name = f"facebook/dinov2-with-registers-{size}" if use_registers else f"facebook/dinov2-{size}"
+        # name = f"facebook/dinov2-with-registers-{size}" if use_registers else f"facebook/dinov2-{size}"
+        name = f"pretrain_weights/dinov2-registers-{size}" if use_registers else f"pretrain_weights/dinov2-{size}"
 
         self.shape = shape
         self.patch_size = patch_size
@@ -80,6 +81,7 @@ class DinoV2(nn.Module):
                 name,
                 out_features=[f"stage{i}" for i in out_feature_indexes],
                 return_dict=False,
+                local_files_only=True
             )
         else:
             window_block_indexes = set(range(out_feature_indexes[-1] + 1))
