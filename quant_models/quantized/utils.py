@@ -1,6 +1,5 @@
 from .layers import *
 import inspect
-import src.utils.torch as ptu
 
 
 def inject_real_quant_layers(module):
@@ -56,7 +55,7 @@ def inject_real_quant_layers(module):
             inject_real_quant_layers(child)
 
 
-def load_quant_params_from_checkpoint(model, checkpoint):
+def load_quant_params_from_checkpoint(model, checkpoint, device='cuda'):
     """
     Initialize QuantLinear and QuantConv2d layers in `model` with int32 weights,
     biases, and scaling loaded from checkpoint dictionary.
@@ -79,9 +78,9 @@ def load_quant_params_from_checkpoint(model, checkpoint):
             if isinstance(module, QuantLinear):
                 s_key = f"{name}.fc_scaling_factor"
                 if w_key in checkpoint and s_key in checkpoint:
-                    weight_int = checkpoint[w_key].to(ptu.device)
-                    bias_int = checkpoint[b_key].to(ptu.device) if b_key in checkpoint else None
-                    fc_scale = checkpoint[s_key].to(ptu.device)
+                    weight_int = checkpoint[w_key].to(device)
+                    bias_int = checkpoint[b_key].to(device) if b_key in checkpoint else None
+                    fc_scale = checkpoint[s_key].to(device)
                     module.set_quant_params(weight_int, bias_int, fc_scale)
                     print(f"Loaded QuantLinear params for {name}")
                 else:
@@ -90,9 +89,9 @@ def load_quant_params_from_checkpoint(model, checkpoint):
             elif isinstance(module, QuantConv2d):
                 s_key = f"{name}.conv_scaling_factor"
                 if w_key in checkpoint and s_key in checkpoint:
-                    weight_int = checkpoint[w_key].to(ptu.device)
-                    bias_int = checkpoint[b_key].to(ptu.device) if b_key in checkpoint else None
-                    conv_scale = checkpoint[s_key].to(ptu.device)
+                    weight_int = checkpoint[w_key].to(device)
+                    bias_int = checkpoint[b_key].to(device) if b_key in checkpoint else None
+                    conv_scale = checkpoint[s_key].to(device)
                     module.set_quant_params(weight_int, bias_int, conv_scale)
                     print(f"Loaded QuantConv2d params for {name}")
                 else:
@@ -101,7 +100,7 @@ def load_quant_params_from_checkpoint(model, checkpoint):
             elif isinstance(module, QuantMatMul):
                 s_key = f"{name}.act_scaling_factor"
                 if s_key in checkpoint:
-                    mul_scale = checkpoint[s_key].to(ptu.device)
+                    mul_scale = checkpoint[s_key].to(device)
                     module.set_quant_params(mul_scale)
                     print(f"Loaded QuantMatMul params for {name}")
                 else:
@@ -110,8 +109,8 @@ def load_quant_params_from_checkpoint(model, checkpoint):
             elif isinstance(module, QuantLayerNorm):
                 s_key = f"{name}.norm_scaling_factor"
                 if b_key in checkpoint and s_key in checkpoint:
-                    bias_int = checkpoint[b_key].to(ptu.device)
-                    norm_scale = checkpoint[s_key].to(ptu.device)
+                    bias_int = checkpoint[b_key].to(device)
+                    norm_scale = checkpoint[s_key].to(device)
                     module.set_quant_params(bias_int, norm_scale)
                     print(f"Loaded QuantLayerNorm params for {name}")
                 else:
@@ -120,7 +119,7 @@ def load_quant_params_from_checkpoint(model, checkpoint):
             elif isinstance(module, QuantSoftmax):
                 s_key = f"{name}.act_scaling_factor"
                 if s_key in checkpoint:
-                    softmax_scale = checkpoint[s_key].to(ptu.device)
+                    softmax_scale = checkpoint[s_key].to(device)
                     module.set_quant_params(softmax_scale)
                     print(f"Loaded QuantSoftmax params for {name}")
                 else:
@@ -129,7 +128,7 @@ def load_quant_params_from_checkpoint(model, checkpoint):
             elif isinstance(module, QuantGELU):
                 s_key = f"{name}.act_scaling_factor"
                 if s_key in checkpoint:
-                    softmax_scale = checkpoint[s_key].to(ptu.device)
+                    softmax_scale = checkpoint[s_key].to(device)
                     module.set_quant_params(softmax_scale)
                     print(f"Loaded QuantGELU params for {name}")
                 else:
@@ -139,7 +138,7 @@ def load_quant_params_from_checkpoint(model, checkpoint):
                 a_key = f"{name}.act_scaling_factor"
                 # o_key = f"{name}.out_scaling_factor"
                 if a_key in checkpoint:
-                    act_scale = checkpoint[a_key].to(ptu.device)
+                    act_scale = checkpoint[a_key].to(device)
                     # out_scale = checkpoint[o_key].to(ptu.device)
                     module.set_quant_params(act_scale)  # , out_scale)
                     print(f"Loaded QuantAct params for {name}")

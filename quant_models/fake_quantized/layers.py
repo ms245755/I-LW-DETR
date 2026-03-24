@@ -5,7 +5,10 @@ import torch.nn.functional as F
 torch.set_printoptions(precision=10)
 
 from .utils import *
-from src.utils.decorators import *
+from util.decorators import *
+from dataclasses import dataclass
+from transformers.utils import ModelOutput
+from typing import Optional, Tuple
 
 enable_assert = False
 enable_casting = False
@@ -652,3 +655,74 @@ class IViTSoftmax(nn.Module):
         exp_int = floor_ste.apply(exp_int * factor / (2.0 ** (self.m - self.output_bit + 1)))
 
         return exp_int * self.act_scaling_factor, self.act_scaling_factor
+
+class IViTLayerScale(nn.Module):
+    def __init__(
+        self,
+        config,
+        weight_bit=8,
+        quant_mode="symmetric",
+    ) -> None:
+        super().__init__()
+        self.lambda1 = nn.Parameter(
+            config.layerscale_value * torch.ones(config.hidden_size)
+        )
+        self.weight_bit = weight_bit
+        self.quant_mode = quant_mode
+
+        if self.quant_mode == "symmetric":
+            self.weight_function = SymmetricQuantFunction.apply
+        else:
+            raise ValueError("unknown quant mode: {}".format(self.quant_mode))
+
+        # --- buffers, same pattern as IViTLinear ---
+        self.register_buffer("scaling_factor", torch.ones(config.hidden_size))
+        self.register_buffer("lambda1_integer", torch.ones_like(self.lambda1))
+
+    def forward(self, hidden_state: torch.Tensor, act_scaling_factor=None):
+
+        # Step 1 — compute scale for lambda1 (per-channel, same as IViTLinear)
+        with torch.no_grad():
+            cur_min = self.lambda1.min()   # scalar — lambda1 is 1D so per-tensor is fine
+            cur_max = self.lambda1.max()
+
+            self.scaling_factor = symmetric_linear_quantization_params(
+                self.weight_bit,
+                cur_min.unsqueeze(0),
+                cur_max.unsqueeze(0),
+            )
+
+        # Step 2 — quantize lambda1 to integer
+        self.lambda1_integer = self.weight_function(
+            self.lambda1, self.weight_bit, self.scaling_factor, True
+        )
+
+        # Step 3 — quantize incoming hidden_state using act_scaling_factor
+        hidden_state_int = round_ste.apply(hidden_state / act_scaling_factor)
+
+        # Step 4 — integer multiply
+        # (batch, seq_len, hidden_size) * (hidden_size,)
+        out = hidden_state_int * self.lambda1_integer
+        out = round_ste.apply(out)
+
+        # Step 5 — rescale back to float
+        out_scaling_factor = self.scaling_factor * act_scaling_factor
+        out = out * out_scaling_factor
+
+        return out, out_scaling_factor
+    
+
+@dataclass
+class QuantizedBaseModelOutput(ModelOutput):
+    last_hidden_state: torch.Tensor = None
+    act_scaling_factor: torch.Tensor = None      # ← added
+    hidden_states: Optional[tuple] = None
+    attentions: Optional[tuple] = None
+
+@dataclass
+class QuantizedBaseModelOutputWithPooling(ModelOutput):
+    act_scaling_factor: torch.Tensor = None      # ← added
+    last_hidden_state: torch.FloatTensor = None
+    pooler_output: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None

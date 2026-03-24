@@ -36,6 +36,7 @@ from transformers.utils.backbone_utils import (
     BackboneMixin,
     get_aligned_output_features_output_indices,
 )
+from quant_models.fake_quantized.layers import *
 
 logger = logging.get_logger(__name__)
 
@@ -187,7 +188,7 @@ class WindowedDinov2WithRegistersConfig(BackboneConfigMixin, PretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
 
 
-class Dinov2WithRegistersPatchEmbeddings(nn.Module):
+class IDinov2WithRegistersPatchEmbeddings(nn.Module):
     """
     This class turns `pixel_values` of shape `(batch_size, num_channels, height, width)` into the initial
     `hidden_states` (patch embeddings) of shape `(batch_size, seq_length, hidden_size)` to be consumed by a
@@ -207,61 +208,219 @@ class Dinov2WithRegistersPatchEmbeddings(nn.Module):
         self.num_channels = num_channels
         self.num_patches = num_patches
 
-        self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+        self.projection = IViTConv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, act_scaling_factor=None) -> torch.Tensor:
         num_channels = pixel_values.shape[1]
         if num_channels != self.num_channels:
             raise ValueError(
                 "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
                 f" Expected {self.num_channels} but got {num_channels}."
             )
-        embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
-        return embeddings
+        embeddings, act_scaling_factor = self.projection(pixel_values, act_scaling_factor).flatten(2).transpose(1, 2)
+        return embeddings, act_scaling_factor
 
-
-class WindowedDinov2WithRegistersEmbeddings(nn.Module):
+class QuantizedTokenParameter(nn.Module):
     """
-    Construct the CLS token, mask token, register tokens, position and patch embeddings.
+    Drop-in replacement for nn.Parameter that supports integer quantization.
+    Used for cls_token, mask_token, register_tokens, position_embeddings.
     """
+    def __init__(self, *shape, weight_bit=8, quant_mode="symmetric"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(*shape))
+        self.weight_bit = weight_bit
 
+        if quant_mode == "symmetric":
+            self.weight_function = SymmetricQuantFunction.apply
+        else:
+            raise ValueError("unknown quant mode: {}".format(quant_mode))
+
+        self.register_buffer("scaling_factor", torch.ones(1))
+        self.register_buffer("weight_integer", torch.ones_like(self.weight))
+
+    def quantize(self):
+        """Compute scaling factor and quantize weight to integer."""
+        with torch.no_grad():
+            cur_min = self.weight.min()
+            cur_max = self.weight.max()
+            self.scaling_factor = symmetric_linear_quantization_params(
+                self.weight_bit,
+                cur_min.unsqueeze(0),
+                cur_max.unsqueeze(0),
+            )
+        self.weight_integer = self.weight_function(
+            self.weight, self.weight_bit, self.scaling_factor, True
+        )
+        return self.weight_integer, self.scaling_factor
+
+    def forward(self):
+        """Returns (weight_integer, scaling_factor)."""
+        return self.quantize()
+
+# class WindowedDinov2WithRegistersEmbeddings(nn.Module):
+#     """
+#     Construct the CLS token, mask token, register tokens, position and patch embeddings.
+#     """
+
+#     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+#         super().__init__()
+
+#         self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
+#         self.mask_token = nn.Parameter(torch.zeros(1, config.hidden_size))
+#         self.register_tokens = (
+#             nn.Parameter(torch.zeros(1, config.num_register_tokens, config.hidden_size))
+#             if config.num_register_tokens > 0
+#             else None
+#         )
+#         self.patch_embeddings = IDinov2WithRegistersPatchEmbeddings(config)
+#         num_patches = self.patch_embeddings.num_patches
+#         self.position_embeddings = nn.Parameter(torch.randn(1, num_patches + 1, config.hidden_size))
+#         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+#         self.patch_size = config.patch_size
+#         self.config = config
+
+#     def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
+#         """
+#         This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher
+#         resolution images. This implementation supports torch.jit tracing while maintaining backwards compatibility
+#         with the original implementation.
+
+#         Adapted from:
+#         - https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
+#         - https://github.com/facebookresearch/dinov2/blob/main/dinov2/models/vision_transformer.py
+#         """
+#         num_patches = embeddings.shape[1] - 1
+#         num_positions = self.position_embeddings.shape[1] - 1
+
+#         # Skip interpolation for matching dimensions (unless tracing)
+#         if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
+#             return self.position_embeddings
+
+#         # Handle class token and patch embeddings separately
+#         class_pos_embed = self.position_embeddings[:, 0]
+#         patch_pos_embed = self.position_embeddings[:, 1:]
+#         dim = embeddings.shape[-1]
+
+#         # Calculate new dimensions
+#         height = height // self.config.patch_size
+#         width = width // self.config.patch_size
+
+#         # Reshape for interpolation
+#         sqrt_num_positions = torch_int(num_positions**0.5)
+#         patch_pos_embed = patch_pos_embed.reshape(1, sqrt_num_positions, sqrt_num_positions, dim)
+#         patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
+
+#         # Store original dtype for restoration after interpolation
+#         target_dtype = patch_pos_embed.dtype
+
+#         # Interpolate at float32 precision
+#         patch_pos_embed = nn.functional.interpolate(
+#             patch_pos_embed.to(dtype=torch.float32),
+#             size=(torch_int(height), torch_int(width)),  # Explicit size instead of scale_factor
+#             mode="bicubic",
+#             align_corners=False,
+#             antialias=True,
+#         ).to(dtype=target_dtype)
+
+#         # Validate output dimensions if not tracing
+#         if not torch.jit.is_tracing():
+#             if int(height) != patch_pos_embed.shape[-2] or int(width) != patch_pos_embed.shape[-1]:
+#                 raise ValueError("Width or height does not match with the interpolated position embeddings")
+
+#         # Reshape back to original format
+#         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+
+#         # Combine class and patch embeddings
+#         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+
+#     def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+#         batch_size, _, height, width = pixel_values.shape
+#         target_dtype = self.patch_embeddings.projection.weight.dtype
+#         embeddings = self.patch_embeddings(pixel_values.to(dtype=target_dtype))
+
+#         if bool_masked_pos is not None:
+#             embeddings = torch.where(
+#                 bool_masked_pos.unsqueeze(-1), self.mask_token.to(embeddings.dtype).unsqueeze(0), embeddings
+#             )
+
+#         # add the [CLS] token to the embedded patch tokens
+#         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+#         embeddings = torch.cat((cls_tokens, embeddings), dim=1)
+
+#         # add positional encoding to each token
+#         embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
+
+#         if self.config.num_windows > 1:
+#             # reshape for windows
+#             num_h_patches = height // self.config.patch_size
+#             num_w_patches = width // self.config.patch_size
+#             cls_token_with_pos_embed = embeddings[:, :1]
+#             pixel_tokens_with_pos_embed = embeddings[:, 1:]
+#             pixel_tokens_with_pos_embed = pixel_tokens_with_pos_embed.view(batch_size, num_h_patches, num_w_patches, -1)
+#             num_w_patches_per_window = num_w_patches // self.config.num_windows
+#             num_h_patches_per_window = num_h_patches // self.config.num_windows
+#             num_windows = self.config.num_windows
+#             windowed_pixel_tokens = pixel_tokens_with_pos_embed.reshape(
+#                 batch_size * num_windows, num_h_patches_per_window, num_windows, num_w_patches_per_window, -1
+#             )
+#             windowed_pixel_tokens = windowed_pixel_tokens.permute(0, 2, 1, 3, 4)
+#             windowed_pixel_tokens = windowed_pixel_tokens.reshape(
+#                 batch_size * num_windows**2, num_h_patches_per_window * num_w_patches_per_window, -1
+#             )
+#             windowed_cls_token_with_pos_embed = cls_token_with_pos_embed.repeat(num_windows**2, 1, 1)
+#             embeddings = torch.cat((windowed_cls_token_with_pos_embed, windowed_pixel_tokens), dim=1)
+
+#         # add register tokens
+#         embeddings = (
+#             torch.cat(
+#                 (embeddings[:, :1], self.register_tokens.expand(embeddings.shape[0], -1, -1), embeddings[:, 1:]), dim=1
+#             )
+#             if self.config.num_register_tokens > 0
+#             else embeddings
+#         )
+
+#         embeddings = self.dropout(embeddings)
+
+#         return embeddings
+class IWindowedDinov2WithRegistersEmbeddings(nn.Module):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__()
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
-        self.mask_token = nn.Parameter(torch.zeros(1, config.hidden_size))
+        # ── quantized token parameters ─────────────────────────────────
+        self.cls_token = QuantizedTokenParameter(
+            1, 1, config.hidden_size
+        )
+        self.mask_token = QuantizedTokenParameter(
+            1, config.hidden_size
+        )
         self.register_tokens = (
-            nn.Parameter(torch.zeros(1, config.num_register_tokens, config.hidden_size))
+            QuantizedTokenParameter(
+                1, config.num_register_tokens, config.hidden_size
+            )
             if config.num_register_tokens > 0
             else None
         )
-        self.patch_embeddings = Dinov2WithRegistersPatchEmbeddings(config)
+        self.position_embeddings = QuantizedTokenParameter(
+            1, self.patch_embeddings.num_patches + 1, config.hidden_size
+        )
+
+        self.patch_embeddings = IDinov2WithRegistersPatchEmbeddings(config)
         num_patches = self.patch_embeddings.num_patches
-        self.position_embeddings = nn.Parameter(torch.randn(1, num_patches + 1, config.hidden_size))
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.patch_size = config.patch_size
         self.config = config
 
-    def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        """
-        This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher
-        resolution images. This implementation supports torch.jit tracing while maintaining backwards compatibility
-        with the original implementation.
-
-        Adapted from:
-        - https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
-        - https://github.com/facebookresearch/dinov2/blob/main/dinov2/models/vision_transformer.py
-        """
+    def interpolate_pos_encoding(self, embeddings, height, width):
+        # same as before but use weight directly for interpolation
         num_patches = embeddings.shape[1] - 1
-        num_positions = self.position_embeddings.shape[1] - 1
+        num_positions = self.position_embeddings.weight.shape[1] - 1
 
-        # Skip interpolation for matching dimensions (unless tracing)
         if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
-            return self.position_embeddings
+            return self.position_embeddings.weight      # ← .weight instead of direct access
 
-        # Handle class token and patch embeddings separately
-        class_pos_embed = self.position_embeddings[:, 0]
-        patch_pos_embed = self.position_embeddings[:, 1:]
+        class_pos_embed = self.position_embeddings.weight[:, 0]
+        patch_pos_embed = self.position_embeddings.weight[:, 1:]
+        # ... rest unchanged, just replace self.position_embeddings → self.position_embeddings.weight
         dim = embeddings.shape[-1]
 
         # Calculate new dimensions
@@ -296,30 +455,63 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
         # Combine class and patch embeddings
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
 
-    def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        bool_masked_pos: Optional[torch.Tensor] = None,
+    ):
         batch_size, _, height, width = pixel_values.shape
         target_dtype = self.patch_embeddings.projection.weight.dtype
-        embeddings = self.patch_embeddings(pixel_values.to(dtype=target_dtype))
 
+        # ── patch embeddings (already quantized via IDinov2WithRegistersPatchEmbeddings) ──
+        embeddings, act_scaling_factor = self.patch_embeddings(pixel_values.to(dtype=target_dtype))
+
+        # ── mask token ─────────────────────────────────────────────────
         if bool_masked_pos is not None:
+            mask_int, mask_scale = self.mask_token()
+            # unify scales before where()
+            out_scale = torch.max(act_scaling_factor, mask_scale)
+            embeddings_rescaled  = round_ste.apply(embeddings * (act_scaling_factor / out_scale))
+            mask_rescaled        = round_ste.apply(mask_int   * (mask_scale         / out_scale))
             embeddings = torch.where(
-                bool_masked_pos.unsqueeze(-1), self.mask_token.to(embeddings.dtype).unsqueeze(0), embeddings
+                bool_masked_pos.unsqueeze(-1),
+                mask_rescaled.to(embeddings.dtype).unsqueeze(0),
+                embeddings_rescaled,
             )
+            act_scaling_factor = out_scale
 
-        # add the [CLS] token to the embedded patch tokens
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        embeddings = torch.cat((cls_tokens, embeddings), dim=1)
+        # ── cls token ──────────────────────────────────────────────────
+        cls_int, cls_scale = self.cls_token()                          # (1, 1, hidden_size), s_cls
+        cls_tokens = cls_int.expand(batch_size, -1, -1)
 
-        # add positional encoding to each token
-        embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
+        # unify cls scale with embeddings scale before cat
+        out_scale = torch.max(act_scaling_factor, cls_scale)
+        cls_tokens  = round_ste.apply(cls_tokens  * (cls_scale          / out_scale))
+        embeddings  = round_ste.apply(embeddings  * (act_scaling_factor / out_scale))
+        embeddings  = torch.cat((cls_tokens, embeddings), dim=1)
+        act_scaling_factor = out_scale
 
+        # ── position embeddings ────────────────────────────────────────
+        pos_int, pos_scale = self.position_embeddings()                 # (1, num_patches+1, hidden_size)
+        pos_encoding = self.interpolate_pos_encoding(embeddings, height, width)
+        # interpolate_pos_encoding now returns integer tensor at pos_scale
+
+        out_scale = torch.max(act_scaling_factor, pos_scale)
+        embeddings    = round_ste.apply(embeddings   * (act_scaling_factor / out_scale))
+        pos_encoding  = round_ste.apply(pos_encoding * (pos_scale          / out_scale))
+        embeddings    = embeddings + pos_encoding
+        embeddings    = round_ste.apply(embeddings)
+        act_scaling_factor = out_scale
+
+        # ── windowed reshape (no scale change — pure reshape) ──────────
         if self.config.num_windows > 1:
-            # reshape for windows
             num_h_patches = height // self.config.patch_size
-            num_w_patches = width // self.config.patch_size
-            cls_token_with_pos_embed = embeddings[:, :1]
-            pixel_tokens_with_pos_embed = embeddings[:, 1:]
-            pixel_tokens_with_pos_embed = pixel_tokens_with_pos_embed.view(batch_size, num_h_patches, num_w_patches, -1)
+            num_w_patches = width  // self.config.patch_size
+            cls_token_with_pos_embed     = embeddings[:, :1]
+            pixel_tokens_with_pos_embed  = embeddings[:, 1:]
+            pixel_tokens_with_pos_embed  = pixel_tokens_with_pos_embed.view(
+                batch_size, num_h_patches, num_w_patches, -1
+            )
             num_w_patches_per_window = num_w_patches // self.config.num_windows
             num_h_patches_per_window = num_h_patches // self.config.num_windows
             num_windows = self.config.num_windows
@@ -330,24 +522,29 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
             windowed_pixel_tokens = windowed_pixel_tokens.reshape(
                 batch_size * num_windows**2, num_h_patches_per_window * num_w_patches_per_window, -1
             )
-            windowed_cls_token_with_pos_embed = cls_token_with_pos_embed.repeat(num_windows**2, 1, 1)
-            embeddings = torch.cat((windowed_cls_token_with_pos_embed, windowed_pixel_tokens), dim=1)
+            windowed_cls_token = cls_token_with_pos_embed.repeat(num_windows**2, 1, 1)
+            embeddings = torch.cat((windowed_cls_token, windowed_pixel_tokens), dim=1)
 
-        # add register tokens
-        embeddings = (
-            torch.cat(
-                (embeddings[:, :1], self.register_tokens.expand(embeddings.shape[0], -1, -1), embeddings[:, 1:]), dim=1
+        # ── register tokens ────────────────────────────────────────────
+        if self.config.num_register_tokens > 0:
+            reg_int, reg_scale = self.register_tokens()
+            reg_tokens = reg_int.expand(embeddings.shape[0], -1, -1)
+
+            out_scale = torch.max(act_scaling_factor, reg_scale)
+            embeddings  = round_ste.apply(embeddings * (act_scaling_factor / out_scale))
+            reg_tokens  = round_ste.apply(reg_tokens * (reg_scale          / out_scale))
+
+            embeddings = torch.cat(
+                (embeddings[:, :1], reg_tokens, embeddings[:, 1:]), dim=1
             )
-            if self.config.num_register_tokens > 0
-            else embeddings
-        )
+            embeddings = round_ste.apply(embeddings)
+            act_scaling_factor = out_scale
 
         embeddings = self.dropout(embeddings)
 
-        return embeddings
+        return embeddings, act_scaling_factor
 
-
-class Dinov2WithRegistersSelfAttention(nn.Module):
+class IDinov2WithRegistersSelfAttention(nn.Module):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
@@ -359,34 +556,48 @@ class Dinov2WithRegistersSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.scale = self.attention_head_size**-0.5
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.query = IViTLinear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.key = IViTLinear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.value = IViTLinear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+        self.matmul = IViTMatMul()
+        self.softmax = IViTSoftmax(output_bit=16, dim=-1)
 
     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(new_x_shape)
         return x.permute(0, 2, 1, 3)
-
+    
     def forward(
-        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False, act_scaling_factor=None
+    ):
         mixed_query_layer = self.query(hidden_states)
 
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        k, act_scaling_factor_k = self.key(hidden_states, act_scaling_factor)
+        q, act_scaling_factor_q = self.query(hidden_states, act_scaling_factor)
+        v, act_scaling_factor_v = self.value(hidden_states, act_scaling_factor)
+
+        key_layer = self.transpose_for_scores(k)
+        value_layer = self.transpose_for_scores(v)
+        query_layer = self.transpose_for_scores(q)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores, act_scaling_factor = self.matmul(
+            A = query_layer,
+            pre_act_scaling_factor_A = act_scaling_factor_q,
+            B = key_layer.transpose(-1, -2),
+            pre_act_scaling_factor_B = act_scaling_factor_k
+        )
 
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_scores = attention_scores * self.scale
+        act_scaling_factor = act_scaling_factor * self.scale
 
         # Normalize the attention scores to probabilities.
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        attention_probs, act_scaling_factor = self.softmax(x=attention_scores, act_scaling_factor=act_scaling_factor)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -394,20 +605,25 @@ class Dinov2WithRegistersSelfAttention(nn.Module):
 
         # Mask heads if we want to
         if head_mask is not None:
-            attention_probs = attention_probs * head_mask
+            attention_probs = attention_probs * head_mask # LTC: do we need to quantize?
 
-        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer, act_scaling_factor_context = self.matmul(
+            A = attention_probs,
+            pre_act_scaling_factor_A = act_scaling_factor,
+            B = v,
+            pre_act_scaling_factor_B = act_scaling_factor_v
+        )
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+        outputs = (context_layer, act_scaling_factor_context, attention_probs, act_scaling_factor) if output_attentions else (context_layer, act_scaling_factor_context)
 
         return outputs
 
 
-class Dinov2WithRegistersSdpaSelfAttention(Dinov2WithRegistersSelfAttention):
+class Dinov2WithRegistersSdpaSelfAttention(IDinov2WithRegistersSelfAttention):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__(config)
         self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
@@ -448,7 +664,7 @@ class Dinov2WithRegistersSdpaSelfAttention(Dinov2WithRegistersSelfAttention):
         return context_layer, None
 
 
-class Dinov2WithRegistersSelfOutput(nn.Module):
+class IDinov2WithRegistersSelfOutput(nn.Module):
     """
     The residual connection is defined in Dinov2WithRegistersLayer instead of here (as is the case with other models), due to the
     layernorm applied before each block.
@@ -456,21 +672,21 @@ class Dinov2WithRegistersSelfOutput(nn.Module):
 
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = IViTLinear(config.hidden_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor, act_scaling_factor=None) -> torch.Tensor:
+        hidden_states, act_scaling_factor = self.dense(hidden_states, act_scaling_factor)
         hidden_states = self.dropout(hidden_states)
 
-        return hidden_states
+        return hidden_states, act_scaling_factor
 
 
-class Dinov2WithRegistersAttention(nn.Module):
+class IDinov2WithRegistersAttention(nn.Module):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__()
-        self.attention = Dinov2WithRegistersSelfAttention(config)
-        self.output = Dinov2WithRegistersSelfOutput(config)
+        self.attention = IDinov2WithRegistersSelfAttention(config)
+        self.output = IDinov2WithRegistersSelfOutput(config)
         self.pruned_heads = set()
 
     def prune_heads(self, heads: Set[int]) -> None:
@@ -496,28 +712,29 @@ class Dinov2WithRegistersAttention(nn.Module):
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
-        self_outputs = self.attention(hidden_states, head_mask, output_attentions)
+        act_scaling_factor = None
+    ):
+        self_outputs = self.attention(hidden_states, head_mask, output_attentions, act_scaling_factor)
 
-        attention_output = self.output(self_outputs[0], hidden_states)
+        attention_output, act_scaling_factor = self.output(self_outputs[0], hidden_states, self_outputs[1])
 
-        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+        outputs = (attention_output, act_scaling_factor) + self_outputs[2:]  # add attentions if we output them
         return outputs
 
 
-class Dinov2WithRegistersSdpaAttention(Dinov2WithRegistersAttention):
+class Dinov2WithRegistersSdpaAttention(IDinov2WithRegistersAttention):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__(config)
         self.attention = Dinov2WithRegistersSdpaSelfAttention(config)
 
 
-class Dinov2WithRegistersLayerScale(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        self.lambda1 = nn.Parameter(config.layerscale_value * torch.ones(config.hidden_size))
+# class Dinov2WithRegistersLayerScale(nn.Module):
+#     def __init__(self, config) -> None:
+#         super().__init__()
+#         self.lambda1 = nn.Parameter(config.layerscale_value * torch.ones(config.hidden_size))
 
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        return hidden_state * self.lambda1
+#     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+#         return hidden_state * self.lambda1
 
 
 def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
@@ -554,23 +771,21 @@ class Dinov2WithRegistersDropPath(nn.Module):
         return "p={}".format(self.drop_prob)
 
 
-class Dinov2WithRegistersMLP(nn.Module):
+class IDinov2WithRegistersMLP(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         in_features = out_features = config.hidden_size
         hidden_features = int(config.hidden_size * config.mlp_ratio)
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
-        if isinstance(config.hidden_act, str):
-            self.activation = ACT2FN[config.hidden_act]
-        else:
-            self.activation = config.hidden_act
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+        self.fc1 = IViTLinear(in_features, hidden_features, bias=True)
+        
+        self.activation = ISegGELU(output_bit=8)
+        self.fc2 = IViTLinear(hidden_features, out_features, bias=True)
 
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        hidden_state = self.fc1(hidden_state)
-        hidden_state = self.activation(hidden_state)
-        hidden_state = self.fc2(hidden_state)
-        return hidden_state
+    def forward(self, hidden_state: torch.Tensor, act_scaling_factor = None):
+        hidden_state, act_scaling_factor = self.fc1(hidden_state, act_scaling_factor)
+        hidden_state, act_scaling_factor = self.activation(hidden_state, act_scaling_factor)
+        hidden_state, act_scaling_factor = self.fc2(hidden_state, act_scaling_factor)
+        return hidden_state, act_scaling_factor
 
 
 class Dinov2WithRegistersSwiGLUFFN(nn.Module):
@@ -591,12 +806,12 @@ class Dinov2WithRegistersSwiGLUFFN(nn.Module):
 
 
 DINOV2_WITH_REGISTERS_ATTENTION_CLASSES = {
-    "eager": Dinov2WithRegistersAttention,
+    "eager": IDinov2WithRegistersAttention,
     "sdpa": Dinov2WithRegistersSdpaAttention,
 }
 
 
-class WindowedDinov2WithRegistersLayer(nn.Module):
+class IWindowedDinov2WithRegistersLayer(nn.Module):
     """This corresponds to the Block class in the original implementation."""
 
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
@@ -604,9 +819,9 @@ class WindowedDinov2WithRegistersLayer(nn.Module):
 
         self.num_windows = config.num_windows
 
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm1 = IViTLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = DINOV2_WITH_REGISTERS_ATTENTION_CLASSES[config._attn_implementation](config)
-        self.layer_scale1 = Dinov2WithRegistersLayerScale(config)
+        self.layer_scale1 = IViTLayerScale(config)
         self.drop_path = (
             Dinov2WithRegistersDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
         )
@@ -616,8 +831,8 @@ class WindowedDinov2WithRegistersLayer(nn.Module):
         if config.use_swiglu_ffn:
             self.mlp = Dinov2WithRegistersSwiGLUFFN(config)
         else:
-            self.mlp = Dinov2WithRegistersMLP(config)
-        self.layer_scale2 = Dinov2WithRegistersLayerScale(config)
+            self.mlp = IDinov2WithRegistersMLP(config)
+        self.layer_scale2 = IViTLayerScale(config)
 
     def forward(
         self,
@@ -625,22 +840,29 @@ class WindowedDinov2WithRegistersLayer(nn.Module):
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         run_full_attention: bool = False,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        act_scaling_factor = None
+    ):
         assert head_mask is None, "head_mask is not supported for windowed attention"
         assert not output_attentions, "output_attentions is not supported for windowed attention"
         shortcut = hidden_states
+        shortcut_scale = act_scaling_factor
+
         if run_full_attention:
             # reshape x to remove windows
             B, HW, C = hidden_states.shape
             num_windows_squared = self.num_windows**2
             hidden_states = hidden_states.view(B // num_windows_squared, num_windows_squared * HW, C)
 
+        hidden_states, act_scaling_factor = self.norm1(hidden_states, act_scaling_factor)
+
         self_attention_outputs = self.attention(
-            self.norm1(hidden_states),  # in Dinov2WithRegisters, layernorm is applied before self-attention
+            hidden_states,  # in Dinov2WithRegisters, layernorm is applied before self-attention
             head_mask,
             output_attentions=output_attentions,
+            act_scaling_factor=act_scaling_factor
         )
         attention_output = self_attention_outputs[0]
+        act_scaling_factor = self_attention_outputs[1]
 
         if run_full_attention:
             # reshape x to add windows back
@@ -649,30 +871,44 @@ class WindowedDinov2WithRegistersLayer(nn.Module):
             # hidden_states = hidden_states.view(B * num_windows_squared, HW // num_windows_squared, C)
             attention_output = attention_output.view(B * num_windows_squared, HW // num_windows_squared, C)
 
-        attention_output = self.layer_scale1(attention_output)
-        outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
+        attention_output, act_scaling_factor = self.layer_scale1(attention_output, act_scaling_factor)
+        outputs = self_attention_outputs[2:]  # add self attentions if we output attention weights
 
         # first residual connection
-        hidden_states = self.drop_path(attention_output) + shortcut
+        # Need to make shortcut and attention_output in the same scale
+        out_scale = torch.max(shortcut_scale, act_scaling_factor)
+        shortcut_int   = round_ste.apply(shortcut          * (shortcut_scale    / out_scale))
+        attn_int       = round_ste.apply(attention_output  * (act_scaling_factor / out_scale))
+
+        hidden_states     = self.drop_path(attn_int) + shortcut_int   # integer add
+        hidden_states     = round_ste.apply(hidden_states)
+        act_scaling_factor = out_scale
 
         # in Dinov2WithRegisters, layernorm is also applied after self-attention
-        layer_output = self.norm2(hidden_states)
-        layer_output = self.mlp(layer_output)
-        layer_output = self.layer_scale2(layer_output)
+        layer_output, act_scaling_factor = self.norm2(hidden_states, act_scaling_factor)
+        layer_output, act_scaling_factor = self.mlp(layer_output, act_scaling_factor)
+        layer_output, act_scaling_factor = self.layer_scale2(layer_output, act_scaling_factor)
 
         # second residual connection
+        out_scale2 = torch.max(act_scaling_factor, out_scale)
+        hidden_int     = round_ste.apply(hidden_states * (out_scale      / out_scale2))
+        mlp_int        = round_ste.apply(layer_output  * (act_scaling_factor / out_scale2))
+
+        layer_output      = self.drop_path(mlp_int) + hidden_int          # integer add
+        layer_output      = round_ste.apply(layer_output)
+
         layer_output = self.drop_path(layer_output) + hidden_states
 
-        outputs = (layer_output,) + outputs
+        outputs = (layer_output, out_scale2) + outputs
 
         return outputs
 
 
-class WindowedDinov2WithRegistersEncoder(nn.Module):
+class IWindowedDinov2WithRegistersEncoder(nn.Module):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([WindowedDinov2WithRegistersLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([IWindowedDinov2WithRegistersLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = config.gradient_checkpointing
 
     def forward(
@@ -682,13 +918,14 @@ class WindowedDinov2WithRegistersEncoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        act_scaling_factor = None,
     ) -> Union[tuple, BaseModelOutput]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+                all_hidden_states = all_hidden_states + ((hidden_states, act_scaling_factor), )
 
             if i > int(self.config.out_features[-1][5:]):
                 # early stop if we have reached the last output feature
@@ -705,28 +942,31 @@ class WindowedDinov2WithRegistersEncoder(nn.Module):
                     layer_head_mask,
                     output_attentions,
                     run_full_attention,
+                    act_scaling_factor
                 )
             else:
-                layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions, run_full_attention)
+                layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions, run_full_attention, act_scaling_factor)
 
             hidden_states = layer_outputs[0]
+            act_scaling_factor = layer_outputs[1]
 
             if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+                all_self_attentions = all_self_attentions + (layer_outputs[2:],)
 
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
+            all_hidden_states = all_hidden_states + ((hidden_states, act_scaling_factor),)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
-        return BaseModelOutput(
+            return tuple(v for v in [hidden_states, act_scaling_factor, all_hidden_states, all_self_attentions] if v is not None)
+        return QuantizedBaseModelOutput(
             last_hidden_state=hidden_states,
+            act_scaling_factor=act_scaling_factor,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
 
 
-class WindowedDinov2WithRegistersPreTrainedModel(PreTrainedModel):
+class IWindowedDinov2WithRegistersPreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
@@ -741,7 +981,7 @@ class WindowedDinov2WithRegistersPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module: Union[nn.Linear, nn.Conv2d, nn.LayerNorm]) -> None:
         """Initialize the weights"""
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
+        if isinstance(module, (nn.Linear, nn.Conv2d, IViTLinear, IViTConv2d)):
             # Upcast the input in `fp32` and cast it back to desired `dtype` to avoid
             # `trunc_normal_cpu` not implemented in `half` issues
             module.weight.data = nn.init.trunc_normal_(
@@ -749,10 +989,10 @@ class WindowedDinov2WithRegistersPreTrainedModel(PreTrainedModel):
             ).to(module.weight.dtype)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, (nn.LayerNorm, IViTLayerNorm)):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-        elif isinstance(module, WindowedDinov2WithRegistersEmbeddings):
+        elif isinstance(module, IWindowedDinov2WithRegistersEmbeddings):
             module.position_embeddings.data = nn.init.trunc_normal_(
                 module.position_embeddings.data.to(torch.float32),
                 mean=0.0,
@@ -808,20 +1048,22 @@ DINOV2_WITH_REGISTERS_BASE_INPUTS_DOCSTRING = r"""
     "The bare Dinov2WithRegisters Model transformer outputting raw hidden-states without any specific head on top.",
     DINOV2_WITH_REGISTERS_START_DOCSTRING,
 )
-class WindowedDinov2WithRegistersModel(WindowedDinov2WithRegistersPreTrainedModel):
+class IWindowedDinov2WithRegistersModel(IWindowedDinov2WithRegistersPreTrainedModel):
     def __init__(self, config: WindowedDinov2WithRegistersConfig):
         super().__init__(config)
         self.config = config
 
-        self.embeddings = WindowedDinov2WithRegistersEmbeddings(config)
-        self.encoder = WindowedDinov2WithRegistersEncoder(config)
+        self.qact_input = IViTAct()
 
-        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.embeddings = IWindowedDinov2WithRegistersEmbeddings(config)
+        self.encoder = IWindowedDinov2WithRegistersEncoder(config)
+
+        self.layernorm = IViTLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self) -> Dinov2WithRegistersPatchEmbeddings:
+    def get_input_embeddings(self) -> IDinov2WithRegistersPatchEmbeddings:
         return self.embeddings.patch_embeddings
 
     def _prune_heads(self, heads_to_prune: Dict[int, List[int]]) -> None:
@@ -883,7 +1125,9 @@ class WindowedDinov2WithRegistersModel(WindowedDinov2WithRegistersPreTrainedMode
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
-        embedding_output = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos)
+        pixel_values, act_scaling_factor = self.qact_input(x=pixel_values, act_scaling_factor=None)
+
+        embedding_output, act_scaling_factor = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos, act_scaling_factor=act_scaling_factor)
 
         encoder_outputs = self.encoder(
             embedding_output,
@@ -891,17 +1135,20 @@ class WindowedDinov2WithRegistersModel(WindowedDinov2WithRegistersPreTrainedMode
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            act_scaling_factor=act_scaling_factor
         )
         sequence_output = encoder_outputs[0]
-        sequence_output = self.layernorm(sequence_output)
+        act_scaling_factor = encoder_outputs[1]
+        sequence_output, act_scaling_factor = self.layernorm(sequence_output, act_scaling_factor)
         pooled_output = sequence_output[:, 0, :]
 
         if not return_dict:
-            head_outputs = (sequence_output, pooled_output)
-            return head_outputs + encoder_outputs[1:]
+            head_outputs = (sequence_output, act_scaling_factor, pooled_output, act_scaling_factor)
+            return head_outputs + encoder_outputs[2:]
 
-        return BaseModelOutputWithPooling(
+        return QuantizedBaseModelOutputWithPooling(
             last_hidden_state=sequence_output,
+            act_scaling_factor=act_scaling_factor,
             pooler_output=pooled_output,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
@@ -938,16 +1185,16 @@ DINOV2_WITH_REGISTERS_INPUTS_DOCSTRING = r"""
     """,
     DINOV2_WITH_REGISTERS_START_DOCSTRING,
 )
-class WindowedDinov2WithRegistersForImageClassification(WindowedDinov2WithRegistersPreTrainedModel):
+class WindowedDinov2WithRegistersForImageClassification(IWindowedDinov2WithRegistersPreTrainedModel):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__(config)
 
         self.num_labels = config.num_labels
-        self.dinov2_with_registers = WindowedDinov2WithRegistersModel(config)
+        self.dinov2_with_registers = IWindowedDinov2WithRegistersModel(config)
 
         # Classifier head
         self.classifier = (
-            nn.Linear(config.hidden_size * 2, config.num_labels) if config.num_labels > 0 else nn.Identity()
+            IViTLinear(config.hidden_size * 2, config.num_labels) if config.num_labels > 0 else nn.Identity()
         )
 
         # Initialize weights and apply final processing
@@ -1059,13 +1306,16 @@ class WindowedDinov2WithRegistersForImageClassification(WindowedDinov2WithRegist
     """,
     DINOV2_WITH_REGISTERS_START_DOCSTRING,
 )
-class WindowedDinov2WithRegistersBackbone(WindowedDinov2WithRegistersPreTrainedModel, BackboneMixin):
+class WindowedDinov2WithRegistersBackbone(IWindowedDinov2WithRegistersPreTrainedModel, BackboneMixin):
     def __init__(self, config: WindowedDinov2WithRegistersConfig):
         super().__init__(config)
         super()._init_backbone(config)
         self.num_features = [config.hidden_size for _ in range(config.num_hidden_layers + 1)]
-        self.embeddings = WindowedDinov2WithRegistersEmbeddings(config)
-        self.encoder = WindowedDinov2WithRegistersEncoder(config)
+        
+        self.qact_input = IViTAct()
+
+        self.embeddings = IWindowedDinov2WithRegistersEmbeddings(config)
+        self.encoder = IWindowedDinov2WithRegistersEncoder(config)
 
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
@@ -1074,7 +1324,7 @@ class WindowedDinov2WithRegistersBackbone(WindowedDinov2WithRegistersPreTrainedM
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self) -> Dinov2WithRegistersPatchEmbeddings:
+    def get_input_embeddings(self) -> IDinov2WithRegistersPatchEmbeddings:
         return self.embeddings.patch_embeddings
 
     @add_start_docstrings_to_model_forward(DINOV2_WITH_REGISTERS_INPUTS_DOCSTRING)
@@ -1120,19 +1370,26 @@ class WindowedDinov2WithRegistersBackbone(WindowedDinov2WithRegistersPreTrainedM
         )
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
 
-        embedding_output = self.embeddings(pixel_values)
+        pixel_values, act_scaling_factor = self.qact_input(x=pixel_values, act_scaling_factor=None)
+
+        embedding_output, act_scaling_factor = self.embeddings(pixel_values, act_scaling_factor=act_scaling_factor)
 
         outputs = self.encoder(
-            embedding_output, output_hidden_states=True, output_attentions=output_attentions, return_dict=return_dict
+            embedding_output, output_hidden_states=True, output_attentions=output_attentions, return_dict=return_dict, act_scaling_factor=act_scaling_factor
         )
 
-        hidden_states = outputs.hidden_states if return_dict else outputs[1]
+        # sequence_output = encoder_outputs[0]
+        # act_scaling_factor = encoder_outputs[1]
+        # sequence_output, act_scaling_factor = self.layernorm(sequence_output, act_scaling_factor)
+        # pooled_output = sequence_output[:, 0, :]
+
+        hidden_states = outputs.hidden_states if return_dict else outputs[2]
 
         feature_maps = ()
-        for stage, hidden_state in zip(self.stage_names, hidden_states):
+        for stage, (hidden_state, act_scaling_factor_stage) in zip(self.stage_names, hidden_states):
             if stage in self.out_features:
                 if self.config.apply_layernorm:
-                    hidden_state = self.layernorm(hidden_state)
+                    hidden_state, act_scaling_factor_stage = self.layernorm(hidden_state, act_scaling_factor_stage)
                 if self.config.reshape_hidden_states:
                     hidden_state = hidden_state[:, self.num_register_tokens + 1 :]
                     # this was actually a bug in the original implementation that we copied here,
@@ -1162,13 +1419,13 @@ class WindowedDinov2WithRegistersBackbone(WindowedDinov2WithRegistersPreTrainedM
                     hidden_state = hidden_state.reshape(batch_size, num_h_patches, num_w_patches, -1)
                     hidden_state = hidden_state.permute(0, 3, 1, 2).contiguous()
 
-                feature_maps += (hidden_state,)
+                feature_maps += ((hidden_state, act_scaling_factor_stage),)
 
         if not return_dict:
             if output_hidden_states:
-                output = (feature_maps,) + outputs[1:]
-            else:
                 output = (feature_maps,) + outputs[2:]
+            else:
+                output = (feature_maps,) + outputs[3:]
             return output
 
         return BackboneOutput(
