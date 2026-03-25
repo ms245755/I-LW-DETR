@@ -14,8 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoBackbone
 
-from models.backbone.dinov2_with_windowed_attn import (
-    WindowedDinov2WithRegistersBackbone,
+from quant_models.quant_backbone.quant_dinov2_with_windowed_attn import (
+    IWindowedDinov2WithRegistersBackbone,
     WindowedDinov2WithRegistersConfig,
 )
 
