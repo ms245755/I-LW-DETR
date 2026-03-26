@@ -454,8 +454,57 @@ class IViTLayerNorm(nn.LayerNorm):
         self.norm_scaling_factor = act_scaling_factor
 
         return x, act_scaling_factor
+    
+@track_init_args
+class IViTLayerNormChannelFirst(nn.LayerNorm):
+    def __init__(self, normalized_shape, eps=1e-6, elementwise_affine=True):
+        super(IViTLayerNormChannelFirst, self).__init__(
+            normalized_shape=normalized_shape, eps=eps, elementwise_affine=elementwise_affine
+        )
+        self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(normalized_shape)))
+        self.register_buffer("bias_integer", nn.Parameter(torch.ones_like(self.bias)))
+        self.register_buffer(
+            "base_act_scaling_factor",
+            nn.Parameter(torch.sqrt(torch.tensor(normalized_shape, dtype=torch.float)) / 2.0**30),
+        )
+    def fix(self):
+        pass
 
+    def unfix(self):
+        pass
+    
+    def forward(self, x, act_scaling_factor=None):
+        # Normalization: computes mean and variance(std)
+        x_int = round_ste.apply(x / act_scaling_factor)
+        mean_int = floor_ste.apply(x_int.sum(dim=1, keepdim=True) / x_int.shape[1])
+        y_int = x_int - mean_int
+        y_sq_int = y_int**2
+        var_int = torch.sum(y_sq_int, axis=1, keepdim=True)
 
+        # Integer Iteration
+        k = 2.0**16
+        for _ in range(10):
+            k_1 = floor_ste.apply((k + floor_ste.apply(var_int / k)) / 2)
+            k = k_1
+        std_int = k
+
+        exp = floor_ste.apply((2.0**31 - 1) / std_int)
+        factor = exp
+        y_int = floor_ste.apply(y_int * factor / 2)
+
+        # scaling and shifting
+        bias = self.bias / self.weight
+        bias_int = floor_ste.apply(bias / self.base_act_scaling_factor)
+
+        self.bias_integer = bias_int
+
+        y_int = y_int + bias_int[:, None, None]
+        act_scaling_factor = self.base_act_scaling_factor * self.weight[:, None, None]
+        x = y_int * act_scaling_factor
+        self.norm_scaling_factor = act_scaling_factor
+
+        return x, act_scaling_factor
+    
 class IViTGELU(nn.Module):
     """
     Implementation of ShiftGELU

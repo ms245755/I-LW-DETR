@@ -456,6 +456,65 @@ class QuantLayerNorm(nn.Module):
 
         return out, self.norm_scaling_factor
 
+class QuantLayerNormChannelFirst(nn.Module):
+    """
+    Inference-only integer LayerNorm using integer arithmetic and static quantization.
+    All internal ops are int32, except for initial input scaling and final output scaling.
+    """
+
+    def __init__(self, normalized_shape):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+
+        # Buffers to hold quantization parameters
+        self.register_buffer("norm_scaling_factor", None)  # Final output scale (float32)
+        self.register_buffer("bias_integer", None)  # Quantized bias (int32)
+
+    def set_quant_params(self, bias_int, scale):
+        """
+        Set the quantized bias and final output scaling factor.
+        """
+        self.bias_integer = bias_int  # shape: (..., normalized_shape)
+        self.norm_scaling_factor = scale  # shape: (..., normalized_shape)
+
+    def forward(self, x, act_scaling_factor):
+        """
+        Args:
+            x: input tensor (float32, assumed quantized: x = x_int * act_scaling_factor)
+            act_scaling_factor: per-channel input scale
+        Returns:
+            (dequantized output tensor, output scale)
+        """
+
+        # Convert input to int32 (simulating quantized input)
+        x_int = (x / act_scaling_factor).to(torch.int32)
+
+        # Compute integer mean across last dimension
+        mean_int = x_int.sum(dim=1, keepdim=True) // x_int.shape[1]
+        y_int = x_int - mean_int  # Center input
+
+        # Integer variance (sum of squared deviations)
+        y_sq_int = y_int * y_int
+        var_int = y_sq_int.sum(dim=1, keepdim=True)
+
+        # Approximate reciprocal std using Newton-Raphson + bitshifting
+        k = torch.full_like(var_int, 1 << 16)  # Initial guess (2^16)
+        for _ in range(10):
+            k = (k + (var_int // k)) >> 1  # Iteratively refine k ≈ sqrt(var)
+
+        std_int = k  # Approximate std (int32)
+
+        # Scale factor: use fixed-point ratio to normalize
+        factor = ((1 << 31) - 1) // std_int  # Fixed-point scale to normalize
+        y_scaled_int = (y_int * factor) >> 1  # Normalize and shrink range
+
+        # Add integer bias
+        y_scaled_int = y_scaled_int + self.bias_integer[:, None, None]
+
+        # Dequantize output using learned float scale
+        out = y_scaled_int * self.norm_scaling_factor  # FLOAT OP
+
+        return out, self.norm_scaling_factor
 
 class QuantSoftmax(nn.Module):
     """

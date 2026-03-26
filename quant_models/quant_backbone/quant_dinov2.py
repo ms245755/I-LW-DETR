@@ -49,7 +49,7 @@ def get_config(size, use_registers):
     return dino_config
 
 
-class DinoV2(nn.Module):
+class IDinoV2(nn.Module):
     def __init__(
         self,
         shape=(640, 640),
@@ -119,12 +119,12 @@ class DinoV2(nn.Module):
                     gradient_checkpointing=gradient_checkpointing,
                 )
             self.encoder = (
-                WindowedDinov2WithRegistersBackbone.from_pretrained(
+                IWindowedDinov2WithRegistersBackbone.from_pretrained(
                     name,
                     config=windowed_dino_config,
                 )
                 if load_dinov2_weights
-                else WindowedDinov2WithRegistersBackbone(windowed_dino_config)
+                else IWindowedDinov2WithRegistersBackbone(windowed_dino_config)
             )
 
         self._out_feature_channels = [size_to_width[size]] * len(out_feature_indexes)
@@ -199,7 +199,7 @@ class DinoV2(nn.Module):
 
 
 if __name__ == "__main__":
-    model = DinoV2()
+    model = IDinoV2()
     model.export()
     x = torch.randn(1, 3, 640, 640)
     print(model(x))
