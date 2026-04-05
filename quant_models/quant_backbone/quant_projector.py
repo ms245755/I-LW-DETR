@@ -84,8 +84,8 @@ class IBottleneck(nn.Module):
 
         if self.add:
             out_scale = torch.max(act_scaling_factor, act_scaling_factor_short)
-            x_short     = round_ste.apply(x_short * (act_scaling_factor_short / out_scale))
-            x        = round_ste.apply(x  * (act_scaling_factor / out_scale))
+            x_short   = round_ste.apply(x_short / out_scale)
+            x        = round_ste.apply(x  / out_scale)
             x = (x + x_short) * out_scale
             act_scaling_factor = out_scale
 
@@ -115,17 +115,18 @@ class IC2f(nn.Module):
             y.append(x_out)
             act_scaling_factors_list.append(scale)
         
-        out_scale = torch.max(torch.tensor(act_scaling_factors_list))
+        out_scale = torch.stack(act_scaling_factors_list).max()
         for i in range(len(act_scaling_factors_list)):
-            y[i] = round_ste.apply(y[i] * (act_scaling_factors_list[i] / out_scale))
+            y[i] = round_ste.apply(y[i] / act_scaling_factors_list[i])
 
         concatenated_output = torch.cat(y, 1)
+        concatenated_output = concatenated_output * out_scale
         final_output, act_scaling_factor_final = self.cv2(concatenated_output, out_scale)
 
         return final_output, act_scaling_factor_final
 
 
-class MultiScaleProjector(nn.Module):
+class IMultiScaleProjector(nn.Module):
     """
     This module implements MultiScaleProjector in :paper:`lwdetr`.
     It creates pyramid features built on top of the input feature map.
@@ -146,7 +147,7 @@ class MultiScaleProjector(nn.Module):
             scale_factors (list[float]): list of scaling factors to upsample or downsample
                 the input features for creating pyramid features.
         """
-        super(MultiScaleProjector, self).__init__()
+        super(IMultiScaleProjector, self).__init__()
 
         self.scale_factors = scale_factors
 
@@ -155,19 +156,20 @@ class MultiScaleProjector(nn.Module):
         # use_bias = norm == ""
         use_bias = False
         self.use_extra_pool = False
+        self.qact_post_fuse = IViTAct()
         for scale in scale_factors:
             stages_sampling.append([])
             for in_dim in in_channels:
                 out_dim = in_dim
                 if scale == 4.0:
                     layers = [
-                        nn.ConvTranspose2d(in_dim, in_dim // 2, kernel_size=2, stride=2),
+                        IViTConvTranspose2d(in_dim, in_dim // 2, kernel_size=2, stride=2),
                         IViTAct(),
                         get_norm('LN', in_dim // 2),
                         IViTAct(),
-                        nn.GELU(),
+                        IViTGELU,
                         IViTAct(),
-                        nn.ConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
+                        IViTConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
                         IViTAct(),
                     ]
                     out_dim = in_dim // 4
@@ -176,12 +178,12 @@ class MultiScaleProjector(nn.Module):
                     if in_dim > 512:
                         layers = [
                             IConvX(in_dim, in_dim // 2, kernel=1),
-                            nn.ConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
+                            IViTConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
                             IViTAct(),
                         ]
                         out_dim = in_dim // 4
                     else:
-                        layers = [nn.ConvTranspose2d(in_dim, in_dim // 2, kernel_size=2, stride=2), IViTAct(),]
+                        layers = [IViTConvTranspose2d(in_dim, in_dim // 2, kernel_size=2, stride=2), IViTAct(),]
                         out_dim = in_dim // 2
                 elif scale == 1.0:
                     layers = []
@@ -230,10 +232,28 @@ class MultiScaleProjector(nn.Module):
             for j, stage_sampling in enumerate(self.stages_sampling[i]):
                 feat_fuse.append(stage_sampling(x[j]))
             if len(feat_fuse) > 1:
-                feat_fuse = torch.cat(feat_fuse, dim=1)
+                # need to bring all feature layer to one scale
+                # max_scale = torch.stack([fs for (_, fs) in feat_fuse]).max()
+                # feat_list = []
+                # for feat, feat_scale in feat_fuse:
+                #     feat_list.append(round_ste.apply(feat / feat_scale))
+
+                # feat_fuse = torch.cat(feat_list, dim=1)
+                # feat_fuse = feat_fuse * max_scale
+                # feat_fuse, max_scale = self.qact_post_fuse(feat_fuse, max_scale)
+                feat_cat = torch.cat([feat for (feat, _) in feat_fuse], dim=1)
+                # 2) concat scales in channel order
+                scale_cat = torch.cat([fs.expand(feat.shape[1]) for (feat, fs) in feat_fuse], dim=0)  # should be length == C_total
+                # print(feat_cat.shape)
+                # print(scale_cat.shape)
+
+                feat_fuse, max_scale = self.qact_post_fuse(feat_cat, scale_cat)
             else:
+                max_scale = feat_fuse[0][1]
                 feat_fuse = feat_fuse[0][0]
-            feat, scale = feat_fuse
+            feat = feat_fuse
+            scale = max_scale
+            # print("fuse scale:", max_scale, "feat_fuse min/max:", feat_fuse.min().item(), feat_fuse.max().item())
             for layer in stage:
                 feat, scale = layer(feat, scale)
             results.append((feat, scale))

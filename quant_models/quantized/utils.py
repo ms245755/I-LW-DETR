@@ -14,7 +14,7 @@ def inject_real_quant_layers(module):
             quant_class_name = class_name.replace("IViT", "Quant")
             try:
                 quant_module = __import__(
-                    "src.model.iseg.quantized.layers", fromlist=[quant_class_name]
+                    "quant_models.quantized.layers", fromlist=[quant_class_name]
                 )
                 quant_class = getattr(quant_module, quant_class_name)
             except (ImportError, AttributeError) as e:

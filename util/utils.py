@@ -2,7 +2,8 @@ from copy import deepcopy
 import torch
 import json
 from collections import OrderedDict
-
+from timm.models.layers import trunc_normal_
+import torch.nn as nn
 
 class ModelEma(torch.nn.Module):
     """EMA Model"""
@@ -113,3 +114,12 @@ def clean_state_dict(state_dict):
             k = k[7:]  # remove `module.`
         new_state_dict[k] = v
     return new_state_dict
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        trunc_normal_(m.weight, std=0.02)
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.constant_(m.bias, 0)
+        nn.init.constant_(m.weight, 1.0)

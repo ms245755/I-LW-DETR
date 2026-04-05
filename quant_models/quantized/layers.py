@@ -298,7 +298,78 @@ class QuantConv2d(nn.Module):
 
         return x_out, correct_output_scale
 
+class QuantConvTranspose2d(nn.Module):
+    """
+    A frozen ConvTranspose2d module for quantized inference.
+    Accepts integer weights/bias and performs fake quantization on activations.
+    """
 
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        output_padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        quant_mode="symmetric",
+    ):
+        super().__init__()
+
+        # Standard ConvTranspose2d layer (weights/bias will be frozen)
+        self.conv = nn.ConvTranspose2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+        # Disable gradient updates (weights/bias are fixed)
+        self.conv.weight.requires_grad = False
+        self.conv.bias.requires_grad = False
+
+        # Store conv scaling factor as buffer (non-trainable tensor)
+        self.register_buffer("conv_scaling_factor", None)
+
+    def set_quant_params(self, weight_int, bias_int, conv_scale):
+        """
+        Set quantized weights/bias and the conv scaling factor.
+        Assumes inputs are integer tensors representing quantized params.
+        """
+        with torch.no_grad():
+            self.conv.weight.copy_(weight_int.to(torch.float32))
+            self.conv.bias.copy_(bias_int.to(torch.float32))
+        self.conv_scaling_factor = conv_scale
+
+    def forward(self, x, act_scaling_factor=None):
+        """
+        Forward pass with fake quantization.
+        - x is dequantized using act_scaling_factor
+        - Output is requantized using combined scale
+        """
+        act_scaling_factor = act_scaling_factor.view(1, -1, 1, 1)  # Match input shape
+        bias_scaling_factor = self.conv_scaling_factor * act_scaling_factor
+        correct_output_scale = bias_scaling_factor.view(1, -1, 1, 1)
+
+        # Dequantize input
+        x_int = torch.round(x / act_scaling_factor)  # Simulate quantized input
+
+        # Perform transpose convolution with frozen float weights
+        x_out = self.conv(x_int)
+
+        # Requantize output
+        x_out = x_out * correct_output_scale  # Simulate quantized output
+
+        return x_out, correct_output_scale
+    
 class QuantLinear(nn.Module):
     """
     A frozen Linear layer for quantized inference.
