@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import GradScaler
 
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import evaluate, train_one_epoch
+from engine import evaluate, train_one_epoch, calibrate
 from models import build_model
 from util.drop_scheduler import drop_scheduler
 from util.get_param_dicts import get_param_dict
@@ -150,6 +150,7 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--use_ema', action='store_true')
+    parser.add_argument('--calib', action='store_true')
     parser.add_argument('--ema_decay', default=0.9997, type=float)
     parser.add_argument('--num_workers', default=2, type=int)
 
@@ -263,16 +264,19 @@ def main(args):
     output_dir = Path(args.output_dir)
     
     #### this took a lot of gpu resource
-    if  utils.is_main_process():
-        print("Get benchmark")
-        benchmark_model = copy.deepcopy(model_without_ddp)
-        bm = benchmark(benchmark_model.float(), dataset_val, output_dir)
-        print(json.dumps(bm, indent=2))
-        del benchmark_model
+    # if  utils.is_main_process():
+    #     print("Get benchmark")
+    #     benchmark_model = copy.deepcopy(model_without_ddp)
+    #     bm = benchmark(benchmark_model.float(), dataset_val, output_dir)
+    #     print(json.dumps(bm, indent=2))
+    #     del benchmark_model
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        new_state_dict = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
+        stat = model_without_ddp.load_state_dict(new_state_dict, strict=False)
+        # print(stat)
+        # return
         if args.use_ema:
             if 'ema_model' in checkpoint:
                 ema_m.module.load_state_dict(clean_state_dict(checkpoint['ema_model']))
@@ -295,6 +299,39 @@ def main(args):
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
     
+    if args.calib:
+        # 1) calibrate using val set (or train set). val is usually fine.
+        calibrate(
+            model,
+            data_loader_val,
+            device,
+            args=args,
+            calib_batches=getattr(args, "calib_batches", 200),
+        )
+
+        # 2) (optional) save calibrated quant checkpoint
+        if args.output_dir and utils.is_main_process() and getattr(args, "calib_save", True):
+            calib_path = output_dir / "checkpoint_calibrated.pth"
+            utils.save_on_master(
+                {
+                    "model": model_without_ddp.state_dict(),
+                    "args": args,
+                },
+                calib_path,
+            )
+            print("Saved calibrated checkpoint to:", calib_path)
+
+        # 3) (optional) evaluate immediately after calibration
+        if getattr(args, "calib_eval", True):
+            test_stats, coco_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val, base_ds, device, args
+            )
+            if args.output_dir and utils.is_main_process():
+                utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval_calib.pth")
+
+        return
+        
+    
     # for drop
     total_batch_size = args.batch_size * utils.get_world_size()
     num_training_steps_per_epoch = (len(dataset_train) + total_batch_size - 1) // total_batch_size
@@ -315,7 +352,7 @@ def main(args):
     
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(0, args.epochs):
         epoch_start_time = time.time()
         if args.distributed:
             sampler_train.set_epoch(epoch)
@@ -422,6 +459,102 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
+@torch.no_grad()
+def fuse_bn_into_conv_in_state_dict(
+    state_dict: dict,
+    eps: float = 1e-5,
+    conv_suffix: str = ".conv",
+    bn_suffix: str = ".bn",
+    verbose: bool = True,
+):
+    """
+    Fuse BatchNorm params into Conv params directly in a checkpoint state_dict.
+
+    Expects ConvX-like naming where conv and bn live under the same prefix:
+      <prefix>.conv.weight
+      <prefix>.conv.bias (optional)
+      <prefix>.bn.weight
+      <prefix>.bn.bias
+      <prefix>.bn.running_mean
+      <prefix>.bn.running_var
+      <prefix>.bn.num_batches_tracked (optional)
+
+    Returns a NEW dict (doesn't mutate the input).
+    """
+    sd = dict(state_dict)
+    keys = list(sd.keys())
+
+    # Find all BN weight keys and infer the block prefix from them.
+    bn_weight_keys = [k for k in keys if k.endswith(f"{bn_suffix}.weight")]
+
+    fused = 0
+    skipped_no_conv = 0
+
+    for bn_w_key in bn_weight_keys:
+        prefix = bn_w_key[: -len(f"{bn_suffix}.weight")]  # strip ".bn.weight"
+
+        # BN keys
+        bn_b_key  = prefix + f"{bn_suffix}.bias"
+        bn_rm_key = prefix + f"{bn_suffix}.running_mean"
+        bn_rv_key = prefix + f"{bn_suffix}.running_var"
+
+        if not all(k in sd for k in (bn_w_key, bn_b_key, bn_rm_key, bn_rv_key)):
+            continue
+
+        # Matching conv keys
+        conv_w_key = prefix + f"{conv_suffix}.weight"
+        conv_b_key = prefix + f"{conv_suffix}.bias"
+
+        if conv_w_key not in sd:
+            skipped_no_conv += 1
+            if verbose:
+                print(f"[skip] BN found but no conv weight for prefix: {prefix}")
+            continue
+
+        W = sd[conv_w_key]
+        if conv_b_key in sd:
+            b = sd[conv_b_key]
+        else:
+            b = torch.zeros(W.size(0), device=W.device, dtype=W.dtype)
+
+        gamma = sd[bn_w_key].to(dtype=W.dtype, device=W.device)
+        beta  = sd[bn_b_key].to(dtype=W.dtype, device=W.device)
+        mean  = sd[bn_rm_key].to(dtype=W.dtype, device=W.device)
+        var   = sd[bn_rv_key].to(dtype=W.dtype, device=W.device)
+
+        # a = gamma / sqrt(var + eps)
+        a = gamma / torch.sqrt(var + eps)
+
+        # Fuse
+        if W.ndim != 4:
+            raise ValueError(f"Expected Conv2d weight (4D) at {conv_w_key}, got shape {tuple(W.shape)}")
+
+        W_fused = W * a.reshape(-1, 1, 1, 1)
+        b_fused = a * (b - mean) + beta
+
+        sd[conv_w_key] = W_fused
+        sd[conv_b_key] = b_fused
+
+        # Remove BN entries so they won't show up as unexpected later
+        for k in (
+            bn_w_key,
+            bn_b_key,
+            bn_rm_key,
+            bn_rv_key,
+            prefix + f"{bn_suffix}.num_batches_tracked",
+        ):
+            if k in sd:
+                del sd[k]
+
+        fused += 1
+        if verbose:
+            print(f"[fused] {prefix}{conv_suffix} <= {prefix}{bn_suffix}")
+
+    if verbose:
+        print(f"Fused blocks: {fused}")
+        print(f"Skipped (BN but missing conv): {skipped_no_conv}")
+
+    return sd
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('LWDETR training and evaluation script', parents=[get_args_parser()])

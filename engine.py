@@ -21,6 +21,7 @@ from typing import Iterable
 import torch
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
+from quant_models.fake_quantized.model_utils import *
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -162,3 +163,63 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, arg
         if 'segm' in postprocessors.keys():
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
     return stats, coco_evaluator
+
+import torch
+
+@torch.no_grad()
+def calibrate(
+    model,
+    data_loader,
+    device,
+    args=None,
+    calib_batches: int = 200,
+):
+    """
+    Run PTQ-style calibration for the quantized model by collecting activation stats
+    (e.g., IViTAct.running_stat=True) on representative data.
+
+    This mirrors the structure of evaluate(), but:
+      - no criterion / postprocessors
+      - no losses / coco eval
+      - only forward passes
+      - freezes stats at the end
+
+    Args:
+        model: quantized model (already loaded with fp32 checkpoint)
+        data_loader: calibration data loader (can reuse val loader)
+        device: torch.device
+        args: should have fp16_eval optionally (same as evaluate)
+        calib_batches: number of batches to run for calibration
+    """
+    model.eval()
+
+    unfreeze_model(model=model)
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = "Calibrate:"
+
+    for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, 1, header)):
+        if i >= calib_batches:
+            break
+
+        samples = samples.to(device)
+
+        # targets are not used, but keep the same device move pattern
+        if targets is not None:
+            _ = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        # if args is not None and getattr(args, "fp16_eval", False):
+        #     samples.tensors = samples.tensors.half()
+
+        _ = model(samples)
+
+        # You can log something lightweight if desired (optional)
+        metric_logger.update(calib_batches=i + 1)
+
+    metric_logger.synchronize_between_processes()
+    print("Calibration done. Processed batches:", calib_batches)
+
+    # Freeze stats (preferred: call model.fix())
+    freeze_model(model)
+
+    return model
