@@ -687,6 +687,96 @@ class IViTGELU(nn.Module):
         act_scaling_factor = act_scaling_factor * sigmoid_act_scaling_factor
         self.act_scaling_factor = act_scaling_factor
         return x_int * act_scaling_factor, act_scaling_factor
+
+@track_init_args
+class IViTExp(nn.Module):
+    """
+    Integer-ish Exp layer (ShiftExp)
+    Computes y = exp(x) with an integer exp approximation + scaling-factor tracking.
+
+    Input:
+      x: tensor representing real values (usually float tensor carrying quantized values)
+      act_scaling_factor: scale Sx such that x_real ≈ (x / Sx) * Sx
+
+    Output:
+      y: approximate exp(x_real)
+      y_scaling_factor: scale Sy such that y_real ≈ y_int * Sy
+    """
+
+    def __init__(self, output_bit=16, n=23, clamp_min_real=-10.0, clamp_max_real=10.0):
+        super().__init__()
+        self.output_bit = output_bit
+        self.n = n
+
+        # Optional clamp to keep exp stable in integer-only pipelines
+        self.clamp_min_real = clamp_min_real
+        self.clamp_max_real = clamp_max_real
+
+        self.register_buffer("act_scaling_factor", torch.zeros(1))
+
+    def fix(self):
+        pass
+
+    def unfix(self):
+        pass
+
+    def int_exp_shift(self, x_int, scaling_factor):
+        # same core as IViTGELU
+        x_int = x_int + floor_ste.apply(x_int / 2) - floor_ste.apply(x_int / 2**4)
+
+        with torch.no_grad():
+            x0_int = torch.floor(-1.0 / scaling_factor)
+
+        x_int = torch.max(x_int, self.n * x0_int)
+
+        q = floor_ste.apply(x_int / x0_int)
+        r = x_int - x0_int * q
+
+        exp_int = r / 2 - x0_int
+        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** (self.n - q)), min=0)
+
+        scaling_factor = scaling_factor / 2.0**self.n
+        return exp_int, scaling_factor
+
+    def forward(self, x, act_scaling_factor=None):
+        assert act_scaling_factor is not None, "act_scaling_factor must be provided"
+
+        # "integer" representation (still float tensor in your framework)
+        x_int = x / act_scaling_factor
+
+        # Optional real-domain clamp for stability:
+        # x_real = x_int * act_scaling_factor, so clamp x_int to [min/S, max/S]
+        if self.clamp_min_real is not None or self.clamp_max_real is not None:
+            with torch.no_grad():
+                lo = None if self.clamp_min_real is None else torch.floor(
+                    torch.tensor(self.clamp_min_real, device=x.device, dtype=torch.float32) / act_scaling_factor
+                )
+                hi = None if self.clamp_max_real is None else torch.ceil(
+                    torch.tensor(self.clamp_max_real, device=x.device, dtype=torch.float32) / act_scaling_factor
+                )
+
+            if lo is not None and hi is not None:
+                x_int = torch.clamp(x_int, lo.item(), hi.item())
+            elif lo is not None:
+                x_int = torch.max(x_int, lo.item())
+            elif hi is not None:
+                x_int = torch.min(x_int, hi.item())
+
+        # Integer exp approximation:
+        # exp_int is an integer-like tensor, exp_scale is the scale for exp_int
+        exp_int, exp_scale = self.int_exp_shift(x_int, act_scaling_factor)
+
+        # Optionally quantize exp_int down to a fixed-point format controlled by output_bit.
+        # Your int_exp_shift returns an exp_int with its own exp_scale; you can keep it as-is.
+        # But if you want exp_int to fit into a fixed range:
+        if self.output_bit is not None:
+            # map to signed range if you want (exp is non-negative, so unsigned would be better,
+            # but we keep the same style as the rest of your code)
+            max_int = 2 ** (self.output_bit - 1) - 1
+            exp_int = torch.clamp(exp_int, 0, max_int)
+
+        self.act_scaling_factor = exp_scale
+        return exp_int * exp_scale, exp_scale
     
 @track_init_args
 class IViTSiLU(nn.Module):
