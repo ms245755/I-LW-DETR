@@ -21,6 +21,7 @@ from torch import nn
 from util.misc import NestedTensor, is_main_process
 
 from .base import BackboneBase
+from models.backbone.projector import MultiScaleProjector
 from quant_models.quant_backbone.quant_vit import IViT
 from quant_models.quant_backbone.quant_projector import IMultiScaleProjector
 __all__ = ["Backbone"]
@@ -98,7 +99,7 @@ class Backbone(BackboneBase):
         )
         scale_factors = [level2scalefactor[lvl] for lvl in self.projector_scale]
 
-        self.projector = IMultiScaleProjector(
+        self.projector = MultiScaleProjector(
             in_channels=self.encoder._out_feature_channels,
             out_channels=out_channels,
             scale_factors=scale_factors,
@@ -116,15 +117,17 @@ class Backbone(BackboneBase):
         """
         # (H, W, B, C)
         feats = self.encoder(tensor_list.tensors)
-        # feats = [feat for (feat, scale) in feats]
+        feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
         # x: [(B, C, H, W)]
         out = []
-        for (feat, scale) in feats:
+        # for (feat, scale) in feats:
+        for feat in feats:
             m = tensor_list.mask
             assert m is not None
             mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
-            out.append(NestedTensor((feat, scale) , mask))
+            # out.append(NestedTensor((feat, scale), mask))
+            out.append(NestedTensor(feat, mask))
         return out
 
     def forward_export(self, tensors:torch.Tensor):
@@ -132,11 +135,11 @@ class Backbone(BackboneBase):
         feats = self.projector(feats)
         out_feats = []
         out_masks = []
-        for feat, scale in feats:
+        for feat in feats:
             # x: [(B, C, H, W)]
             b, _, h, w = feat.shape
             out_masks.append(torch.zeros((b, h, w), dtype=torch.bool, device=feat.device))
-            out_feats.append((feat, scale))
+            out_feats.append(feat)
         return out_feats, out_masks
 
     def get_named_param_lr_pairs(self, args, prefix:str = "backbone.0"):

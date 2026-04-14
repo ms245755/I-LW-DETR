@@ -8,6 +8,7 @@
 import torch.nn as nn
 
 from models.backbone import Joiner
+from quant_models.quant_backbone import Joiner as QJoiner
 
 
 def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, num_layers=12):
@@ -39,7 +40,7 @@ def get_vit_weight_decay_rate(name, weight_decay_rate=1.0):
 
 
 def get_param_dict(args, model_without_ddp: nn.Module):
-    assert isinstance(model_without_ddp.backbone, Joiner)
+    assert isinstance(model_without_ddp.backbone, (Joiner, QJoiner))
     backbone = model_without_ddp.backbone[0]
     backbone_named_param_lr_pairs = backbone.get_named_param_lr_pairs(args, prefix="backbone.0")
     backbone_param_lr_pairs = [param_dict for _, param_dict in backbone_named_param_lr_pairs.items()]
