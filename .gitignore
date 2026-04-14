@@ -22,3 +22,8 @@ figs/
 plot*.py
 *.onnx
 *.engine
+pretrain_weights/*
+output/
+demo/*
+data/
+experiments/
