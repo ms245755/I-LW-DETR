@@ -78,6 +78,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         losses.backward()
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            
+        for i, group in enumerate(optimizer.param_groups):
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                st = optimizer.state.get(p, {})
+                if "exp_avg" in st and st["exp_avg"].shape != p.grad.shape:
+                    print("MISMATCH!")
+                    print("param shape:", tuple(p.shape))
+                    print("grad shape :", tuple(p.grad.shape))
+                    print("exp_avg    :", tuple(st["exp_avg"].shape))
+                    raise SystemExit
         optimizer.step()
         if ema_m is not None:
             if epoch >= 0:
@@ -210,7 +222,7 @@ def calibrate(
 
         # if args is not None and getattr(args, "fp16_eval", False):
         #     samples.tensors = samples.tensors.half()
-
+        
         _ = model(samples)
 
         # You can log something lightweight if desired (optional)
