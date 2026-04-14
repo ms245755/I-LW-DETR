@@ -34,6 +34,8 @@ def linear_quantize(input, scale, zero_point, is_weight):
         elif len(input.shape) == 4:
             scale = scale.view(1, -1, 1, 1)
             zero_point = zero_point.view(1, -1, 1, 1)
+        elif len(input.shape) == 1:
+            pass
         else:
             raise NotImplementedError
 
@@ -107,6 +109,8 @@ class SymmetricQuantFunction(Function):
                 scale = scale.view(1, 1, -1)
             elif len(grad_output.shape) == 4:
                 scale = scale.view(1, -1, 1, 1)
+            elif len(grad_output.shape) == 1:
+                pass
             else:
                 raise NotImplementedError
         return grad_output / scale, None, None, None
@@ -205,6 +209,8 @@ class fixedpoint_mul(Function):
             reshape = lambda x: x.view(1, 1, -1)
         elif len(pre_act.shape) == 4:
             reshape = lambda x: x.view(1, -1, 1, 1)
+        elif len(pre_act.shape) == 1:
+            pass
         else:
             raise NotImplementedError
         ctx.identity = identity
@@ -252,3 +258,27 @@ class fixedpoint_mul(Function):
             identity_grad = grad_output  # Don't modify grad_output in-place for identity
 
         return grad_output, None, None, None, None, identity_grad, None
+
+def concat_list_tensor_scale(tensor_list, dim = 0):
+    max_scale = torch.stack([scale for (_, scale) in tensor_list]).max()
+
+    result = []
+    for tmp, scale in tensor_list:
+        result.append(round_ste.apply(tmp / scale))
+    
+    result = torch.cat(result, dim = dim)
+    result = result * max_scale
+    return result, max_scale
+
+def add_tensor_scale(x, scale_x, y, scale_y):
+    max_scale = torch.stack([scale_x, scale_y]).max()
+    x = round_ste.apply(x / max_scale)
+    y = round_ste.apply(y / max_scale)
+
+    result = x + y
+    return result * max_scale, max_scale
+
+def multiply_tensor_scale(x, scale_x, y, scale_y):
+    max_scale = scale_x * scale_y
+    result = x * y
+    return result, max_scale
