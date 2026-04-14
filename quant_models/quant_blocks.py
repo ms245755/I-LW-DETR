@@ -12,6 +12,7 @@ from timm.models.vision_transformer import _load_weights
 
 from util.box_ops import box_cxcywh_to_xyxy
 from quant_models.fake_quantized.layers import *
+from quant_models.fake_quantized.utils import *
 from util.utils import init_weights
 from torch.nn.init import constant_, xavier_uniform_
 
@@ -22,7 +23,7 @@ class IPatchEmbed(nn.Module):
     """
 
     def __init__(
-        self, kernel_size=16, stride=16, padding=(0, 0), in_chans=3, embed_dim=768
+        self, kernel_size=16, stride=16, padding=(0, 0), in_chans=3, embed_dim=768, num_bits=8,
     ):
         """
         Args:
@@ -35,9 +36,9 @@ class IPatchEmbed(nn.Module):
         super().__init__()
 
         self.proj = IViTConv2d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
+            in_chans, embed_dim, kernel_size=kernel_size, stride=stride, weight_bit=num_bits, bias_bit=num_bits*4
         )
-        self.qact = IViTAct(16)
+        self.qact = IViTAct(activation_bit=num_bits*2)
 
     def forward(self, x, act_scaling_factor=None):
         
@@ -77,22 +78,23 @@ class IFeedForward(nn.Module):
         gelu_n=23,
         gelu_lambda=6,
         gelu_choice="l_shiftgelu",
+        num_bits = 8,
     ):
         super().__init__()
-        self.fc1 = IViTLinear(in_features=dim, out_features=hidden_dim)
-        self.act = ISegGELU(output_bit=8, n=gelu_n, lambda_scaler=gelu_lambda)
-        self.act_fp = IViTGELU()
-        self.act_no_lambda = IViTGELU(output_bit=8)
+        self.fc1 = IViTLinear(in_features=dim, out_features=hidden_dim, weight_bit=num_bits, bias_bit=num_bits*4)
+        self.act = ISegGELU(output_bit=num_bits, n=gelu_n, lambda_scaler=gelu_lambda)
+        self.act_fp = IViTGELU(output_bit=num_bits)
+        self.act_no_lambda = IViTGELU(output_bit=num_bits)
         if out_dim is None:
             out_dim = dim
-        self.fc2 = IViTLinear(in_features=hidden_dim, out_features=out_dim)
+        self.fc2 = IViTLinear(in_features=hidden_dim, out_features=out_dim, weight_bit=num_bits, bias_bit=num_bits*4)
         self.drop = nn.Dropout(p=dropout)
         self.gelu_choice = gelu_choice
 
         # Quantization activations around GELU and dropout
-        self.qact_pre_gelu = IViTAct()
-        self.qact_post_gelu = IViTAct()
-        self.qact_drop2_stub = IViTAct(16)
+        self.qact_pre_gelu = IViTAct(activation_bit=num_bits)
+        self.qact_post_gelu = IViTAct(activation_bit=num_bits)
+        self.qact_drop2_stub = IViTAct(activation_bit=num_bits*2)
 
         # Observation flags
         self.observe_gelu = observe_gelu
@@ -151,88 +153,13 @@ class IFeedForward(nn.Module):
         x, act_scaling_factor = self.qact_drop2_stub(x=x, act_scaling_factor=act_scaling_factor)
 
         return x, act_scaling_factor
-    
-# class IAttention(nn.Module):
-#     """
-#     Quantized multi-head self-attention layer.
-
-#     Args:
-#         dim (int): Input/Output feature dimension.
-#         heads (int): Number of attention heads.
-#         dropout (float): Dropout probability for attention weights and projection.
-#     """
-
-#     def __init__(self, dim, heads, dropout):
-#         super().__init__()
-#         self.heads = heads
-#         head_dim = dim // heads
-#         self.scale = head_dim**-0.5
-#         self.attn = None
-
-#         # Linear projections for Q, K, V
-#         self.qkv = IViTLinear(in_features=dim, out_features=dim * 3)
-#         self.proj = IViTLinear(in_features=dim, out_features=dim)
-
-#         # Quantized matmul + softmax
-#         self.matmul = IViTMatMul()
-#         self.softmax = IViTSoftmax(output_bit=16, dim=-1)
-
-#         # Quantized activations
-#         self.qact_qkv = IViTAct()
-#         self.qact_attn_out = IViTAct()
-#         self.qact_pre_proj = IViTAct()
-#         self.qact_proj_drop = IViTAct()
-
-#     @property
-#     def unwrapped(self):
-#         return self
-
-#     def forward(self, x, mask=None, act_scaling_factor=None):
-#         B, N, C = x.shape
-
-#         # Project input into Q, K, V
-#         x, act_scaling_factor = self.qkv(x=x, act_scaling_factor=act_scaling_factor)
-#         x, act_scaling_factor_qkv = self.qact_qkv(x=x, act_scaling_factor=act_scaling_factor)
-#         qkv = x.reshape(B, N, 3, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)  # (BN33)
-#         q, k, v = qkv[0], qkv[1], qkv[2]
-#         attn, act_scaling_factor = self.matmul(
-#             A=q,
-#             pre_act_scaling_factor_A=act_scaling_factor_qkv,
-#             B=k.transpose(-2, -1),
-#             pre_act_scaling_factor_B=act_scaling_factor_qkv,
-#         )
-#         attn = attn * self.scale
-#         act_scaling_factor = act_scaling_factor * self.scale
-
-#         # Quantize + softmax
-#         attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=act_scaling_factor)
-#         attn, act_scaling_factor = self.softmax(x=attn, act_scaling_factor=act_scaling_factor)
-
-#         # Apply attention to values
-#         x, act_scaling_factor = self.matmul(
-#             A=attn,
-#             pre_act_scaling_factor_A=act_scaling_factor,
-#             B=v,
-#             pre_act_scaling_factor_B=act_scaling_factor_qkv,
-#         )
-#         x = x.transpose(1, 2).reshape(B, N, C)
-
-#         # Projection + quantize
-#         x, act_scaling_factor = self.qact_pre_proj(x=x, act_scaling_factor=act_scaling_factor)
-#         x, act_scaling_factor = self.proj(x=x, act_scaling_factor=act_scaling_factor)
-#         x, act_scaling_factor = self.qact_proj_drop(x=x, act_scaling_factor=act_scaling_factor)
-
-#         return x, act_scaling_factor
-
-import torch
-import torch.nn as nn
 
 class IAttention(nn.Module):
     """
     Quantized multi-head self-attention layer, CAE-compatible (q_bias/v_bias).
     """
 
-    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True):
+    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True, num_bits: int =8):
         super().__init__()
         self.heads = heads
         self.dim = dim
@@ -243,15 +170,16 @@ class IAttention(nn.Module):
         self.use_cae = use_cae
 
         # Linear projections for Q, K, V
-        self.proj = IViTLinear(in_features=dim, out_features=dim)
+        self.proj = IViTLinear(in_features=dim, out_features=dim, weight_bit=num_bits, bias_bit=num_bits*4)
 
         # CAE-style separate biases (same as float Attention when use_cae=True)
         if self.use_cae:
-            self.qkv  = IViTLinear(in_features=dim, out_features=dim * 3, bias=False)
+            self.qkv  = IViTLinear(in_features=dim, out_features=dim * 3, bias=False, weight_bit=num_bits, bias_bit=num_bits*4)
             self.q_bias = nn.Parameter(torch.zeros(dim))
             self.v_bias = nn.Parameter(torch.zeros(dim))
+            # self.qact_bias = IViTAct()
         else:
-            self.qkv  = IViTLinear(in_features=dim, out_features=dim * 3, bias=qkv_bias)
+            self.qkv  = IViTLinear(in_features=dim, out_features=dim * 3, bias=qkv_bias, weight_bit=num_bits, bias_bit=num_bits*4)
             self.q_bias = None
             self.v_bias = None
 
@@ -260,10 +188,10 @@ class IAttention(nn.Module):
         self.softmax = IViTSoftmax(output_bit=16, dim=-1)
 
         # Quantized activations
-        self.qact_qkv = IViTAct()
-        self.qact_attn_out = IViTAct()
-        self.qact_pre_proj = IViTAct()
-        self.qact_proj_drop = IViTAct()
+        self.qact_qkv = IViTAct(activation_bit=num_bits)
+        self.qact_attn_out = IViTAct(activation_bit=num_bits)
+        self.qact_pre_proj = IViTAct(activation_bit=num_bits)
+        self.qact_proj_drop = IViTAct(activation_bit=num_bits)
 
     @property
     def unwrapped(self):
@@ -284,7 +212,9 @@ class IAttention(nn.Module):
                 (self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias),
                 dim=0,
             )
+            # qkv_bias, qkv_bias_scale = self.qact_bias(qkv_bias, None)
             # broadcast to [B, N, 3C]
+            # x, act_scaling_factor = add_tensor_scale([(x, act_scaling_factor), (qkv_bias.view(1, 1, -1), qkv_bias_scale)])
             x = x + qkv_bias.view(1, 1, -1)
         # ---------------------------------------------------------------
 
@@ -327,6 +257,14 @@ class IAttention(nn.Module):
 
         return x, act_scaling_factor
 
+def print_stat(block_name, x, observed_stat = False):
+    if observed_stat:
+        print(block_name,
+            "x finite", torch.isfinite(x).float().mean().item(),
+            "x absmax", x.detach().abs().max().item(),
+            "x mean", x.detach().mean().item(),
+            "x std", x.detach().std().item())
+
 class IBlock(nn.Module):
     """
     Transformer block consisting of:
@@ -361,57 +299,64 @@ class IBlock(nn.Module):
         record_rmse=False,
         window=False,
         use_cae=True,
+        num_bits=8
     ):
         super().__init__()
         self.norm1 = IViTLayerNorm(normalized_shape=dim)
         self.norm2 = IViTLayerNorm(normalized_shape=dim)
-        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias)
+        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits)
         self.mlp = IFeedForward(
-            dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice
+            dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits
         )
         self.window = window
 
         # Quantized activations around residual paths
-        self.pre_attn_scaler = IViTAct()
-        self.qact_drop_1 = IViTAct(16)
-        self.pre_mlp_scaler = IViTAct()
-        self.qact_drop_2 = IViTAct(16)
+        self.pre_attn_scaler = IViTAct(activation_bit=num_bits)
+        self.qact_drop_1 = IViTAct(activation_bit=num_bits*2)
+        self.pre_mlp_scaler = IViTAct(activation_bit=num_bits)
+        self.qact_drop_2 = IViTAct(activation_bit=num_bits*2)
         self.use_cae = use_cae
         if use_cae:
             init_values = 0.1
-            self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
-            self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
-            # self.qact_gamma_1 = IViTAct()
-            # self.qact_gamma_2 = IViTAct()
+            self.gamma_1 = nn.Parameter(init_values * torch.ones(dim),requires_grad=True)
+            self.gamma_2 = nn.Parameter(init_values * torch.ones(dim),requires_grad=True)
+            self.qact_gamma_1 = IViTAct(activation_bit=num_bits)
+            self.qact_gamma_2 = IViTAct(activation_bit=num_bits)
+            self.qact_post_gamma_1 = IViTAct(activation_bit=num_bits*2)
+            self.qact_post_gamma_2 = IViTAct(activation_bit=num_bits*2)
 
     def forward(
         self, x, mask=None, return_attention=False, act_scaling_factor=None, block_name="Encoder_0/"
     ):
+        print_stat("[IBlock] before norm:", x)
         B, HW, C = x.shape
         shortcut = x
         shortcut_scale = act_scaling_factor
         x, act_scaling_factor = self.norm1(x, act_scaling_factor)
         x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
-
+        print_stat("[IBlock] after norm:", x)
+        
         if not self.window:
             x = x.reshape(B // 16, 16*HW, C)
             if mask is not None:
                 mask = mask.reshape(B//16, 16*HW)
-        # if self.use_cae:
-        #     gamma1, scale_gamma1 = self.qact_gamma_1(self.gamma_1, act_scaling_factor=None)
-        #     gamma2, scale_gamma2 = self.qact_gamma_2(self.gamma_2, act_scaling_factor=None)
 
-
+        if self.use_cae:
+            gamma_1, scale_gamma1 = self.qact_gamma_1(self.gamma_1, act_scaling_factor=None)
+            gamma_2, scale_gamma2 = self.qact_gamma_2(self.gamma_2, act_scaling_factor=None)
 
         
         # Attention branch
         x, act_scaling_factor = self.attn(x=x, act_scaling_factor=act_scaling_factor)
-
+        print_stat("[IBlock] after attn:", x)
+        
         # Cong: do i need to requantize after multiply?
         if self.use_cae:
-            x = x * self.gamma_1
-            # act_scaling_factor = act_scaling_factor * scale_gamma1
-
+            x = x * gamma_1
+            act_scaling_factor = act_scaling_factor * scale_gamma1
+            # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_1, scale_gamma1)
+            x, act_scaling_factor = self.qact_post_gamma_1(x, act_scaling_factor)
+        print_stat("[IBlock] after gamma 1:", x)
 
         if not self.window:
             x = x.reshape(B , HW, C)
@@ -419,40 +364,36 @@ class IBlock(nn.Module):
                 mask = mask.reshape(B, HW)
 
         # Residual connection with rounding
-        # max_scale = torch.max(shortcut_scale, act_scaling_factor)
-
-        # Cong: should we use x * old_scale / new_scale or x * new_scale / old_scale
-        x = round_ste.apply(x / act_scaling_factor)
-        shortcut = round_ste.apply(shortcut / act_scaling_factor )
-
-        x = x + shortcut  # Possible overflow 
-        # act_scaling_factor = max_scale
-        x *= act_scaling_factor
-
+        x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
+        print_stat("[IBlock] after residual 1:", x)
+        
+        x, act_scaling_factor = self.qact_drop_1(x=x, act_scaling_factor=act_scaling_factor)
+        
         shortcut = x
         shortcut_scale = act_scaling_factor
-
-        x, act_scaling_factor = self.qact_drop_1(x=x, act_scaling_factor=act_scaling_factor)
-
+        print_stat("[IBlock] before norm2:", x)
         # FeedForward branch
         x, act_scaling_factor = self.norm2(x=x, act_scaling_factor=act_scaling_factor)
         x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)
+        print_stat("[IBlock] after norm2:", x)
         x, act_scaling_factor = self.mlp(
             x=x, act_scaling_factor=act_scaling_factor, block_name=block_name
         )
+        print_stat("[IBlock] after mlp:", x)
         if self.use_cae:
-            x = x * self.gamma_2
-            # act_scaling_factor = act_scaling_factor * scale_gamma2
+            x = x * gamma_2
+            act_scaling_factor = act_scaling_factor * scale_gamma2
+            # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_2, scale_gamma2)
+            x, act_scaling_factor = self.qact_post_gamma_2(x, act_scaling_factor)
 
+            print_stat("[IBlock] after gamma 2:", x)
         # Residual connection with rounding
-        # max_scale = torch.max(shortcut_scale, act_scaling_factor)
-        x = round_ste.apply(x / act_scaling_factor)
-        shortcut = round_ste.apply(shortcut  / act_scaling_factor)
-
-        x = x + shortcut  # Possible overflow 
-        x *= act_scaling_factor
+        x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
+        print_stat("[IBlock] after residual 2:", x)
         x, act_scaling_factor = self.qact_drop_2(x=x, act_scaling_factor=act_scaling_factor)
+        print_stat("[IBlock] output:", x)
 
+        # print ("-----------------------------")
         return x, act_scaling_factor
 
 def _is_power_of_2(n):
@@ -726,3 +667,28 @@ class IMSDeformAttn(nn.Module):
         output, output_scale = self.output_proj(output, output_scale)
 
         return output, output_scale
+
+def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights):
+    """ "for debug and test only, need to use cuda version instead"""
+    # B, n_heads, head_dim, N
+    B, n_heads, head_dim, _ = value.shape
+    _, Len_q, n_heads, L, P, _ = sampling_locations.shape
+    value_list = value.split([H * W for H, W in value_spatial_shapes], dim=3)
+    sampling_grids = 2 * sampling_locations - 1
+    sampling_value_list = []
+    for lid_, (H, W) in enumerate(value_spatial_shapes):
+        # B, n_heads, head_dim, H, W
+        value_l_ = value_list[lid_].view(B * n_heads, head_dim, H, W)
+        # B, Len_q, n_heads, P, 2 -> B, n_heads, Len_q, P, 2 -> B*n_heads, Len_q, P, 2
+        sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
+        # B*n_heads, head_dim, Len_q, P
+        sampling_value_l_ = F.grid_sample(
+            value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False
+        )
+        sampling_value_list.append(sampling_value_l_)
+    # (B, Len_q, n_heads, L * P) -> (B, n_heads, Len_q, L, P) -> (B*n_heads, 1, Len_q, L*P)
+    attention_weights = attention_weights.transpose(1, 2).reshape(B * n_heads, 1, Len_q, L * P)
+    # B*n_heads, head_dim, Len_q, L*P
+    sampling_value_list = torch.stack(sampling_value_list, dim=-2).flatten(-2)
+    output = (sampling_value_list * attention_weights).sum(-1).view(B, n_heads * head_dim, Len_q)
+    return output.transpose(1, 2).contiguous()

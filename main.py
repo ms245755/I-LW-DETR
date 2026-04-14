@@ -30,6 +30,7 @@ from torch.amp import GradScaler
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch, calibrate
 from models import build_model
+from quant_models import build_model_quant
 from util.drop_scheduler import drop_scheduler
 from util.get_param_dicts import get_param_dict
 import util.misc as utils
@@ -151,6 +152,7 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--use_ema', action='store_true')
     parser.add_argument('--calib', action='store_true')
+    parser.add_argument('--qat', action='store_true')
     parser.add_argument('--ema_decay', default=0.9997, type=float)
     parser.add_argument('--num_workers', default=2, type=int)
 
@@ -198,8 +200,12 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
 
-    model, criterion, postprocessors = build_model(args)
+    if args.calib or args.qat:
+        model, criterion, postprocessors = build_model_quant(args)
+    else:
+        model, criterion, postprocessors = build_model(args)
     model.to(device)
+
     if args.use_ema:
         ema_m = ModelEma(model, decay=args.ema_decay)
     else:
@@ -217,7 +223,7 @@ def main(args):
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, 
                                 weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
-    scaler = GradScaler('cuda') if torch.cuda.is_available() else None
+    # scaler = GradScaler('cuda') if torch.cuda.is_available() else None
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
@@ -240,9 +246,11 @@ def main(args):
 
     base_ds = get_coco_api_from_dataset(dataset_val)
 
-
+    # Cong: We need to modify the pretrain key in script to match with the key name of quantize blocks
     if args.pretrain_weights is not None:
         checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
+        # if args.qat or args.calib:
+        #     checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
         # add support to exclude_keys
         # e.g., when load object365 pretrain, do not load `class_embed.[weight, bias]`
         if args.pretrain_exclude_keys is not None:
@@ -273,8 +281,13 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        new_state_dict = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
-        stat = model_without_ddp.load_state_dict(new_state_dict, strict=False)
+        # if args.qat or args.calib:
+        #     checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
+        stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        # for n, m in model.named_modules():
+        #     if "backbone" in n and (n.count(".") <= 3):
+        #         print(n, type(m))]
+        
         # print(stat)
         # return
         if args.use_ema:

@@ -28,13 +28,13 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size,
                        is_dist_avail_and_initialized)
 
-from fake_quantized.layers import *
-from .backbone import build_backbone
-from .matcher import build_matcher
-from .transformer import build_transformer
+from .fake_quantized.layers import *
+from .quant_backbone import build_backbone
+from models.matcher import build_matcher
+from models.transformer import build_transformer
+from models.lwdetr import LWDETR
 
-
-class LWDETR(nn.Module):
+class ILWDETR(nn.Module):
     """ This is the Group DETR v3 module that performs object detection """
     def __init__(self,
                  backbone,
@@ -61,7 +61,7 @@ class LWDETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.class_embed = IViTLinear(hidden_dim, num_classes)
+        self.class_embed = ILinearBlock(hidden_dim, num_classes, gelu=False)
         self.bbox_embed = IMLP(hidden_dim, hidden_dim, 4, 3)
 
         query_dim=4
@@ -133,9 +133,9 @@ class LWDETR(nn.Module):
 
         srcs = []
         masks = []
-        for l, feat in enumerate(features):
+        for l, (feat, scale) in enumerate(features):
             src, mask = feat.decompose()
-            srcs.append(src)
+            srcs.append((src, scale))
             masks.append(mask)
             assert mask is not None
 

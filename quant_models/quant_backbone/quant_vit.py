@@ -91,6 +91,7 @@ class IViT(nn.Module):
         gelu_n=23,
         gelu_lambda=6,
         dropout=0.1,
+        num_bits: int =8
     ):
         """
         Args:
@@ -122,6 +123,7 @@ class IViT(nn.Module):
             stride=(patch_size, patch_size),
             in_chans=in_chans,
             embed_dim=embed_dim,
+            num_bits=num_bits
         )
 
         if use_abs_pos:
@@ -147,6 +149,7 @@ class IViT(nn.Module):
                 gelu_lambda=gelu_lambda,
                 dropout= dropout,
                 qkv_bias=qkv_bias,
+                num_bits=num_bits,
                 use_cae=use_cae
             )
             if use_act_checkpoint:
@@ -168,8 +171,8 @@ class IViT(nn.Module):
 
         self._export = False
 
-        self.qact_input = IViTAct()
-        self.qact_pos = IViTAct()
+        self.qact_input = IViTAct(activation_bit=num_bits)
+        self.qact_pos = IViTAct(activation_bit=num_bits)
 
     def export(self):
         self._export = True
@@ -204,7 +207,6 @@ class IViT(nn.Module):
             # x = x + x_pos
             x = x + x_pos
             x *= act_scaling_factor
-
         B, H, W, C = x.shape
         assert (H % 4 == 0) and (W % 4 == 0)
         h, w = H // 4, W // 4
