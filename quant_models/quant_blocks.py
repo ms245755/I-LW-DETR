@@ -15,6 +15,7 @@ from quant_models.fake_quantized.layers import *
 from quant_models.fake_quantized.utils import *
 from util.utils import init_weights
 from torch.nn.init import constant_, xavier_uniform_
+from util.decorators import save_tensor_from_pathname
 
 
 class IPatchEmbed(nn.Module):
@@ -23,7 +24,7 @@ class IPatchEmbed(nn.Module):
     """
 
     def __init__(
-        self, kernel_size=16, stride=16, padding=(0, 0), in_chans=3, embed_dim=768, num_bits=8,
+        self, kernel_size=16, stride=16, padding=(0, 0), in_chans=3, embed_dim=768, num_bits=8, observe_stat=False, block_name=""
     ):
         """
         Args:
@@ -39,6 +40,8 @@ class IPatchEmbed(nn.Module):
             in_chans, embed_dim, kernel_size=kernel_size, stride=stride, weight_bit=num_bits, bias_bit=num_bits*4
         )
         self.qact = IViTAct(activation_bit=num_bits*2)
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def forward(self, x, act_scaling_factor=None):
         
@@ -47,6 +50,9 @@ class IPatchEmbed(nn.Module):
         x = x.flatten(2).transpose(1, 2)  # Flatten patches and rearrange to (B, N, C)
         act_scaling_factor = act_scaling_factor.reshape(1, 1, x.shape[2])
         x, act_scaling_factor = self.qact(x, act_scaling_factor)
+
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", out_dir="observed_tensor/quant/")
+
         return x.reshape(B, H, W, C), act_scaling_factor
 
 class IFeedForward(nn.Module):
@@ -159,7 +165,7 @@ class IAttention(nn.Module):
     Quantized multi-head self-attention layer, CAE-compatible (q_bias/v_bias).
     """
 
-    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True, num_bits: int =8):
+    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True, num_bits: int =8, observe_stat=False, block_name=""):
         super().__init__()
         self.heads = heads
         self.dim = dim
@@ -192,6 +198,9 @@ class IAttention(nn.Module):
         self.qact_attn_out = IViTAct(activation_bit=num_bits)
         self.qact_pre_proj = IViTAct(activation_bit=num_bits)
         self.qact_proj_drop = IViTAct(activation_bit=num_bits)
+
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     @property
     def unwrapped(self):
@@ -299,12 +308,14 @@ class IBlock(nn.Module):
         record_rmse=False,
         window=False,
         use_cae=True,
-        num_bits=8
+        num_bits=8,
+        observe_stat=False,
+        block_name=""
     ):
         super().__init__()
         self.norm1 = IViTLayerNorm(normalized_shape=dim)
         self.norm2 = IViTLayerNorm(normalized_shape=dim)
-        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits)
+        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits, observe_stat=observe_stat, block_name=block_name+"attn/")
         self.mlp = IFeedForward(
             dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits
         )
@@ -324,17 +335,19 @@ class IBlock(nn.Module):
             self.qact_gamma_2 = IViTAct(activation_bit=num_bits)
             self.qact_post_gamma_1 = IViTAct(activation_bit=num_bits*2)
             self.qact_post_gamma_2 = IViTAct(activation_bit=num_bits*2)
+        
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def forward(
         self, x, mask=None, return_attention=False, act_scaling_factor=None, block_name="Encoder_0/"
     ):
-        print_stat("[IBlock] before norm:", x)
         B, HW, C = x.shape
         shortcut = x
         shortcut_scale = act_scaling_factor
         x, act_scaling_factor = self.norm1(x, act_scaling_factor)
         x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
-        print_stat("[IBlock] after norm:", x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"norm1", out_dir="observed_tensor/quant/")
         
         if not self.window:
             x = x.reshape(B // 16, 16*HW, C)
@@ -348,7 +361,7 @@ class IBlock(nn.Module):
         
         # Attention branch
         x, act_scaling_factor = self.attn(x=x, act_scaling_factor=act_scaling_factor)
-        print_stat("[IBlock] after attn:", x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"attn", out_dir="observed_tensor/quant/")
         
         # Cong: do i need to requantize after multiply?
         if self.use_cae:
@@ -356,7 +369,7 @@ class IBlock(nn.Module):
             act_scaling_factor = act_scaling_factor * scale_gamma1
             # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_1, scale_gamma1)
             x, act_scaling_factor = self.qact_post_gamma_1(x, act_scaling_factor)
-        print_stat("[IBlock] after gamma 1:", x)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"gamma1", out_dir="observed_tensor/quant/")
 
         if not self.window:
             x = x.reshape(B , HW, C)
@@ -365,35 +378,35 @@ class IBlock(nn.Module):
 
         # Residual connection with rounding
         x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
-        print_stat("[IBlock] after residual 1:", x)
-        
         x, act_scaling_factor = self.qact_drop_1(x=x, act_scaling_factor=act_scaling_factor)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"residual1", out_dir="observed_tensor/quant/")
         
         shortcut = x
         shortcut_scale = act_scaling_factor
-        print_stat("[IBlock] before norm2:", x)
+
         # FeedForward branch
         x, act_scaling_factor = self.norm2(x=x, act_scaling_factor=act_scaling_factor)
         x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)
-        print_stat("[IBlock] after norm2:", x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"norm2", out_dir="observed_tensor/quant/")
+
         x, act_scaling_factor = self.mlp(
             x=x, act_scaling_factor=act_scaling_factor, block_name=block_name
         )
-        print_stat("[IBlock] after mlp:", x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"mlp", out_dir="observed_tensor/quant/")
+
         if self.use_cae:
             x = x * gamma_2
             act_scaling_factor = act_scaling_factor * scale_gamma2
             # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_2, scale_gamma2)
             x, act_scaling_factor = self.qact_post_gamma_2(x, act_scaling_factor)
 
-            print_stat("[IBlock] after gamma 2:", x)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"gamma2", out_dir="observed_tensor/quant/")
+
         # Residual connection with rounding
         x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
-        print_stat("[IBlock] after residual 2:", x)
         x, act_scaling_factor = self.qact_drop_2(x=x, act_scaling_factor=act_scaling_factor)
-        print_stat("[IBlock] output:", x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"residual2", out_dir="observed_tensor/quant/")
 
-        # print ("-----------------------------")
         return x, act_scaling_factor
 
 def _is_power_of_2(n):

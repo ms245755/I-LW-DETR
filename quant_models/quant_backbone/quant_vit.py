@@ -91,7 +91,9 @@ class IViT(nn.Module):
         gelu_n=23,
         gelu_lambda=6,
         dropout=0.1,
-        num_bits: int =8
+        num_bits: int =8,
+        observe_stat = False,
+        block_name = ""
     ):
         """
         Args:
@@ -114,6 +116,8 @@ class IViT(nn.Module):
             use_act_checkpoint (bool): If True, use activation checkpointing.
             pretrain_img_size (int): input image size for pretraining models.
             pretrain_use_cls_token (bool): If True, pretrainig models use class token.
+            observe_stat (bool): If True, store activation statistic for analysis.
+            block_name (str): store name of block for visulization
         """
         super().__init__()
         self.pretrain_use_cls_token = pretrain_use_cls_token
@@ -123,7 +127,9 @@ class IViT(nn.Module):
             stride=(patch_size, patch_size),
             in_chans=in_chans,
             embed_dim=embed_dim,
-            num_bits=num_bits
+            num_bits=num_bits,
+            observe_stat = observe_stat,
+            block_name = block_name + "patchembed/"
         )
 
         if use_abs_pos:
@@ -150,7 +156,9 @@ class IViT(nn.Module):
                 dropout= dropout,
                 qkv_bias=qkv_bias,
                 num_bits=num_bits,
-                use_cae=use_cae
+                use_cae=use_cae,
+                observe_stat = observe_stat,
+                block_name = block_name + f"block{i}/"
             )
             if use_act_checkpoint:
                 block = checkpoint_wrapper(block)
@@ -173,6 +181,9 @@ class IViT(nn.Module):
 
         self.qact_input = IViTAct(activation_bit=num_bits)
         self.qact_pos = IViTAct(activation_bit=num_bits)
+
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def export(self):
         self._export = True

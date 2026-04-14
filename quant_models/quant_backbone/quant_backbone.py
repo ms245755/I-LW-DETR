@@ -38,6 +38,8 @@ class Backbone(BackboneBase):
                  out_channels=256,
                  out_feature_indexes: list=None,
                  projector_scale: list=None,
+                 observe_stat = False,
+                 block_name = "backbone/"
                  ):
         super().__init__()
         self.name = name
@@ -71,6 +73,8 @@ class Backbone(BackboneBase):
                 use_abs_pos=True,
                 out_feature_indexes=out_feature_indexes,
                 use_cae=True,
+                observe_stat=observe_stat,
+                block_name=block_name+"vit/"
             )
             # load pretrain model in main_process
             if pretrained_encoder is not None:
@@ -106,6 +110,8 @@ class Backbone(BackboneBase):
         )
 
         self._export = False
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def export(self):
         self._export = True

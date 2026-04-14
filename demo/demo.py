@@ -28,6 +28,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from models import build_model
+from quant_models import build_model_quant
 from util.get_param_dicts import get_param_dict
 import util.misc as utils
 from torchvision import transforms
@@ -149,6 +150,7 @@ def get_args_parser():
     
     # Observation
     parser.add_argument("--observe_stat", action="store_true")
+    parser.add_argument("--quant", action="store_true")
 
     return parser
 
@@ -188,11 +190,14 @@ def main(args):
 
     device = torch.device(args.device)
 
-    model, _, postprocessors = build_model(args)
+    if args.quant:
+        model, _, postprocessors = build_model_quant(args)
+    else:
+        model, _, postprocessors = build_model(args)
+    
     model.to(device)
     model.eval()
 
-    #print(model)
     param_dicts = get_param_dict(args, model)
 
     output_path = Path(args.output_dir) /  "visualize.jpg"
