@@ -27,3 +27,4 @@ output/
 demo/*
 data/
 experiments/
+observed_tensor/

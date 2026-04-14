@@ -58,6 +58,7 @@ def build_backbone(args):
             out_channels=args.hidden_dim,
             out_feature_indexes=args.out_feature_indexes,
             projector_scale=args.projector_scale,
+            observe_stat=args.observe_stat
         )
     # Congpro
     elif 'dinov2' in args.encoder:

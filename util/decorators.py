@@ -3,6 +3,8 @@ import torch
 import functools
 import os
 import inspect
+from pathlib import Path
+from typing import Union
 
 from torch.cuda.amp import autocast
 
@@ -221,3 +223,38 @@ def track_init_args(cls):
     cls.__init__ = __init__
     cls.get_init_kwargs = lambda self: getattr(self, "_init_kwargs", {})
     return cls
+ 
+def save_tensor_from_pathname(
+    x: torch.Tensor,
+    component_path: str,
+    out_dir: Union[str, Path] = "observed_tensor",
+    *,
+    ext: str = ".pt",
+    detach: bool = True,
+    to_cpu: bool = True,
+    overwrite: bool = True,
+) -> Path:
+    """
+    component_path: like "backbone/vit/block0/attn"
+    writes: <out_dir>/backbone/vit/block0/attn.pt
+    """
+    out_dir = Path(out_dir)
+
+    rel = Path(component_path)  # treat as relative path
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError(f"component_path must be a safe relative path, got: {component_path!r}")
+
+    file_path = out_dir / rel
+    file_path = file_path.with_suffix(ext)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if file_path.exists() and not overwrite:
+        raise FileExistsError(str(file_path))
+
+    if detach:
+        x = x.detach()
+    if to_cpu:
+        x = x.cpu()
+
+    torch.save(x, file_path)
+    return file_path

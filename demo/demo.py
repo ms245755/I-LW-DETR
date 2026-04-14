@@ -13,6 +13,12 @@
 """
 inference demo
 """
+import os
+import sys
+current_directory = os.getcwd()
+print(f"Current directory: {current_directory}")
+sys.path.append(os.getcwd())
+
 import argparse
 import random
 from pathlib import Path
@@ -140,6 +146,9 @@ def get_args_parser():
                         help='Directory to save output visualizations.')
     parser.add_argument('--confidence_threshold', type=float, default=0.5,
                         help='Minimum score for instance predictions to be shown')
+    
+    # Observation
+    parser.add_argument("--observe_stat", action="store_true")
 
     return parser
 
@@ -183,6 +192,7 @@ def main(args):
     model.to(device)
     model.eval()
 
+    #print(model)
     param_dicts = get_param_dict(args, model)
 
     output_path = Path(args.output_dir) /  "visualize.jpg"
@@ -198,7 +208,6 @@ def main(args):
 
     images = nested_tensor_from_tensor_list([image])
     orig_image_sizes = torch.stack([orig_image_size])
-
     # forward
     with torch.no_grad():
         outputs = model(images)

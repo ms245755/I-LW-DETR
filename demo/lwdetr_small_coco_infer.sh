@@ -22,4 +22,5 @@ python demo/demo.py \
     --weights $checkpoint \
     --input $image_path \
     --output $output_dir/$model_name \
+    --observe_stat \
     --confidence_threshold 0.5

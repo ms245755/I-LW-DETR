@@ -21,6 +21,7 @@ from fairscale.nn.checkpoint import checkpoint_wrapper
 from timm.models.layers import DropPath, Mlp, trunc_normal_
 
 from util.box_ops import box_cxcywh_to_xyxy
+from util.decorators import save_tensor_from_pathname
 
 
 def get_abs_pos(abs_pos, has_cls_token, hw):
@@ -60,7 +61,7 @@ class PatchEmbed(nn.Module):
     """
 
     def __init__(
-        self, kernel_size=(16, 16), stride=(16, 16), padding=(0, 0), in_chans=3, embed_dim=768
+        self, kernel_size=(16, 16), stride=(16, 16), padding=(0, 0), in_chans=3, embed_dim=768, observe_stat=False, block_name = ""
     ):
         """
         Args:
@@ -69,15 +70,20 @@ class PatchEmbed(nn.Module):
             padding (Tuple): padding size of the projection layer.
             in_chans (int): Number of input image channels.
             embed_dim (int):  embed_dim (int): Patch embedding dimension.
+            observe_stat (bool): If True, store activation statistic for analysis.
+            block_name (str): store name of block for visualization
         """
         super().__init__()
 
         self.proj = nn.Conv2d(
             in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
         )
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def forward(self, x):
         x = self.proj(x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", out_dir="observed_tensor/float/")
         # B C H W -> B H W C
         x = x.permute(0, 2, 3, 1)
         return x
@@ -92,6 +98,8 @@ class Attention(nn.Module):
         num_heads=8,
         qkv_bias=True,
         use_cae=False,
+        observe_stat=False,
+        block_name = ""
     ):
         """
         Args:
@@ -102,6 +110,7 @@ class Attention(nn.Module):
             rel_pos_zero_init (bool): If True, zero initialize relative positional parameters.
             input_size (int or None): Input resolution for calculating the relative positional
                 parameter size.
+            observe_stat (bool): If True, store activation statistic for analysis.
         """
         super().__init__()
         self.num_heads = num_heads
@@ -116,6 +125,8 @@ class Attention(nn.Module):
         else:
             self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def forward(self, x, mask=None):
         B, N, C = x.shape
@@ -139,6 +150,14 @@ class Attention(nn.Module):
 
         return x
 
+# def print_stat(block_name, x, observed=False):
+#     if not observed:
+#         return
+#     print(block_name,
+#             "x finite", torch.isfinite(x).float().mean().item(),
+#             "x absmax", x.detach().abs().max().item(),
+#             "x mean", x.detach().mean().item(),
+#             "x std", x.detach().std().item())
 
 class Block(nn.Module):
     """Transformer blocks with support of window attention and residual propagation blocks"""
@@ -154,6 +173,8 @@ class Block(nn.Module):
         act_layer=nn.GELU,
         window=False,
         use_cae=False,
+        observe_stat=False,
+        block_name = ""
     ):
         """
         Args:
@@ -169,6 +190,8 @@ class Block(nn.Module):
             use_residual_block (bool): If True, use a residual block after the MLP block.
             input_size (int or None): Input resolution for calculating the relative positional
                 parameter size.
+            observe_stat (bool): If True, store activation statistic for analysis.
+            block_name (str): store name of block for visualization
         """
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -177,6 +200,8 @@ class Block(nn.Module):
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             use_cae=use_cae,
+            observe_stat = observe_stat,
+            block_name = block_name + "attn/"
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -191,12 +216,16 @@ class Block(nn.Module):
             init_values = 0.1
             self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
             self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def forward(self, x, mask=None):
         """ Transformer Block forward"""
         B, HW, C = x.shape
         shortcut = x
         x = self.norm1(x)
+        
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"norm1", out_dir="observed_tensor/float/")
 
         if not self.window:
             x = x.reshape(B // 16, 16 * HW, C)
@@ -204,9 +233,14 @@ class Block(nn.Module):
                 mask = mask.reshape(B // 16, 16 * HW)
 
         if self.use_cae:
-            x = self.gamma_1 * self.attn(x, mask)
+            x = self.attn(x, mask)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"attn", out_dir="observed_tensor/float/")
+            x = self.gamma_1 * x
+            # x = self.gamma_1 * self.attn(x, mask)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"gamma1", out_dir="observed_tensor/float/")
         else:
             x = self.attn(x, mask)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"attn", out_dir="observed_tensor/float/")
 
         if not self.window:
             x = x.reshape(B, HW, C)
@@ -214,11 +248,30 @@ class Block(nn.Module):
                 mask = mask.reshape(B, HW)
 
         x = shortcut + self.drop_path(x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"residual1", out_dir="observed_tensor/float/")
         if self.use_cae:
-            x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+            shortcut = x
+            x = self.norm2(x)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"norm2", out_dir="observed_tensor/float/")
+            x = self.mlp(x)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"mlp", out_dir="observed_tensor/float/")
+            x = x * self.gamma_2
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"gamma2", out_dir="observed_tensor/float/")
+            x = self.drop_path(x)
+            
+            x = x + shortcut
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"residual2", out_dir="observed_tensor/float/")
+            # x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
         else:
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-
+            shortcut = x
+            x = self.norm2(x)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"norm2", out_dir="observed_tensor/float/")
+            x = self.mlp(x)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"mlp", out_dir="observed_tensor/float/")
+            x = self.drop_path(x)
+            x = x + shortcut
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"residual2", out_dir="observed_tensor/float/")
+            # x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -249,6 +302,8 @@ class ViT(nn.Module):
         pretrain_use_cls_token=True,
         out_feature_indexes:list=None,
         use_cae=False,
+        observe_stat = False,
+        block_name = ""
     ):
         """
         Args:
@@ -271,6 +326,7 @@ class ViT(nn.Module):
             use_act_checkpoint (bool): If True, use activation checkpointing.
             pretrain_img_size (int): input image size for pretraining models.
             pretrain_use_cls_token (bool): If True, pretrainig models use class token.
+            observe_stat (bool): If True, store activation statistic for analysis.
         """
         super().__init__()
         self.pretrain_use_cls_token = pretrain_use_cls_token
@@ -280,6 +336,8 @@ class ViT(nn.Module):
             stride=(patch_size, patch_size),
             in_chans=in_chans,
             embed_dim=embed_dim,
+            observe_stat = observe_stat,
+            block_name = block_name + "patchembed/"
         )
 
         if use_abs_pos:
@@ -305,6 +363,8 @@ class ViT(nn.Module):
                 act_layer=act_layer,
                 window=True if i in window_block_indexes else False,
                 use_cae=use_cae,
+                observe_stat = observe_stat,
+                block_name = block_name + f"block{i}/"
             )
             if use_act_checkpoint:
                 block = checkpoint_wrapper(block)
@@ -324,6 +384,8 @@ class ViT(nn.Module):
         self.apply(self._init_weights)
 
         self._export = False
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def export(self):
         self._export = True
