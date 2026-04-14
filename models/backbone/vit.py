@@ -150,14 +150,6 @@ class Attention(nn.Module):
 
         return x
 
-# def print_stat(block_name, x, observed=False):
-#     if not observed:
-#         return
-#     print(block_name,
-#             "x finite", torch.isfinite(x).float().mean().item(),
-#             "x absmax", x.detach().abs().max().item(),
-#             "x mean", x.detach().mean().item(),
-#             "x std", x.detach().std().item())
 
 class Block(nn.Module):
     """Transformer blocks with support of window attention and residual propagation blocks"""
