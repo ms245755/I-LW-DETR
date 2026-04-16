@@ -50,10 +50,11 @@ class IPatchEmbed(nn.Module):
         x = x.flatten(2).transpose(1, 2)  # Flatten patches and rearrange to (B, N, C)
         act_scaling_factor = act_scaling_factor.reshape(1, 1, x.shape[2])
         x, act_scaling_factor = self.qact(x, act_scaling_factor)
-
+        
+        x = x.reshape(B, H, W, C)
         save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", out_dir="observed_tensor/quant/")
 
-        return x.reshape(B, H, W, C), act_scaling_factor
+        return x, act_scaling_factor
 
 class IFeedForward(nn.Module):
     """
@@ -230,6 +231,7 @@ class IAttention(nn.Module):
         # Quantize activation after qkv (keep same pipeline)
         x, act_scaling_factor_qkv = self.qact_qkv(x=x, act_scaling_factor=act_scaling_factor)
 
+        save_tensor_from_pathname(x, self.block_name+"qkv", out_dir="observed_tensor/quant/")
         # Split Q, K, V
         qkv = x.reshape(B, N, 3, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -247,9 +249,12 @@ class IAttention(nn.Module):
         act_scaling_factor = act_scaling_factor * self.scale
 
         # Quantize + softmax
+        save_tensor_from_pathname(attn, self.block_name+"attn", out_dir="observed_tensor/quant/")
         attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=act_scaling_factor)
+
         attn, act_scaling_factor = self.softmax(x=attn, act_scaling_factor=act_scaling_factor)
 
+        save_tensor_from_pathname(attn, self.block_name+"softmax", out_dir="observed_tensor/quant/")
         # Apply attention to values
         x, act_scaling_factor = self.matmul(
             A=attn,
@@ -260,10 +265,12 @@ class IAttention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
 
         # Projection + quantize
+        save_tensor_from_pathname(x, self.block_name+"mulvalue", out_dir="observed_tensor/quant/")
         x, act_scaling_factor = self.qact_pre_proj(x=x, act_scaling_factor=act_scaling_factor)
+
         x, act_scaling_factor = self.proj(x=x, act_scaling_factor=act_scaling_factor)
         x, act_scaling_factor = self.qact_proj_drop(x=x, act_scaling_factor=act_scaling_factor)
-
+        save_tensor_from_pathname(x, self.block_name+"output", out_dir="observed_tensor/quant/")
         return x, act_scaling_factor
 
 def print_stat(block_name, x, observed_stat = False):
@@ -313,8 +320,8 @@ class IBlock(nn.Module):
         block_name=""
     ):
         super().__init__()
-        self.norm1 = IViTLayerNorm(normalized_shape=dim)
-        self.norm2 = IViTLayerNorm(normalized_shape=dim)
+        self.norm1 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"norm1/")
+        self.norm2 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"norm2/")
         self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits, observe_stat=observe_stat, block_name=block_name+"attn/")
         self.mlp = IFeedForward(
             dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits

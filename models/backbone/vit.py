@@ -23,7 +23,41 @@ from timm.models.layers import DropPath, Mlp, trunc_normal_
 from util.box_ops import box_cxcywh_to_xyxy
 from util.decorators import save_tensor_from_pathname
 
+class MyLayerNorm(nn.Module):
+    """
+    A LayerNorm variant, popularized by Transformers, that performs point-wise mean and
+    variance normalization over the channel dimension for inputs that have shape
+    (batch_size, height, width, channel).
+    https://github.com/facebookresearch/ConvNeXt/blob/d1fa8f6fef0a165b27399986cc2bdacc92777e40/models/convnext.py#L119
+    """
 
+    def __init__(self, normalized_shape, eps=1e-6, observe_stat=None, block_name=""):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.normalized_shape = (normalized_shape,)
+        self.block_name = block_name
+
+    def forward(self, x):
+        """
+        LayerNorm forward
+        TODO: this is a hack to avoid overflow when using fp16
+        """
+        #if x.dtype == torch.half:
+        #    x = x / (x.max() + self.eps)
+        u = x.mean(-1, keepdim=True)
+        save_tensor_from_pathname(u, self.block_name+"mean", out_dir="observed_tensor/float/")
+        s = (x - u).pow(2).mean(-1, keepdim=True)
+        save_tensor_from_pathname(s, self.block_name+"variance", out_dir="observed_tensor/float/")
+        std = torch.sqrt(s+self.eps)
+        save_tensor_from_pathname(std, self.block_name+"std", out_dir="observed_tensor/float/")
+        x = (x - u) / std
+        save_tensor_from_pathname(x, self.block_name+"normalized_x", out_dir="observed_tensor/float/")
+        x = self.weight[None, None, :] * x + self.bias[None, None, :]
+        save_tensor_from_pathname(x, self.block_name+"output", out_dir="observed_tensor/float/")
+        return x
+    
 def get_abs_pos(abs_pos, has_cls_token, hw):
     """
     Calculate absolute positional embeddings. If needed, resize embeddings and remove cls_token
@@ -83,9 +117,9 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         x = self.proj(x)
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", out_dir="observed_tensor/float/")
         # B C H W -> B H W C
         x = x.permute(0, 2, 3, 1)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", out_dir="observed_tensor/float/")
         return x
 
 
@@ -137,17 +171,22 @@ class Attention(nn.Module):
         else:
             qkv = self.qkv(x)
 
+        save_tensor_from_pathname(qkv, self.block_name+"qkv", out_dir="observed_tensor/float/")
         # pytorch naive implementation
         qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         attn = (q * self.scale) @ k.transpose(-2, -1)
+
+        save_tensor_from_pathname(attn, self.block_name+"attn", out_dir="observed_tensor/float/")
         if mask is not None:
             attn.masked_fill_(mask.reshape(B, 1, 1, N).expand_as(attn), float('-inf'))
 
         attn = attn.softmax(dim=-1)
+        save_tensor_from_pathname(attn, self.block_name+"softmax", out_dir="observed_tensor/float/")
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        save_tensor_from_pathname(x, self.block_name+"mulvalue", out_dir="observed_tensor/float/")
         x = self.proj(x)
-
+        save_tensor_from_pathname(x, self.block_name+"output", out_dir="observed_tensor/float/")
         return x
 
 
@@ -161,7 +200,7 @@ class Block(nn.Module):
         mlp_ratio=4.0,
         qkv_bias=True,
         drop_path=0.0,
-        norm_layer=nn.LayerNorm,
+        norm_layer=MyLayerNorm,
         act_layer=nn.GELU,
         window=False,
         use_cae=False,
@@ -186,7 +225,7 @@ class Block(nn.Module):
             block_name (str): store name of block for visualization
         """
         super().__init__()
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim, block_name=block_name+"norm1/")
         self.attn = Attention(
             dim,
             num_heads=num_heads,
@@ -197,7 +236,7 @@ class Block(nn.Module):
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(dim, block_name=block_name+"norm2/")
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
 
         self.window = window
@@ -285,7 +324,7 @@ class ViT(nn.Module):
         mlp_ratio=4.0,
         qkv_bias=True,
         drop_path_rate=0.0,
-        norm_layer=nn.LayerNorm,
+        norm_layer=MyLayerNorm,
         act_layer=nn.GELU,
         use_abs_pos=True,
         window_block_indexes=(),
@@ -390,11 +429,12 @@ class ViT(nn.Module):
             trunc_normal_(m.weight, std=0.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
+        elif isinstance(m, MyLayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"input", out_dir="observed_tensor/float/")
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             if self._export:

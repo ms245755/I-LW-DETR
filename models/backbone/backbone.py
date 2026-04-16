@@ -68,7 +68,7 @@ class Backbone(BackboneBase):
                 drop_path_rate=dp,
                 mlp_ratio=4,
                 qkv_bias=True,
-                norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                # norm_layer=partial(nn.LayerNorm, eps=1e-6),
                 window_block_indexes=window_block_indexes,
                 use_act_checkpoint=False,  # use checkpoint to save memory
                 use_abs_pos=True,

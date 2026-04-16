@@ -25,6 +25,7 @@ from util.box_ops import box_cxcywh_to_xyxy
 from quant_models.fake_quantized.layers import *
 from util.utils import init_weights
 from quant_models.quant_blocks import *
+from util.decorators import save_tensor_from_pathname
 
 
 def get_abs_pos(abs_pos, has_cls_token, hw):
@@ -201,6 +202,7 @@ class IViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"input", out_dir="observed_tensor/quant/")
         x, act_scaling_factor = self.qact_input(x=x, act_scaling_factor=None)
 
         x, act_scaling_factor = self.patch_embed(x, act_scaling_factor)
