@@ -233,11 +233,14 @@ def save_tensor_from_pathname(
     detach: bool = True,
     to_cpu: bool = True,
     overwrite: bool = True,
+    observe_stat: bool = False,
 ) -> Path:
     """
     component_path: like "backbone/vit/block0/attn"
     writes: <out_dir>/backbone/vit/block0/attn.pt
     """
+    if not observe_stat:
+        return
     out_dir = Path(out_dir)
 
     rel = Path(component_path)  # treat as relative path
