@@ -17,6 +17,8 @@ Train and eval functions used in main.py
 import math
 import sys
 from typing import Iterable
+import random
+from torch.utils.data import Subset, DataLoader
 
 import torch
 import util.misc as utils
@@ -235,3 +237,14 @@ def calibrate(
     freeze_model(model)
 
     return model
+
+def make_random_calib_loader(original_dataset, batch_size, seed, n_samples=800, **loader_kwargs):
+    # Sample random, non-repeating indices
+    indices = list(range(len(original_dataset)))
+    random.seed(seed)
+    random.shuffle(indices)
+    indices = indices[:n_samples]
+    subset = Subset(original_dataset, indices)
+    
+    # Return a new loader that only uses this random subset
+    return DataLoader(subset, batch_size=batch_size, shuffle=False, **loader_kwargs)

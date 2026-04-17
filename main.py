@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import GradScaler
 
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import evaluate, train_one_epoch, calibrate
+from engine import evaluate, make_random_calib_loader, train_one_epoch, calibrate
 from models import build_model
 from quant_models import build_model_quant
 from util.drop_scheduler import drop_scheduler
@@ -314,12 +314,21 @@ def main(args):
     
     if args.calib:
         # 1) calibrate using val set (or train set). val is usually fine.
+        num_calib_batch = 200
+        calib_loader = make_random_calib_loader(
+            dataset_val,
+            batch_size=args.batch_size,
+            seed=seed,                  # <--- fixed seed for reproducibility!
+            n_samples=num_calib_batch * args.batch_size,
+            collate_fn=utils.collate_fn,
+            num_workers=0
+        )
         calibrate(
             model,
-            data_loader_val,
+            calib_loader,
             device,
             args=args,
-            calib_batches=getattr(args, "calib_batches", 200),
+            calib_batches=num_calib_batch,
         )
 
         # 2) (optional) save calibrated quant checkpoint
