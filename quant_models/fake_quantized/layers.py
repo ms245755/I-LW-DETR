@@ -594,7 +594,7 @@ class IViTLayerNormChannelFirst(nn.LayerNorm):
         super(IViTLayerNormChannelFirst, self).__init__(
             normalized_shape=normalized_shape, eps=eps, elementwise_affine=elementwise_affine
         )
-        self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(normalized_shape)))
+        self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(normalized_shape, 1, 1)))
         self.register_buffer("bias_integer", nn.Parameter(torch.ones_like(self.bias)))
         self.register_buffer(
             "base_act_scaling_factor",
@@ -644,13 +644,13 @@ class IViTGELU(nn.Module):
     Class to quantize given GELU layer
     """
 
-    def __init__(self, output_bit=8):
+    def __init__(self, output_bit=8, temp =1.702):
         super(IViTGELU, self).__init__()
         self.output_bit = output_bit
 
         self.n = 23  # sufficiently large integer
         # The minimum value for ensuring accuracy (varies depending on models)
-
+        self.temp = temp
         self.register_buffer("act_scaling_factor", torch.zeros(1))
 
     def fix(self):
@@ -676,7 +676,7 @@ class IViTGELU(nn.Module):
 
     def forward(self, x, act_scaling_factor=None):
         pre_x_int = x / act_scaling_factor
-        act_scaling_factor_sig = act_scaling_factor * 1.702
+        act_scaling_factor_sig = act_scaling_factor * self.temp
 
         x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
         x_int = pre_x_int - x_int_max
