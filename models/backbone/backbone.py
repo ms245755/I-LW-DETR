@@ -138,6 +138,8 @@ class Backbone(BackboneBase):
             in_channels=self.encoder._out_feature_channels,
             out_channels=out_channels,
             scale_factors=scale_factors,
+            observe_stat=observe_stat,
+            block_name=block_name+"projector/"
         )
 
         self._export = False

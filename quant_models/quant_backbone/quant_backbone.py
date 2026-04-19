@@ -103,10 +103,12 @@ class Backbone(BackboneBase):
         )
         scale_factors = [level2scalefactor[lvl] for lvl in self.projector_scale]
 
-        self.projector = MultiScaleProjector(
+        self.projector = IMultiScaleProjector(
             in_channels=self.encoder._out_feature_channels,
             out_channels=out_channels,
             scale_factors=scale_factors,
+            observe_stat=observe_stat,
+            block_name=block_name+"projector/"
         )
 
         self._export = False
@@ -123,8 +125,8 @@ class Backbone(BackboneBase):
         """
         # (H, W, B, C)
         feats = self.encoder(tensor_list.tensors)
-        feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
+        feats = [feat for (feat, scale) in feats]
         # x: [(B, C, H, W)]
         out = []
         # for (feat, scale) in feats:

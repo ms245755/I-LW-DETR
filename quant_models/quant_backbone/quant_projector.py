@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from quant_models.fake_quantized.layers import *
+from quant_models.fake_quantized.utils import *
+from util.decorators import save_tensor_from_pathname
     
 def get_norm(norm, out_channels):
     """
@@ -40,11 +42,12 @@ def get_norm(norm, out_channels):
 
 def get_activation(name, inplace=False):
     """ get activation """
-    return ISegGELU()
+    ### actually it's silu, not gelu
+    return ISegGELU(temp=1.0)
 
 class IConvX(nn.Module):
     """ Conv-bn module"""
-    def __init__(self, in_planes, out_planes, kernel=3, stride=1, groups=1, dilation=1, act='relu'):
+    def __init__(self, in_planes, out_planes, kernel=3, stride=1, groups=1, dilation=1, act='relu', observe_stat=False, block_name=""):
         super(IConvX, self).__init__()
         self.conv = IViTConv2d(in_planes, out_planes, kernel_size=kernel,
                               stride=stride, padding=kernel // 2, groups=groups,
@@ -54,40 +57,42 @@ class IConvX(nn.Module):
         self.act = get_activation(act, inplace=True)
         self.qact_post_conv = IViTAct()
         self.qact_post_act = IViTAct()
+        self.block_name = block_name
+        self.observe_stat = observe_stat
 
     def forward(self, x, act_scaling_factor=None):
         """ forward """
         x, act_scaling_factor = self.conv(x, act_scaling_factor)
         x, act_scaling_factor = self.qact_post_conv(x, act_scaling_factor)
+        save_tensor_from_pathname(x, self.block_name+"conv", "observed_tensor/quant/")
         x, act_scaling_factor = self.act(x, act_scaling_factor)
         x, act_scaling_factor = self.qact_post_act(x, act_scaling_factor)
+        save_tensor_from_pathname(x, self.block_name+"act", "observed_tensor/quant/")
         return x, act_scaling_factor
 
 
 class IBottleneck(nn.Module):
     """Standard bottleneck."""
 
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu'):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu', block_name=""):
         """ ch_in, ch_out, shortcut, groups, kernels, expand """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = IConvX(c1, c_, k[0], 1, act=act)
-        self.cv2 = IConvX(c_, c2, k[1], 1, groups=g, act=act)
+        self.cv1 = IConvX(c1, c_, k[0], 1, act=act, block_name=block_name+"cv1/")
+        self.cv2 = IConvX(c_, c2, k[1], 1, groups=g, act=act, block_name=block_name+"cv2/")
         self.add = shortcut and c1 == c2
+        self.block_name = block_name
 
     def forward(self, x, act_scaling_factor=None):
         """'forward()' applies the YOLOv5 FPN to input data."""
         x_short = x
         act_scaling_factor_short = act_scaling_factor
         x, act_scaling_factor= self.cv1(x, act_scaling_factor)
+        save_tensor_from_pathname(x, self.block_name+"cv1", "observed_tensor/quant/")
         x, act_scaling_factor= self.cv2(x, act_scaling_factor)
-
+        save_tensor_from_pathname(x, self.block_name+"cv2", "observed_tensor/quant/")
         if self.add:
-            out_scale = torch.max(act_scaling_factor, act_scaling_factor_short)
-            x_short   = round_ste.apply(x_short / out_scale)
-            x        = round_ste.apply(x  / out_scale)
-            x = (x + x_short) * out_scale
-            act_scaling_factor = out_scale
+            x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, x_short, act_scaling_factor_short)
 
         return x, act_scaling_factor
 
@@ -95,35 +100,40 @@ class IBottleneck(nn.Module):
 class IC2f(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, act='silu'):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, act='silu', observe_stat=False, block_name=""):
         """ ch_in, ch_out, number, shortcut, groups, expansion """
         super().__init__()
+        self.observe_stat = observe_stat
+        self.block_name = block_name
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = IConvX(c1, 2 * self.c, 1, 1, act=act)
-        self.cv2 = IConvX((2 + n) * self.c, c2, 1, act=act)  # optional act=FReLU(c2)
-        self.m = nn.ModuleList(IBottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act) for _ in range(n))
+        self.cv1 = IConvX(c1, 2 * self.c, 1, 1, act=act, observe_stat=observe_stat, block_name=block_name+"cv1/")
+        self.cv2 = IConvX((2 + n) * self.c, c2, 1, act=act, observe_stat=observe_stat, block_name=block_name+"cv2/")  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(IBottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act, block_name=block_name+f"bot{i}") for i in range(n))
 
     def forward(self, x, act_scaling_factor):
         """Forward pass using split() instead of chunk()."""
         x_out, act_scaling_factor = self.cv1(x, act_scaling_factor)
-
-        y = list(x_out.split((self.c, self.c), 1))
-
-        act_scaling_factors_list = [act_scaling_factor]
-        for m in self.m:
-            x_out, scale = m(y[-1], act_scaling_factors_list[-1])
-            y.append(x_out)
-            act_scaling_factors_list.append(scale)
+        save_tensor_from_pathname(x_out, self.block_name+"cv1", "observed_tensor/quant/")
         
-        out_scale = torch.stack(act_scaling_factors_list).max()
-        for i in range(len(act_scaling_factors_list)):
-            y[i] = round_ste.apply(y[i] / act_scaling_factors_list[i])
+        y = [(tmp, act_scaling_factor) for tmp in x_out.split((self.c, self.c), 1)]
 
-        concatenated_output = torch.cat(y, 1)
-        concatenated_output = concatenated_output * out_scale
-        final_output, act_scaling_factor_final = self.cv2(concatenated_output, out_scale)
+        # act_scaling_factors_list = [act_scaling_factor]
+        for i, layer in enumerate(self.m):
+            x_out, scale = layer(y[-1][0], y[-1][1])
+            y.append((x_out, scale))
+            save_tensor_from_pathname(x_out, self.block_name+f"{i}", "observed_tensor/quant/")
+            # act_scaling_factors_list.append(scale)
+        
+        concatenated_output, act_scaling_factor = concat_list_tensor_scale(y, 1)
+        # out_scale = torch.stack(act_scaling_factors_list).max()
+        # for i in range(len(act_scaling_factors_list)):
+        #     y[i] = round_ste.apply(y[i] / act_scaling_factors_list[i])
 
-        return final_output, act_scaling_factor_final
+        # concatenated_output = torch.cat(y, 1)
+        # concatenated_output = concatenated_output * out_scale
+        final_output, act_scaling_factor = self.cv2(concatenated_output, act_scaling_factor)
+        save_tensor_from_pathname(final_output, self.block_name+"cv2", "observed_tensor/quant/")
+        return final_output, act_scaling_factor
 
 
 class IMultiScaleProjector(nn.Module):
@@ -137,7 +147,9 @@ class IMultiScaleProjector(nn.Module):
         in_channels,
         out_channels,
         scale_factors,
-        num_blocks=3
+        num_blocks=3,
+        observe_stat=False,
+        block_name=""
     ):
         """
         Args:
@@ -150,6 +162,8 @@ class IMultiScaleProjector(nn.Module):
         super(IMultiScaleProjector, self).__init__()
 
         self.scale_factors = scale_factors
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
         stages_sampling = []
         stages = []
@@ -167,7 +181,7 @@ class IMultiScaleProjector(nn.Module):
                         IViTAct(),
                         get_norm('LN', in_dim // 2),
                         IViTAct(),
-                        IViTGELU,
+                        ISegGELU,
                         IViTAct(),
                         IViTConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
                         IViTAct(),
@@ -203,7 +217,7 @@ class IMultiScaleProjector(nn.Module):
 
             in_dim = out_dim * len(in_channels)
             layers = [
-                IC2f(in_dim, out_channels, num_blocks),
+                IC2f(in_dim, out_channels, num_blocks, observe_stat=observe_stat, block_name=block_name+"c2f/"),
                 get_norm('LN', out_channels),
                 IViTAct()
             ]
@@ -244,8 +258,6 @@ class IMultiScaleProjector(nn.Module):
                 feat_cat = torch.cat([feat for (feat, _) in feat_fuse], dim=1)
                 # 2) concat scales in channel order
                 scale_cat = torch.cat([fs.expand(feat.shape[1]) for (feat, fs) in feat_fuse], dim=0)  # should be length == C_total
-                # print(feat_cat.shape)
-                # print(scale_cat.shape)
 
                 feat_fuse, max_scale = self.qact_post_fuse(feat_cat, scale_cat)
             else:
@@ -253,9 +265,10 @@ class IMultiScaleProjector(nn.Module):
                 feat_fuse = feat_fuse[0][0]
             feat = feat_fuse
             scale = max_scale
-            # print("fuse scale:", max_scale, "feat_fuse min/max:", feat_fuse.min().item(), feat_fuse.max().item())
-            for layer in stage:
+            save_tensor_from_pathname(feat, self.block_name+"feat", "observed_tensor/quant/")
+            for i, layer in enumerate(stage):
                 feat, scale = layer(feat, scale)
+                save_tensor_from_pathname(feat, self.block_name+f"{i}", "observed_tensor/quant/")
             results.append((feat, scale))
         if self.use_extra_pool:
             results.append(

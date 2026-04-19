@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from util.decorators import save_tensor_from_pathname
+
 
 class LayerNorm(nn.Module):
     """
@@ -84,52 +86,77 @@ def get_activation(name, inplace=False):
 
 class ConvX(nn.Module):
     """ Conv-bn module"""
-    def __init__(self, in_planes, out_planes, kernel=3, stride=1, groups=1, dilation=1, act='relu'):
+    def __init__(self, in_planes, out_planes, kernel=3, stride=1, groups=1, dilation=1, act='relu', observe_stat=False, block_name=""):
         super(ConvX, self).__init__()
         self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel,
                               stride=stride, padding=kernel // 2, groups=groups,
                               dilation=dilation, bias=False)
         self.bn = nn.BatchNorm2d(out_planes)
         self.act = get_activation(act, inplace=True)
+        self.block_name = block_name
+        self.observe_stat = observe_stat
 
     def forward(self, x):
         """ forward """
-        out = self.act(self.bn(self.conv(x)))
+        x = self.bn(self.conv(x))
+        save_tensor_from_pathname(x, self.block_name+"conv", "observed_tensor/float/")
+        out = self.act(x)
+        save_tensor_from_pathname(x, self.block_name+"act", "observed_tensor/float/")
         return out
 
 
 class Bottleneck(nn.Module):
     """Standard bottleneck."""
 
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu'):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu', block_name=""):
         """ ch_in, ch_out, shortcut, groups, kernels, expand """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = ConvX(c1, c_, k[0], 1, act=act)
-        self.cv2 = ConvX(c_, c2, k[1], 1, groups=g, act=act)
+        self.cv1 = ConvX(c1, c_, k[0], 1, act=act, block_name=block_name+"cv1/")
+        self.cv2 = ConvX(c_, c2, k[1], 1, groups=g, act=act, block_name=block_name+"cv2/")
         self.add = shortcut and c1 == c2
+        self.block_name = block_name
 
     def forward(self, x):
         """'forward()' applies the YOLOv5 FPN to input data."""
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        x_short = x
+        x = self.cv1(x)
+        save_tensor_from_pathname(x, self.block_name+"cv1", "observed_tensor/float/")
+        x = self.cv2(x)
+        save_tensor_from_pathname(x, self.block_name+"cv2", "observed_tensor/float/")
+        if self.add:
+            x = x + x_short
 
+        return x
 
 class C2f(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, act='silu'):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, act='silu', observe_stat=False, block_name=""):
         """ ch_in, ch_out, number, shortcut, groups, expansion """
         super().__init__()
+        self.block_name = block_name
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = ConvX(c1, 2 * self.c, 1, 1, act=act)
-        self.cv2 = ConvX((2 + n) * self.c, c2, 1, act=act)  # optional act=FReLU(c2)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act) for _ in range(n))
+        self.cv1 = ConvX(c1, 2 * self.c, 1, 1, act=act, block_name=block_name+"cv2/")
+        self.cv2 = ConvX((2 + n) * self.c, c2, 1, act=act, block_name=block_name+"cv2/")  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act, block_name=block_name+f"bot{i}") for i in range(n))
 
     def forward(self, x):
         """Forward pass using split() instead of chunk()."""
-        y = list(self.cv1(x).split((self.c, self.c), 1))
-        y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(torch.cat(y, 1))
+        x_out = self.cv1(x)
+        save_tensor_from_pathname(x_out, self.block_name+"cv1", "observed_tensor/float/")
+
+        y = list(x_out.split((self.c, self.c), 1))
+        for i, layer in enumerate(self.m):
+            # print(y[-1].shape)
+            y.append(layer(y[-1]))
+            save_tensor_from_pathname(y[-1], self.block_name+f"{i}", "observed_tensor/float/")
+
+        y = torch.cat(y, 1)
+        final_output = self.cv2(y)
+        save_tensor_from_pathname(final_output, self.block_name+"cv2", "observed_tensor/float/")
+        return final_output
 
 
 class MultiScaleProjector(nn.Module):
@@ -143,7 +170,9 @@ class MultiScaleProjector(nn.Module):
         in_channels,
         out_channels,
         scale_factors,
-        num_blocks=3
+        num_blocks=3,
+        observe_stat=False,
+        block_name = ""
     ):
         """
         Args:
@@ -156,7 +185,8 @@ class MultiScaleProjector(nn.Module):
         super(MultiScaleProjector, self).__init__()
 
         self.scale_factors = scale_factors
-
+        self.observe_stat = observe_stat
+        self.block_name = block_name
         stages_sampling = []
         stages = []
         # use_bias = norm == ""
@@ -202,7 +232,7 @@ class MultiScaleProjector(nn.Module):
 
             in_dim = out_dim * len(in_channels)
             layers = [
-                C2f(in_dim, out_channels, num_blocks),
+                C2f(in_dim, out_channels, num_blocks, block_name=block_name+"c2f/"),
                 get_norm('LN', out_channels),
             ]
             layers = nn.Sequential(*layers)
@@ -233,7 +263,12 @@ class MultiScaleProjector(nn.Module):
                 feat_fuse = torch.cat(feat_fuse, dim=1)
             else:
                 feat_fuse = feat_fuse[0]
-            results.append(stage(feat_fuse))
+            save_tensor_from_pathname(feat_fuse, self.block_name+"feat", "observed_tensor/float/")
+            for i, layer in enumerate(stage):
+                feat_fuse = layer(feat_fuse)
+                save_tensor_from_pathname(feat_fuse, self.block_name+f"{i}", "observed_tensor/float/")
+            results.append(feat_fuse)
+
         if self.use_extra_pool:
             results.append(
                 F.max_pool2d(results[-1], kernel_size=1, stride=2, padding=0)

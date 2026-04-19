@@ -184,6 +184,10 @@ def get_args_parser():
     parser_export.add_argument('--tensorrt', '--trtexec', '--trt', action='store_true',
                                help="build tensorrt engine")
     parser_export.add_argument('--dry-run', '--test', '-t', action='store_true', help="just print command")
+    
+    # analysis
+    parser_export.add_argument('--observe_stat', action='store_true', help="save activation tensor for analysis")
+    
     return parser
 
 
@@ -281,8 +285,8 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        # if args.qat or args.calib:
-        #     checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
+        if args.qat or args.calib:
+            checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
         stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         # for n, m in model.named_modules():
         #     if "backbone" in n and (n.count(".") <= 3):
