@@ -31,6 +31,7 @@ from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, make_random_calib_loader, train_one_epoch, calibrate
 from models import build_model
 from quant_models import build_model_quant
+from quant_models.fake_quantized.model_utils import freeze_model, unfreeze_model
 from util.drop_scheduler import drop_scheduler
 from util.get_param_dicts import get_param_dict
 import util.misc as utils
@@ -295,7 +296,7 @@ def main(args):
             else:
                 del ema_m
                 ema_m = ModelEma(model) 
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+        if not args.eval and not args.qat and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             checkpoint['optimizer']["param_groups"] = optimizer.state_dict()["param_groups"]
             checkpoint['lr_scheduler'].pop("step_size")
             checkpoint['lr_scheduler'].pop("_last_lr")
@@ -374,6 +375,8 @@ def main(args):
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
     for epoch in range(0, args.epochs):
+        if epoch < 3 and args.qat:
+            unfreeze_model(model)
         epoch_start_time = time.time()
         if args.distributed:
             sampler_train.set_epoch(epoch)
@@ -384,7 +387,8 @@ def main(args):
             vit_encoder_num_layers=args.vit_encoder_num_layers, args=args)
         train_epoch_time = time.time() - epoch_start_time
         train_epoch_time_str = str(datetime.timedelta(seconds=int(train_epoch_time)))
-        
+        if epoch < 3 and args.qat:
+            freeze_model(model)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
