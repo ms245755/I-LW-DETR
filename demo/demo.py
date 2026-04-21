@@ -33,6 +33,7 @@ from util.get_param_dicts import get_param_dict
 import util.misc as utils
 from torchvision import transforms
 from util.misc import nested_tensor_from_tensor_list
+from quant_models.fake_quantized.model_utils import *
 
 # COCO classes
 COCO_CLASSES = [
@@ -150,7 +151,7 @@ def get_args_parser():
     
     # Observation
     parser.add_argument("--observe_stat", action="store_true")
-    parser.add_argument("--quant", action="store_true")
+    parser.add_argument("--mode", type=str, default="float")
 
     return parser
 
@@ -190,13 +191,16 @@ def main(args):
 
     device = torch.device(args.device)
 
-    if args.quant:
+    if args.mode == 'quant':
+        print("Build quant model")
         model, _, postprocessors = build_model_quant(args)
     else:
+        print("Build float model")
         model, _, postprocessors = build_model(args)
     
     model.to(device)
     model.eval()
+    freeze_model(model)
 
     param_dicts = get_param_dict(args, model)
 
@@ -204,7 +208,7 @@ def main(args):
 
     if args.weights:
         checkpoint = torch.load(args.weights, map_location='cpu')
-        model.load_state_dict(checkpoint['model'], strict=True)
+        model.load_state_dict(checkpoint['model'], strict=False)
 
     # preprocess
     image, orig_image_size = preprocess_image(args.input)

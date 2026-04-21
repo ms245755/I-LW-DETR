@@ -2,6 +2,7 @@ model_name='lwdetr_small_coco'
 checkpoint=$1
 image_path=$2
 output_dir=$3
+mode=$4
 
 python demo/demo.py \
     --encoder dinov2 \
@@ -23,4 +24,5 @@ python demo/demo.py \
     --input $image_path \
     --output $output_dir/$model_name \
     --observe_stat \
+    --mode $mode \
     --confidence_threshold 0.5
