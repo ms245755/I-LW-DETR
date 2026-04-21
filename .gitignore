@@ -24,7 +24,6 @@ plot*.py
 *.engine
 pretrain_weights/*
 output/
-demo/*
 data/
 experiments/
 observed_tensor/
