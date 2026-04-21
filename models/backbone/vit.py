@@ -434,7 +434,7 @@ class ViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", observe_stat=self.observe_stat)
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             if self._export:

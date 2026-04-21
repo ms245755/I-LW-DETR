@@ -202,7 +202,7 @@ class IViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", out_dir="observed_tensor/quant/")
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", observe_stat=self.observe_stat)
         x, act_scaling_factor = self.qact_input(x=x, act_scaling_factor=None)
 
         x, act_scaling_factor = self.patch_embed(x, act_scaling_factor)
