@@ -119,7 +119,7 @@ class PatchEmbed(nn.Module):
         x = self.proj(x)
         # B C H W -> B H W C
         x = x.permute(0, 2, 3, 1)
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", observe_stat=self.observe_stat)
         return x
 
 
@@ -171,22 +171,22 @@ class Attention(nn.Module):
         else:
             qkv = self.qkv(x)
 
-        save_tensor_from_pathname(qkv, self.block_name+"qkv", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(qkv, self.block_name+"0_qkv", observe_stat=self.observe_stat)
         # pytorch naive implementation
         qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         attn = (q * self.scale) @ k.transpose(-2, -1)
 
-        save_tensor_from_pathname(attn, self.block_name+"attn", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(attn, self.block_name+"1_attn", observe_stat=self.observe_stat)
         if mask is not None:
             attn.masked_fill_(mask.reshape(B, 1, 1, N).expand_as(attn), float('-inf'))
 
         attn = attn.softmax(dim=-1)
-        save_tensor_from_pathname(attn, self.block_name+"softmax", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(attn, self.block_name+"2_softmax", observe_stat=self.observe_stat)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        save_tensor_from_pathname(x, self.block_name+"mulvalue", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"3_mulvalue", observe_stat=self.observe_stat)
         x = self.proj(x)
-        save_tensor_from_pathname(x, self.block_name+"output", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"4_output", observe_stat=self.observe_stat)
         return x
 
 
@@ -225,18 +225,18 @@ class Block(nn.Module):
             block_name (str): store name of block for visualization
         """
         super().__init__()
-        self.norm1 = norm_layer(dim, block_name=block_name+"norm1/")
+        self.norm1 = norm_layer(dim, block_name=block_name+"0_norm1/")
         self.attn = Attention(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             use_cae=use_cae,
             observe_stat = observe_stat,
-            block_name = block_name + "attn/"
+            block_name = block_name + "1_attn/"
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = norm_layer(dim, block_name=block_name+"norm2/")
+        self.norm2 = norm_layer(dim, block_name=block_name+"4_norm2/")
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
 
         self.window = window
@@ -256,7 +256,7 @@ class Block(nn.Module):
         shortcut = x
         x = self.norm1(x)
         
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"norm1", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_norm1", observe_stat=self.observe_stat)
 
         if not self.window:
             x = x.reshape(B // 16, 16 * HW, C)
@@ -265,13 +265,13 @@ class Block(nn.Module):
 
         if self.use_cae:
             x = self.attn(x, mask)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"attn", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"1_attn", observe_stat=self.observe_stat)
             x = self.gamma_1 * x
             # x = self.gamma_1 * self.attn(x, mask)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"gamma1", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"2_gamma1", observe_stat=self.observe_stat)
         else:
             x = self.attn(x, mask)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"attn", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"1_attn", observe_stat=self.observe_stat)
 
         if not self.window:
             x = x.reshape(B, HW, C)
@@ -279,29 +279,29 @@ class Block(nn.Module):
                 mask = mask.reshape(B, HW)
 
         x = shortcut + self.drop_path(x)
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"residual1", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"3_residual1", observe_stat=self.observe_stat)
         if self.use_cae:
             shortcut = x
             x = self.norm2(x)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"norm2", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2", observe_stat=self.observe_stat)
             x = self.mlp(x)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"mlp", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"5_mlp", observe_stat=self.observe_stat)
             x = x * self.gamma_2
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"gamma2", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"6_gamma2", observe_stat=self.observe_stat)
             x = self.drop_path(x)
             
             x = x + shortcut
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"residual2", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"7_residual2", observe_stat=self.observe_stat)
             # x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
         else:
             shortcut = x
             x = self.norm2(x)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"norm2", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2", observe_stat=self.observe_stat)
             x = self.mlp(x)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"mlp", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"5_mlp", observe_stat=self.observe_stat)
             x = self.drop_path(x)
             x = x + shortcut
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"residual2", out_dir="observed_tensor/float/")
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"7_residual2", observe_stat=self.observe_stat)
             # x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -368,7 +368,7 @@ class ViT(nn.Module):
             in_chans=in_chans,
             embed_dim=embed_dim,
             observe_stat = observe_stat,
-            block_name = block_name + "patchembed/"
+            block_name = block_name + "1_patchembed/"
         )
 
         if use_abs_pos:
@@ -434,7 +434,7 @@ class ViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"input", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", out_dir="observed_tensor/float/")
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             if self._export:

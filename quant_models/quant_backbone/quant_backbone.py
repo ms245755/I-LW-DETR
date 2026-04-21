@@ -39,7 +39,7 @@ class Backbone(BackboneBase):
                  out_feature_indexes: list=None,
                  projector_scale: list=None,
                  observe_stat = False,
-                 block_name = "backbone/"
+                 block_name = "observed_tensor/quant/backbone/"
                  ):
         super().__init__()
         self.name = name

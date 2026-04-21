@@ -99,32 +99,33 @@ class ConvX(nn.Module):
     def forward(self, x):
         """ forward """
         x = self.bn(self.conv(x))
-        save_tensor_from_pathname(x, self.block_name+"conv", "observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"0_conv", observe_stat=self.observe_stat)
         out = self.act(x)
-        save_tensor_from_pathname(x, self.block_name+"act", "observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"1_act", observe_stat=self.observe_stat)
         return out
 
 
 class Bottleneck(nn.Module):
     """Standard bottleneck."""
 
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu', block_name=""):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu', block_name="", observe_stat=False):
         """ ch_in, ch_out, shortcut, groups, kernels, expand """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = ConvX(c1, c_, k[0], 1, act=act, block_name=block_name+"cv1/")
-        self.cv2 = ConvX(c_, c2, k[1], 1, groups=g, act=act, block_name=block_name+"cv2/")
+        self.cv1 = ConvX(c1, c_, k[0], 1, act=act, block_name=block_name+"cv1/", observe_stat=observe_stat)
+        self.cv2 = ConvX(c_, c2, k[1], 1, groups=g, act=act, block_name=block_name+"cv2/", observe_stat=observe_stat)
         self.add = shortcut and c1 == c2
         self.block_name = block_name
+        self.observe_stat=observe_stat
 
     def forward(self, x):
         """'forward()' applies the YOLOv5 FPN to input data."""
         # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
         x_short = x
         x = self.cv1(x)
-        save_tensor_from_pathname(x, self.block_name+"cv1", "observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"cv1", observe_stat=self.observe_stat)
         x = self.cv2(x)
-        save_tensor_from_pathname(x, self.block_name+"cv2", "observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"cv2", observe_stat=self.observe_stat)
         if self.add:
             x = x + x_short
 
@@ -138,24 +139,24 @@ class C2f(nn.Module):
         super().__init__()
         self.block_name = block_name
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = ConvX(c1, 2 * self.c, 1, 1, act=act, block_name=block_name+"cv2/")
-        self.cv2 = ConvX((2 + n) * self.c, c2, 1, act=act, block_name=block_name+"cv2/")  # optional act=FReLU(c2)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act, block_name=block_name+f"bot{i}") for i in range(n))
+        self.cv1 = ConvX(c1, 2 * self.c, 1, 1, act=act, block_name=block_name+"0_cv1/", observe_stat=observe_stat)
+        self.cv2 = ConvX((2 + n) * self.c, c2, 1, act=act, block_name=block_name+"2_cv2/", observe_stat=observe_stat)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act, block_name=block_name+f"1_bot{i}/", observe_stat=observe_stat) for i in range(n))
 
     def forward(self, x):
         """Forward pass using split() instead of chunk()."""
         x_out = self.cv1(x)
-        save_tensor_from_pathname(x_out, self.block_name+"cv1", "observed_tensor/float/")
+        # save_tensor_from_pathname(x_out, self.block_name+"cv1", "observed_tensor/float/")
 
         y = list(x_out.split((self.c, self.c), 1))
         for i, layer in enumerate(self.m):
             # print(y[-1].shape)
             y.append(layer(y[-1]))
-            save_tensor_from_pathname(y[-1], self.block_name+f"{i}", "observed_tensor/float/")
+            # save_tensor_from_pathname(y[-1], self.block_name+f"{i}", "observed_tensor/float/")
 
         y = torch.cat(y, 1)
         final_output = self.cv2(y)
-        save_tensor_from_pathname(final_output, self.block_name+"cv2", "observed_tensor/float/")
+        # save_tensor_from_pathname(final_output, self.block_name+"cv2", "observed_tensor/float/")
         return final_output
 
 
@@ -263,10 +264,10 @@ class MultiScaleProjector(nn.Module):
                 feat_fuse = torch.cat(feat_fuse, dim=1)
             else:
                 feat_fuse = feat_fuse[0]
-            save_tensor_from_pathname(feat_fuse, self.block_name+"feat", "observed_tensor/float/")
+            # save_tensor_from_pathname(feat_fuse, self.block_name+"feat", "observed_tensor/float/")
             for i, layer in enumerate(stage):
                 feat_fuse = layer(feat_fuse)
-                save_tensor_from_pathname(feat_fuse, self.block_name+f"{i}", "observed_tensor/float/")
+                # save_tensor_from_pathname(feat_fuse, self.block_name+f"{i}", "observed_tensor/float/")
             results.append(feat_fuse)
 
         if self.use_extra_pool:

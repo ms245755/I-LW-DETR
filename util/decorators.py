@@ -241,13 +241,13 @@ def save_tensor_from_pathname(
     """
     if not observe_stat:
         return
-    out_dir = Path(out_dir)
+    # out_dir = Path(out_dir)
 
-    rel = Path(component_path)  # treat as relative path
-    if rel.is_absolute() or ".." in rel.parts:
-        raise ValueError(f"component_path must be a safe relative path, got: {component_path!r}")
+    # rel = Path(component_path)  # treat as relative path
+    # if rel.is_absolute() or ".." in rel.parts:
+    #     raise ValueError(f"component_path must be a safe relative path, got: {component_path!r}")
 
-    file_path = out_dir / rel
+    file_path = Path(component_path)
     file_path = file_path.with_suffix(ext)
     file_path.parent.mkdir(parents=True, exist_ok=True)
 

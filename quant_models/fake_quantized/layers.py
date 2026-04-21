@@ -542,6 +542,7 @@ class IViTLayerNorm(nn.LayerNorm):
             nn.Parameter(torch.sqrt(torch.tensor(normalized_shape, dtype=torch.float)) / 2.0**30),
         )
         self.block_name = block_name
+        self.observe_stat = observe_stat
 
     def fix(self):
         pass
@@ -553,13 +554,13 @@ class IViTLayerNorm(nn.LayerNorm):
         # Normalization: computes mean and variance(std)
         x_int = round_ste.apply(x / act_scaling_factor)
         mean_int = floor_ste.apply(x_int.sum(dim=-1, keepdim=True) / x_int.shape[-1])
-        save_tensor_from_pathname(mean_int * act_scaling_factor, self.block_name+"mean", out_dir="observed_tensor/quant/")
+        save_tensor_from_pathname(mean_int * act_scaling_factor, self.block_name+"mean", observe_stat=self.observe_stat)
 
         y_int = x_int - mean_int
         y_sq_int = y_int**2
         var_int = torch.sum(y_sq_int, axis=-1, keepdim=True)
 
-        save_tensor_from_pathname(var_int * act_scaling_factor, self.block_name+"variance", out_dir="observed_tensor/quant/")
+        save_tensor_from_pathname(var_int * act_scaling_factor, self.block_name+"variance", observe_stat=self.observe_stat)
 
         # Integer Iteration
         k = 2.0**16
@@ -567,13 +568,13 @@ class IViTLayerNorm(nn.LayerNorm):
             k_1 = floor_ste.apply((k + floor_ste.apply(var_int / k)) / 2)
             k = k_1
         std_int = k
-        save_tensor_from_pathname(std_int * act_scaling_factor, self.block_name+"std", out_dir="observed_tensor/quant/")
+        save_tensor_from_pathname(std_int * act_scaling_factor, self.block_name+"std", observe_stat=self.observe_stat)
         
         exp = floor_ste.apply((2.0**31 - 1) / std_int)
         factor = exp
         y_int = floor_ste.apply(y_int * factor / 2)
 
-        save_tensor_from_pathname(y_int * act_scaling_factor *2, self.block_name+"normalized_x", out_dir="observed_tensor/quant/")
+        save_tensor_from_pathname(y_int * act_scaling_factor *2, self.block_name+"normalized_x", observe_stat=self.observe_stat)
         # scaling and shifting
         bias = self.bias / self.weight
         bias_int = floor_ste.apply(bias / self.base_act_scaling_factor)
@@ -585,7 +586,7 @@ class IViTLayerNorm(nn.LayerNorm):
         x = y_int * act_scaling_factor
         self.norm_scaling_factor = act_scaling_factor
 
-        save_tensor_from_pathname(x, self.block_name+"output", out_dir="observed_tensor/quant/")
+        save_tensor_from_pathname(x, self.block_name+"output", observe_stat=self.observe_stat)
         return x, act_scaling_factor
     
 @track_init_args

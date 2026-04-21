@@ -64,33 +64,34 @@ class IConvX(nn.Module):
         """ forward """
         x, act_scaling_factor = self.conv(x, act_scaling_factor)
         x, act_scaling_factor = self.qact_post_conv(x, act_scaling_factor)
-        save_tensor_from_pathname(x, self.block_name+"conv", "observed_tensor/quant/")
+        save_tensor_from_pathname(x, self.block_name+"0_conv", observe_stat=self.observe_stat)
         x, act_scaling_factor = self.act(x, act_scaling_factor)
         x, act_scaling_factor = self.qact_post_act(x, act_scaling_factor)
-        save_tensor_from_pathname(x, self.block_name+"act", "observed_tensor/quant/")
+        save_tensor_from_pathname(x, self.block_name+"1_act", observe_stat=self.observe_stat)
         return x, act_scaling_factor
 
 
 class IBottleneck(nn.Module):
     """Standard bottleneck."""
 
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu', block_name=""):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, act='silu', block_name="", observe_stat=False):
         """ ch_in, ch_out, shortcut, groups, kernels, expand """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = IConvX(c1, c_, k[0], 1, act=act, block_name=block_name+"cv1/")
-        self.cv2 = IConvX(c_, c2, k[1], 1, groups=g, act=act, block_name=block_name+"cv2/")
+        self.cv1 = IConvX(c1, c_, k[0], 1, act=act, block_name=block_name+"cv1/", observe_stat=observe_stat)
+        self.cv2 = IConvX(c_, c2, k[1], 1, groups=g, act=act, block_name=block_name+"cv2/", observe_stat=observe_stat)
         self.add = shortcut and c1 == c2
         self.block_name = block_name
+        self.observe_stat = observe_stat
 
     def forward(self, x, act_scaling_factor=None):
         """'forward()' applies the YOLOv5 FPN to input data."""
         x_short = x
         act_scaling_factor_short = act_scaling_factor
         x, act_scaling_factor= self.cv1(x, act_scaling_factor)
-        save_tensor_from_pathname(x, self.block_name+"cv1", "observed_tensor/quant/")
+        save_tensor_from_pathname(x, self.block_name+"cv1", observe_stat=self.observe_stat)
         x, act_scaling_factor= self.cv2(x, act_scaling_factor)
-        save_tensor_from_pathname(x, self.block_name+"cv2", "observed_tensor/quant/")
+        save_tensor_from_pathname(x, self.block_name+"cv2", observe_stat=self.observe_stat)
         if self.add:
             x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, x_short, act_scaling_factor_short)
 
@@ -106,14 +107,14 @@ class IC2f(nn.Module):
         self.observe_stat = observe_stat
         self.block_name = block_name
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = IConvX(c1, 2 * self.c, 1, 1, act=act, observe_stat=observe_stat, block_name=block_name+"cv1/")
-        self.cv2 = IConvX((2 + n) * self.c, c2, 1, act=act, observe_stat=observe_stat, block_name=block_name+"cv2/")  # optional act=FReLU(c2)
-        self.m = nn.ModuleList(IBottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act, block_name=block_name+f"bot{i}") for i in range(n))
+        self.cv1 = IConvX(c1, 2 * self.c, 1, 1, act=act, observe_stat=observe_stat, block_name=block_name+"0_cv1/")
+        self.cv2 = IConvX((2 + n) * self.c, c2, 1, act=act, observe_stat=observe_stat, block_name=block_name+"2_cv2/")  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(IBottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act, block_name=block_name+f"1_bot{i}/", observe_stat=observe_stat) for i in range(n))
 
     def forward(self, x, act_scaling_factor):
         """Forward pass using split() instead of chunk()."""
         x_out, act_scaling_factor = self.cv1(x, act_scaling_factor)
-        save_tensor_from_pathname(x_out, self.block_name+"cv1", "observed_tensor/quant/")
+        # save_tensor_from_pathname(x_out, self.block_name+"cv1", "observed_tensor/quant/")
         
         y = [(tmp, act_scaling_factor) for tmp in x_out.split((self.c, self.c), 1)]
 
@@ -121,7 +122,7 @@ class IC2f(nn.Module):
         for i, layer in enumerate(self.m):
             x_out, scale = layer(y[-1][0], y[-1][1])
             y.append((x_out, scale))
-            save_tensor_from_pathname(x_out, self.block_name+f"{i}", "observed_tensor/quant/")
+            # save_tensor_from_pathname(x_out, self.block_name+f"{i}", "observed_tensor/quant/")
             # act_scaling_factors_list.append(scale)
         
         concatenated_output, act_scaling_factor = concat_list_tensor_scale(y, 1)
@@ -132,7 +133,7 @@ class IC2f(nn.Module):
         # concatenated_output = torch.cat(y, 1)
         # concatenated_output = concatenated_output * out_scale
         final_output, act_scaling_factor = self.cv2(concatenated_output, act_scaling_factor)
-        save_tensor_from_pathname(final_output, self.block_name+"cv2", "observed_tensor/quant/")
+        # save_tensor_from_pathname(final_output, self.block_name+"cv2", "observed_tensor/quant/")
         return final_output, act_scaling_factor
 
 
@@ -265,10 +266,10 @@ class IMultiScaleProjector(nn.Module):
                 feat_fuse = feat_fuse[0][0]
             feat = feat_fuse
             scale = max_scale
-            save_tensor_from_pathname(feat, self.block_name+"feat", "observed_tensor/quant/")
+            # save_tensor_from_pathname(feat, self.block_name+"feat", "observed_tensor/quant/")
             for i, layer in enumerate(stage):
                 feat, scale = layer(feat, scale)
-                save_tensor_from_pathname(feat, self.block_name+f"{i}", "observed_tensor/quant/")
+                # save_tensor_from_pathname(feat, self.block_name+f"{i}", "observed_tensor/quant/")
             results.append((feat, scale))
         if self.use_extra_pool:
             results.append(
