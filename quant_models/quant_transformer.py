@@ -20,24 +20,39 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
-from quant_blocks import *
+from .quant_blocks import *
 from quant_models.fake_quantized.layers import *
-from .ops.modules import MSDeformAttn
 
+class ILinearBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, has_gelu=True):
+        self.linear = IViTLinear(in_dim, out_dim)
+        self.qact_post_linear = IViTAct()
+        self.has_gelu = has_gelu
+        if has_gelu:
+            self.act = ISegGELU()
+            self.qact_post_gelu = IViTAct()
+    
+    def forward(self, x, act_scaling_factor=None):
+        x, act_scaling_factor = self.linear(x, act_scaling_factor)
+        x, act_scaling_factor = self.qact_post_linear(x, act_scaling_factor)
+        if self.has_gelu:
+            x, act_scaling_factor = self.linear(x, act_scaling_factor)
+            x, act_scaling_factor = self.linear(x, act_scaling_factor)
+        return x, act_scaling_factor
 
-class MLP(nn.Module):
+class IMLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+        self.layers = nn.ModuleList(ILinearBlock(n, k, h) for n, k, h in zip([input_dim] + h, h + [output_dim], [True] * (num_layers-1) + [False]))
 
-    def forward(self, x):
+    def forward(self, x, act_scaling_factor = None):
         for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
+            x, act_scaling_factor = layer(x, act_scaling_factor)
+        return x, act_scaling_factor
 
 
 def gen_sineembed_for_position(pos_tensor, dim=128):
@@ -69,10 +84,12 @@ def gen_sineembed_for_position(pos_tensor, dim=128):
     return pos
 
 
+# Cong: this also hard to quantize
 def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, unsigmoid=True):
     """
     Input:
         - memory: bs, \sum{hw}, d_model
+        - memory_scale: scalar
         - memory_padding_mask: bs, \sum{hw}
         - spatial_shapes: nlevel, 2
     Output:
@@ -108,7 +125,9 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
     output_proposals = torch.cat(proposals, 1)
     output_proposals_valid = ((output_proposals > 0.01) & (output_proposals < 0.99)).all(-1, keepdim=True)
 
+    # bbox_reparam = False
     if unsigmoid:
+        # Cong: quantize the log function also
         output_proposals = torch.log(output_proposals / (1 - output_proposals)) # unsigmoid
         if memory_padding_mask is not None:
             output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float('inf'))
@@ -158,7 +177,8 @@ class Transformer(nn.Module):
                                           lite_refpoint_refine=lite_refpoint_refine,
                                           bbox_reparam=bbox_reparam)
         
-        
+        self.int_exp = IViTExp()
+        self.qact_output_proposal = IViTAct()
         self.two_stage = two_stage
         if two_stage:
             self.enc_output = nn.ModuleList([IViTLinear(d_model, d_model) for _ in range(group_detr)])
@@ -203,7 +223,9 @@ class Transformer(nn.Module):
         lvl_pos_embed_flatten = []
         spatial_shapes = []
         valid_ratios = [] if masks is not None else None
-        for lvl, (src, pos_embed) in enumerate(zip(srcs, pos_embeds)):
+
+        max_scale = torch.stack([scale for (_, scale) in srcs]).max()
+        for lvl, ((src, scale), pos_embed) in enumerate(zip(srcs, pos_embeds)):
             bs, c, h, w = src.shape
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
@@ -211,11 +233,15 @@ class Transformer(nn.Module):
             src = src.flatten(2).transpose(1, 2)                # bs, hw, c
             pos_embed = pos_embed.flatten(2).transpose(1, 2)    # bs, hw, c
             lvl_pos_embed_flatten.append(pos_embed)
+            src_int = round_ste.apply(src / scale)
+            src = src_int * max_scale
             src_flatten.append(src)
             if masks is not None:
                 mask = masks[lvl].flatten(1)                    # bs, hw
                 mask_flatten.append(mask)
-        memory = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c 
+            
+        memory = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c # Cong: should we cat them? because the scale would be lost
+        memory_scale = max_scale
         if masks is not None:
             mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
             valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
@@ -226,59 +252,77 @@ class Transformer(nn.Module):
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(
                 memory, mask_flatten, spatial_shapes, unsigmoid=not self.bbox_reparam)
+            
+            output_proposals, output_proposals_scale = self.qact_output_proposal(output_proposals, None)
             # group detr for first stage
             refpoint_embed_ts, memory_ts, boxes_ts = [], [], []
             group_detr = self.group_detr if self.training else 1
             for g_idx in range(group_detr):
-                output_memory_gidx = self.enc_output_norm[g_idx](self.enc_output[g_idx](output_memory))
+                # output_memory_gidx = self.enc_output_norm[g_idx](self.enc_output[g_idx](output_memory, memory_scale))
+                output_memory_gidx, output_memory_gidx_scale = self.enc_output[g_idx](output_memory, memory_scale)
+                output_memory_gidx, output_memory_gidx_scale = self.qact_post_linear_output[g_idx](output_memory, output_memory_gidx_scale)
+                output_memory_gidx, output_memory_gidx_scale = self.enc_output_norm[g_idx](output_memory, output_memory_gidx_scale)
+                output_memory_gidx, output_memory_gidx_scale = self.qact_post_norm_output[g_idx](output_memory, output_memory_gidx_scale)
     
-                enc_outputs_class_unselected_gidx = self.enc_out_class_embed[g_idx](output_memory_gidx)
+                enc_outputs_class_unselected_gidx, enc_outputs_class_unselected_gidx_scale  = self.enc_out_class_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                 if self.bbox_reparam:
-                    enc_outputs_coord_delta_gidx = self.enc_out_bbox_embed[g_idx](output_memory_gidx)
+                    enc_outputs_coord_delta_gidx, enc_outputs_coord_delta_gidx_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                     enc_outputs_coord_cxcy_gidx = enc_outputs_coord_delta_gidx[...,
                         :2] * output_proposals[..., 2:] + output_proposals[..., :2]
-                    enc_outputs_coord_wh_gidx = enc_outputs_coord_delta_gidx[..., 2:].exp() * output_proposals[..., 2:]
-                    enc_outputs_coord_unselected_gidx = torch.concat(
-                        [enc_outputs_coord_cxcy_gidx, enc_outputs_coord_wh_gidx], dim=-1)
+                    enc_outputs_coord_cxcy_gidx_scale = enc_outputs_coord_delta_gidx_scale * output_proposals_scale
+
+                    # Cong: careful about this exp function, we can also approximate by bit shift (convert to 2^(log e * value))
+                    tmp, tmp_scale = self.int_exp(enc_outputs_coord_delta_gidx[..., 2:], enc_outputs_coord_delta_gidx_scale)
+                    enc_outputs_coord_wh_gidx, enc_outputs_coord_wh_gidx_scale = multiply_tensor_scale(tmp, tmp_scale, output_proposals[..., 2:], output_proposals_scale)
+
+                    concat_list = [(enc_outputs_coord_cxcy_gidx, enc_outputs_coord_cxcy_gidx_scale), (enc_outputs_coord_wh_gidx, enc_outputs_coord_wh_gidx_scale)]
+                    enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = concat_list_tensor_scale(concat_list, dim=-1)
+
                 else:
-                    enc_outputs_coord_unselected_gidx = self.enc_out_bbox_embed[g_idx](
-                        output_memory_gidx) + output_proposals # (bs, \sum{hw}, 4) unsigmoid
+                    tmp, tmp_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
+                    enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = add_tensor_scale(tmp, tmp_scale, output_proposals, output_proposals_scale)
 
                 topk = self.num_queries
+                # Return the index of top k, not the value
                 topk_proposals_gidx = torch.topk(enc_outputs_class_unselected_gidx.max(-1)[0], topk, dim=1)[1] # bs, nq
                 
                 refpoint_embed_gidx_undetach = torch.gather(
                     enc_outputs_coord_unselected_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, 4)) # unsigmoid
+                
                 # for decoder layer, detached as initial ones, (bs, nq, 4)
                 refpoint_embed_gidx = refpoint_embed_gidx_undetach.detach()
+                refpoint_embed_gidx_scale = enc_outputs_coord_unselected_gidx_scale
                 
                 # get memory tgt
                 tgt_undetach_gidx = torch.gather(
                     output_memory_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, self.d_model))
                 
-                refpoint_embed_ts.append(refpoint_embed_gidx)
-                memory_ts.append(tgt_undetach_gidx)
-                boxes_ts.append(refpoint_embed_gidx_undetach)
+                refpoint_embed_ts.append((refpoint_embed_gidx, refpoint_embed_gidx_scale))
+                memory_ts.append((tgt_undetach_gidx, output_memory_gidx_scale))
+                boxes_ts.append((refpoint_embed_gidx_undetach, refpoint_embed_gidx_scale))
+            
             # concat on dim=1, the nq dimension, (bs, nq, d) --> (bs, nq, d)
-            refpoint_embed_ts = torch.cat(refpoint_embed_ts, dim=1)
+            refpoint_embed_ts, refpoint_embed_ts_scale = concat_list_tensor_scale(refpoint_embed_ts, dim=1)
             # (bs, nq, d)
-            memory_ts = torch.cat(memory_ts, dim=1)#.transpose(0, 1)
-            boxes_ts = torch.cat(boxes_ts, dim=1)#.transpose(0, 1)
+            memory_ts, memory_ts_scale = concat_list_tensor_scale(memory_ts, dim=1)#.transpose(0, 1)
+            boxes_ts, memory_ts_scale = concat_list_tensor_scale(boxes_ts, dim=1)#.transpose(0, 1)
         
         tgt = query_feat.unsqueeze(0).repeat(bs, 1, 1)
         refpoint_embed = refpoint_embed.unsqueeze(0).repeat(bs, 1, 1)
         if self.two_stage:
             if self.bbox_reparam:
-                refpoint_embed_cxcy = refpoint_embed[..., :2] * refpoint_embed_ts[..., 2:] + refpoint_embed_ts[..., :2]
-                refpoint_embed_wh = refpoint_embed[..., 2:].exp() * refpoint_embed_ts[..., 2:]
-                refpoint_embed = torch.concat(
-                    [refpoint_embed_cxcy, refpoint_embed_wh], dim=-1
-                )
-            else:
-                refpoint_embed = refpoint_embed + refpoint_embed_ts
+                # Cong: dont use this function
+                tmp, tmp_scale = multiply_tensor_scale(refpoint_embed[..., :2], refpoint_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
+                refpoint_embed_cxcy, refpoint_embed_cxcy_scale = add_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., :2], refpoint_embed_ts_scale)
 
-        hs, references = self.decoder(tgt, memory, memory_key_padding_mask=mask_flatten,
-                          pos=lvl_pos_embed_flatten, refpoints_unsigmoid=refpoint_embed,
+                tmp, tmp_scale = self.int_exp(refpoint_embed[..., 2:], refpoint_scale)
+                refpoint_embed_wh, refpoint_embed_wh_scale = multiply_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
+                refpoint_embed, refpoint_scale = concat_list_tensor_scale([(refpoint_embed_cxcy, refpoint_embed_cxcy_scale), (refpoint_embed_wh, refpoint_embed_wh_scale)], dim=-1)
+            else:
+                refpoint_embed, refpoint_scale = add_tensor_scale(refpoint_embed, refpoint_scale, refpoint_embed_ts, refpoint_embed_ts_scale)
+
+        hs, references = self.decoder(tgt, query_scale, memory, memory_scale, memory_key_padding_mask=mask_flatten,
+                          pos=lvl_pos_embed_flatten, refpoints_unsigmoid=refpoint_embed, refpoint_scale=refpoint_scale,
                           level_start_index=level_start_index, 
                           spatial_shapes=spatial_shapes,
                           valid_ratios=valid_ratios.to(memory.dtype) if valid_ratios is not None else valid_ratios)
@@ -309,7 +353,7 @@ class TransformerDecoder(nn.Module):
         self.lite_refpoint_refine = lite_refpoint_refine
         self.bbox_reparam = bbox_reparam
 
-        self.ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
+        self.ref_point_head = IMLP(2 * d_model, d_model, d_model, 2)
 
         self._export = False
     
@@ -327,13 +371,13 @@ class TransformerDecoder(nn.Module):
             new_refpoints_unsigmoid = refpoints_unsigmoid + new_refpoints_delta
         return new_refpoints_unsigmoid
 
-    def forward(self, tgt, memory,
+    def forward(self, tgt, query_scale, memory, memory_scale,
                 tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None,
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                refpoints_unsigmoid: Optional[Tensor] = None,
+                refpoints_unsigmoid: Optional[Tensor] = None, refpoint_scale = None,
                 # for memory
                 level_start_index: Optional[Tensor] = None, # num_levels
                 spatial_shapes: Optional[Tensor] = None, # bs, num_levels, 2
@@ -343,6 +387,7 @@ class TransformerDecoder(nn.Module):
         intermediate = []
         hs_refpoints_unsigmoid = [refpoints_unsigmoid]
         
+        # Cong: hard to quantize gen_sineembed_for_position, if we train from beginning or use qat
         def get_reference(refpoints):
             # [num_queries, batch_size, 4]
             obj_center = refpoints[..., :4]
@@ -355,7 +400,7 @@ class TransformerDecoder(nn.Module):
                                         * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # bs, nq, nlevel, 4
                 query_sine_embed = gen_sineembed_for_position(
                     refpoints_input[:, :, 0, :], self.d_model / 2) # bs, nq, 256*2 
-            query_pos = self.ref_point_head(query_sine_embed)
+            query_pos, query_pos_scale = self.ref_point_head(query_sine_embed, None)
             return obj_center, refpoints_input, query_pos, query_sine_embed
         
         # always use init refpoints
@@ -378,13 +423,13 @@ class TransformerDecoder(nn.Module):
 
             query_pos = query_pos * pos_transformation
             
-            output = layer(output, memory, tgt_mask=tgt_mask,
+            output = layer(output, query_scale, memory, memory_scale, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
                            pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed, 
                            is_first=(layer_id == 0),
-                           reference_points=refpoints_input,
+                           reference_points=refpoints_input, refpoint_scale = refpoint_scale,
                            spatial_shapes=spatial_shapes,
                            level_start_index=level_start_index)
 
@@ -466,7 +511,7 @@ class TransformerDecoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, tgt, memory,
+    def forward_post(self, tgt, query_scale, memory, memory_scale,
                      tgt_mask: Optional[Tensor] = None,
                      memory_mask: Optional[Tensor] = None,
                      tgt_key_padding_mask: Optional[Tensor] = None,
@@ -475,7 +520,7 @@ class TransformerDecoderLayer(nn.Module):
                      query_pos: Optional[Tensor] = None,
                      query_sine_embed = None,
                      is_first = False,
-                     reference_points = None,
+                     reference_points = None, refpoint_scale = None,
                      spatial_shapes=None,
                      level_start_index=None,
                      ):
@@ -519,7 +564,7 @@ class TransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward(self, tgt, memory,
+    def forward(self, tgt, query_scale, memory, memory_scale,
                 tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None,
                 tgt_key_padding_mask: Optional[Tensor] = None,
@@ -528,13 +573,13 @@ class TransformerDecoderLayer(nn.Module):
                 query_pos: Optional[Tensor] = None,
                 query_sine_embed = None,
                 is_first = False,
-                reference_points = None,
+                reference_points = None, refpoint_scale = None,
                 spatial_shapes=None,
                 level_start_index=None):
-        return self.forward_post(tgt, memory, tgt_mask, memory_mask,
+        return self.forward_post(tgt, query_scale, memory, memory_scale, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos, 
                                  query_sine_embed, is_first,
-                                 reference_points, spatial_shapes, level_start_index)
+                                 reference_points, refpoint_scale, spatial_shapes, level_start_index)
 
 
 def _get_clones(module, N):
@@ -565,14 +610,3 @@ def build_transformer(args):
         decoder_norm_type=args.decoder_norm,
         bbox_reparam=args.bbox_reparam,
     )
-
-
-def _get_activation_fn(activation):
-    """Return an activation function given a string"""
-    if activation == "relu":
-        return F.relu
-    if activation == "gelu":
-        return F.gelu
-    if activation == "glu":
-        return F.glu
-    raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
