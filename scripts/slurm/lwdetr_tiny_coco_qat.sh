@@ -29,8 +29,8 @@ srun python -u -m torch.distributed.launch \
     --lr_encoder 1.5e-4 \
     --batch_size 2 \
     --weight_decay 1e-4 \
-    --epochs 2 \
-    --lr_drop 60 \
+    --epochs 20 \
+    --lr_drop 10 \
     --lr_vit_layer_decay 0.8 \
     --lr_component_decay 0.7 \
     --encoder vit_tiny \
@@ -58,5 +58,5 @@ srun python -u -m torch.distributed.launch \
     --pretrain_weights pretrain_weights/LWDETR_tiny_30e_objects365.pth \
     --resume pretrain_weights/LWDETR_tiny_60e_coco.pth \
     --qat \
-    --pretrain_keys_modify_to_load transformer.enc_out_class_embed.0.linear.weight transformer.enc_out_class_embed.1.linear.weight transformer.enc_out_class_embed.2.linear.weight transformer.enc_out_class_embed.3.linear.weight transformer.enc_out_class_embed.4.linear.weight transformer.enc_out_class_embed.5.linear.weight transformer.enc_out_class_embed.6.linear.weight transformer.enc_out_class_embed.7.linear.weight transformer.enc_out_class_embed.8.linear.weight transformer.enc_out_class_embed.9.linear.weight transformer.enc_out_class_embed.10.linear.weight transformer.enc_out_class_embed.11.linear.weight transformer.enc_out_class_embed.12.linear.weight transformer.enc_out_class_embed.0.linear.bias transformer.enc_out_class_embed.1.linear.bias transformer.enc_out_class_embed.2.linear.bias transformer.enc_out_class_embed.3.linear.bias transformer.enc_out_class_embed.4.linear.bias transformer.enc_out_class_embed.5.linear.bias transformer.enc_out_class_embed.6.linear.bias transformer.enc_out_class_embed.7.linear.bias transformer.enc_out_class_embed.8.linear.bias transformer.enc_out_class_embed.9.linear.bias transformer.enc_out_class_embed.10.linear.bias transformer.enc_out_class_embed.11.linear.bias transformer.enc_out_class_embed.12.linear.bias class_embed.linear.weight class_embed.linear.bias \
+    --pretrain_keys_modify_to_load transformer.enc_out_class_embed.0.weight transformer.enc_out_class_embed.1.weight transformer.enc_out_class_embed.2.weight transformer.enc_out_class_embed.3.weight transformer.enc_out_class_embed.4.weight transformer.enc_out_class_embed.5.weight transformer.enc_out_class_embed.6.weight transformer.enc_out_class_embed.7.weight transformer.enc_out_class_embed.8.weight transformer.enc_out_class_embed.9.weight transformer.enc_out_class_embed.10.weight transformer.enc_out_class_embed.11.weight transformer.enc_out_class_embed.12.weight transformer.enc_out_class_embed.0.bias transformer.enc_out_class_embed.1.bias transformer.enc_out_class_embed.2.bias transformer.enc_out_class_embed.3.bias transformer.enc_out_class_embed.4.bias transformer.enc_out_class_embed.5.bias transformer.enc_out_class_embed.6.bias transformer.enc_out_class_embed.7.bias transformer.enc_out_class_embed.8.bias transformer.enc_out_class_embed.9.bias transformer.enc_out_class_embed.10.bias transformer.enc_out_class_embed.11.bias transformer.enc_out_class_embed.12.bias class_embed.weight class_embed.bias \
     --output_dir output/$model_name
