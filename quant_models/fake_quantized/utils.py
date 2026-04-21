@@ -264,7 +264,7 @@ def concat_list_tensor_scale(tensor_list, dim = 0):
 
     result = []
     for tmp, scale in tensor_list:
-        result.append(round_ste.apply(tmp / scale))
+        result.append(round_ste.apply(tmp / max_scale))
     
     result = torch.cat(result, dim = dim)
     result = result * max_scale
