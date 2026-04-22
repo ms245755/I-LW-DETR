@@ -39,10 +39,16 @@ class Backbone(BackboneBase):
                  out_feature_indexes: list=None,
                  projector_scale: list=None,
                  observe_stat = False,
-                 block_name = "observed_tensor/quant/backbone/"
+                 block_name = "observed_tensor/quant/backbone/",
+                 backbone_quant_components=None,
+                 encoder_quant_blocks=None,
+                 encoder_quant_components=None,
                  ):
         super().__init__()
         self.name = name
+        self.backbone_quant_components = {"vit", "projector"} if backbone_quant_components is None else set(backbone_quant_components)
+        self.quantize_vit = "vit" in self.backbone_quant_components
+        self.quantize_projector = "projector" in self.backbone_quant_components
         if 'vit' in name:
             if name == 'vit_tiny':
                 img_size, embed_dim, depth, num_heads, dp = 1024, 192, 12, 12, 0.
@@ -74,7 +80,9 @@ class Backbone(BackboneBase):
                 out_feature_indexes=out_feature_indexes,
                 use_cae=True,
                 observe_stat=observe_stat,
-                block_name=block_name+"vit/"
+                block_name=block_name+"vit/",
+                quant_blocks=encoder_quant_blocks if self.quantize_vit else [],
+                quant_components=encoder_quant_components,
             )
             # load pretrain model in main_process
             if pretrained_encoder is not None:
@@ -103,7 +111,8 @@ class Backbone(BackboneBase):
         )
         scale_factors = [level2scalefactor[lvl] for lvl in self.projector_scale]
 
-        self.projector = IMultiScaleProjector(
+        projector_cls = IMultiScaleProjector if self.quantize_projector else MultiScaleProjector
+        self.projector = projector_cls(
             in_channels=self.encoder._out_feature_channels,
             out_channels=out_channels,
             scale_factors=scale_factors,
@@ -125,12 +134,19 @@ class Backbone(BackboneBase):
         """
         # (H, W, B, C)
         feats = self.encoder(tensor_list.tensors)
+        if self.quantize_projector:
+            feats = [
+                (feat, scale) if scale is not None else self.encoder.qact_block_bridge[-1](x=feat, act_scaling_factor=None)
+                for (feat, scale) in feats
+            ]
+        else:
+            feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
-        feats = [feat for (feat, scale) in feats]
         # x: [(B, C, H, W)]
         out = []
-        # for (feat, scale) in feats:
         for feat in feats:
+            if isinstance(feat, tuple):
+                feat = feat[0]
             m = tensor_list.mask
             assert m is not None
             mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
@@ -140,6 +156,8 @@ class Backbone(BackboneBase):
 
     def forward_export(self, tensors:torch.Tensor):
         feats = self.encoder(tensors)
+        if not self.quantize_projector:
+            feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
         out_feats = []
         out_masks = []

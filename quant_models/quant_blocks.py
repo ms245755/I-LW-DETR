@@ -18,13 +18,19 @@ from torch.nn.init import constant_, xavier_uniform_
 from util.decorators import save_tensor_from_pathname
 
 
+def _component_set(components):
+    if components is None:
+        return {"linear", "conv2d", "matmul", "softmax", "gelu", "layernorm"}
+    return set(components)
+
+
 class IPatchEmbed(nn.Module):
     """
     Image to Patch Embedding.
     """
 
     def __init__(
-        self, kernel_size=16, stride=16, padding=(0, 0), in_chans=3, embed_dim=768, num_bits=8, observe_stat=False, block_name=""
+        self, kernel_size=16, stride=16, padding=(0, 0), in_chans=3, embed_dim=768, num_bits=8, observe_stat=False, block_name="", quant_components=None
     ):
         """
         Args:
@@ -36,7 +42,12 @@ class IPatchEmbed(nn.Module):
         """
         super().__init__()
 
-        self.proj = IViTConv2d(
+        self.quant_components = _component_set(quant_components)
+        self.quant_conv = "conv2d" in self.quant_components
+        conv_cls = IViTConv2d if self.quant_conv else nn.Conv2d
+        self.proj = conv_cls(
+            in_chans, embed_dim, kernel_size=kernel_size, stride=stride
+        ) if not self.quant_conv else conv_cls(
             in_chans, embed_dim, kernel_size=kernel_size, stride=stride, weight_bit=num_bits, bias_bit=num_bits*4
         )
         self.qact = IViTAct(activation_bit=num_bits*2)
@@ -45,11 +56,18 @@ class IPatchEmbed(nn.Module):
 
     def forward(self, x, act_scaling_factor=None):
         
-        x, act_scaling_factor = self.proj(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_conv:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.qact(x=x, act_scaling_factor=None)
+            x, act_scaling_factor = self.proj(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            x = self.proj(x)
+            act_scaling_factor = None
         B, C, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)  # Flatten patches and rearrange to (B, N, C)
-        act_scaling_factor = act_scaling_factor.reshape(1, 1, x.shape[2])
-        x, act_scaling_factor = self.qact(x, act_scaling_factor)
+        if self.quant_conv:
+            act_scaling_factor = act_scaling_factor.reshape(1, 1, x.shape[2])
+            x, act_scaling_factor = self.qact(x, act_scaling_factor)
         
         x = x.reshape(B, H, W, C)
         save_tensor_from_pathname(x=x, component_path=self.block_name+"proj", out_dir="observed_tensor/quant/")
@@ -86,15 +104,20 @@ class IFeedForward(nn.Module):
         gelu_lambda=6,
         gelu_choice="l_shiftgelu",
         num_bits = 8,
+        quant_components=None,
     ):
         super().__init__()
-        self.fc1 = IViTLinear(in_features=dim, out_features=hidden_dim, weight_bit=num_bits, bias_bit=num_bits*4)
+        self.quant_components = _component_set(quant_components)
+        self.quant_linear = "linear" in self.quant_components
+        self.quant_gelu = "gelu" in self.quant_components
+        linear_cls = IViTLinear if self.quant_linear else nn.Linear
+        self.fc1 = linear_cls(in_features=dim, out_features=hidden_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, hidden_dim)
         self.act = ISegGELU(output_bit=num_bits, n=gelu_n, lambda_scaler=gelu_lambda)
         self.act_fp = IViTGELU(output_bit=num_bits)
         self.act_no_lambda = IViTGELU(output_bit=num_bits)
         if out_dim is None:
             out_dim = dim
-        self.fc2 = IViTLinear(in_features=hidden_dim, out_features=out_dim, weight_bit=num_bits, bias_bit=num_bits*4)
+        self.fc2 = linear_cls(in_features=hidden_dim, out_features=out_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(hidden_dim, out_dim)
         self.drop = nn.Dropout(p=dropout)
         self.gelu_choice = gelu_choice
 
@@ -115,8 +138,14 @@ class IFeedForward(nn.Module):
 
     def forward(self, x, act_scaling_factor=None, block_name="Encoder_0/"):
         # First linear projection
-        x, act_scaling_factor = self.fc1(x=x, act_scaling_factor=act_scaling_factor)
-        x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_linear:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=None)
+            x, act_scaling_factor = self.fc1(x=x, act_scaling_factor=act_scaling_factor)
+            x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            x = self.fc1(x)
+            act_scaling_factor = None
 
         # Save activations for debugging/analysis
         if self.observe_gelu:
@@ -146,18 +175,25 @@ class IFeedForward(nn.Module):
             self.iseg_rmse += torch.mean((self.act(x, act_scaling_factor)[0] - self.act_fp(x)) ** 2)
 
         # GELU activation choice
-        if self.gelu_choice == "l_shiftgelu":
+        if not self.quant_gelu or self.gelu_choice == "gelu":
+            x = F.gelu(x)
+            act_scaling_factor = None
+        elif self.gelu_choice == "l_shiftgelu":
             x, act_scaling_factor = self.act(x=x, act_scaling_factor=act_scaling_factor)
         elif self.gelu_choice == "shiftgelu":
             x, act_scaling_factor = self.act_no_lambda(x=x, act_scaling_factor=act_scaling_factor)
-        elif self.gelu_choice == "gelu":
-            x = self.act_fp(x)
-            act_scaling_factor = None
-        x, act_scaling_factor = self.qact_post_gelu(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_gelu:
+            x, act_scaling_factor = self.qact_post_gelu(x=x, act_scaling_factor=act_scaling_factor)
 
         # Second linear projection + quantized dropout
-        x, act_scaling_factor = self.fc2(x=x, act_scaling_factor=act_scaling_factor)
-        x, act_scaling_factor = self.qact_drop2_stub(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_linear:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.qact_drop2_stub(x=x, act_scaling_factor=None)
+            x, act_scaling_factor = self.fc2(x=x, act_scaling_factor=act_scaling_factor)
+            x, act_scaling_factor = self.qact_drop2_stub(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            x = self.fc2(x)
+            act_scaling_factor = None
 
         return x, act_scaling_factor
 
@@ -166,8 +202,12 @@ class IAttention(nn.Module):
     Quantized multi-head self-attention layer, CAE-compatible (q_bias/v_bias).
     """
 
-    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True, num_bits: int =8, observe_stat=False, block_name=""):
+    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True, num_bits: int =8, observe_stat=False, block_name="", quant_components=None):
         super().__init__()
+        self.quant_components = _component_set(quant_components)
+        self.quant_linear = "linear" in self.quant_components
+        self.quant_matmul = "matmul" in self.quant_components
+        self.quant_softmax = "softmax" in self.quant_components
         self.heads = heads
         self.dim = dim
         head_dim = dim // heads
@@ -177,16 +217,17 @@ class IAttention(nn.Module):
         self.use_cae = use_cae
 
         # Linear projections for Q, K, V
-        self.proj = IViTLinear(in_features=dim, out_features=dim, weight_bit=num_bits, bias_bit=num_bits*4)
+        linear_cls = IViTLinear if self.quant_linear else nn.Linear
+        self.proj = linear_cls(in_features=dim, out_features=dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, dim)
 
         # CAE-style separate biases (same as float Attention when use_cae=True)
         if self.use_cae:
-            self.qkv  = IViTLinear(in_features=dim, out_features=dim * 3, bias=False, weight_bit=num_bits, bias_bit=num_bits*4)
+            self.qkv  = linear_cls(in_features=dim, out_features=dim * 3, bias=False, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, dim * 3, bias=False)
             self.q_bias = nn.Parameter(torch.zeros(dim))
             self.v_bias = nn.Parameter(torch.zeros(dim))
             # self.qact_bias = IViTAct()
         else:
-            self.qkv  = IViTLinear(in_features=dim, out_features=dim * 3, bias=qkv_bias, weight_bit=num_bits, bias_bit=num_bits*4)
+            self.qkv  = linear_cls(in_features=dim, out_features=dim * 3, bias=qkv_bias, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, dim * 3, bias=qkv_bias)
             self.q_bias = None
             self.v_bias = None
 
@@ -196,6 +237,9 @@ class IAttention(nn.Module):
 
         # Quantized activations
         self.qact_qkv = IViTAct(activation_bit=num_bits)
+        self.qact_q = IViTAct(activation_bit=num_bits)
+        self.qact_k = IViTAct(activation_bit=num_bits)
+        self.qact_v = IViTAct(activation_bit=num_bits)
         self.qact_attn_out = IViTAct(activation_bit=num_bits)
         self.qact_pre_proj = IViTAct(activation_bit=num_bits)
         self.qact_proj_drop = IViTAct(activation_bit=num_bits)
@@ -212,7 +256,13 @@ class IAttention(nn.Module):
         assert C == self.dim
 
         # Project input into Q, K, V (x: [B, N, 3C])
-        x, act_scaling_factor = self.qkv(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_linear:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.qact_qkv(x=x, act_scaling_factor=None)
+            x, act_scaling_factor = self.qkv(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            x = self.qkv(x)
+            act_scaling_factor = None
 
         # --- CAE bias injection to match float Attention(use_cae=True) ---
         # float behavior: qkv_bias = [q_bias, 0*k_bias, v_bias]
@@ -229,7 +279,10 @@ class IAttention(nn.Module):
         # ---------------------------------------------------------------
 
         # Quantize activation after qkv (keep same pipeline)
-        x, act_scaling_factor_qkv = self.qact_qkv(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_linear:
+            x, act_scaling_factor_qkv = self.qact_qkv(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            act_scaling_factor_qkv = None
 
         save_tensor_from_pathname(x, self.block_name+"0_qkv", observe_stat=self.observe_stat)
         # Split Q, K, V
@@ -237,39 +290,64 @@ class IAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # Attention scores
-        attn, act_scaling_factor = self.matmul(
-            A=q,
-            pre_act_scaling_factor_A=act_scaling_factor_qkv,
-            B=k.transpose(-2, -1),
-            pre_act_scaling_factor_B=act_scaling_factor_qkv,
-        )
+        if self.quant_matmul:
+            if act_scaling_factor_qkv is None:
+                q, scale_q = self.qact_q(x=q, act_scaling_factor=None)
+                k, scale_k = self.qact_k(x=k, act_scaling_factor=None)
+            else:
+                scale_q = act_scaling_factor_qkv
+                scale_k = act_scaling_factor_qkv
+            attn, act_scaling_factor = self.matmul(
+                A=q,
+                pre_act_scaling_factor_A=scale_q,
+                B=k.transpose(-2, -1),
+                pre_act_scaling_factor_B=scale_k,
+            )
+        else:
+            attn = q @ k.transpose(-2, -1)
+            act_scaling_factor = None
 
         # scale
         attn = attn * self.scale
-        act_scaling_factor = act_scaling_factor * self.scale
+        if act_scaling_factor is not None:
+            act_scaling_factor = act_scaling_factor * self.scale
 
         # Quantize + softmax
         save_tensor_from_pathname(attn, self.block_name+"1_attn", observe_stat=self.observe_stat)
-        attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=act_scaling_factor)
-
-        attn, act_scaling_factor = self.softmax(x=attn, act_scaling_factor=act_scaling_factor)
+        if self.quant_softmax:
+            attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=act_scaling_factor)
+            attn, act_scaling_factor = self.softmax(x=attn, act_scaling_factor=act_scaling_factor)
+        else:
+            attn = F.softmax(attn, dim=-1)
+            act_scaling_factor = None
 
         save_tensor_from_pathname(attn, self.block_name+"2_softmax", observe_stat=self.observe_stat)
         # Apply attention to values
-        x, act_scaling_factor = self.matmul(
-            A=attn,
-            pre_act_scaling_factor_A=act_scaling_factor,
-            B=v,
-            pre_act_scaling_factor_B=act_scaling_factor_qkv,
-        )
+        if self.quant_matmul:
+            if act_scaling_factor is None:
+                attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=None)
+            if act_scaling_factor_qkv is None:
+                v, act_scaling_factor_qkv = self.qact_v(x=v, act_scaling_factor=None)
+            x, act_scaling_factor = self.matmul(
+                A=attn,
+                pre_act_scaling_factor_A=act_scaling_factor,
+                B=v,
+                pre_act_scaling_factor_B=act_scaling_factor_qkv,
+            )
+        else:
+            x = attn @ v
+            act_scaling_factor = None
         x = x.transpose(1, 2).reshape(B, N, C)
 
         # Projection + quantize
         save_tensor_from_pathname(x, self.block_name+"3_mulvalue", observe_stat=self.observe_stat)
-        x, act_scaling_factor = self.qact_pre_proj(x=x, act_scaling_factor=act_scaling_factor)
-
-        x, act_scaling_factor = self.proj(x=x, act_scaling_factor=act_scaling_factor)
-        x, act_scaling_factor = self.qact_proj_drop(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_linear:
+            x, act_scaling_factor = self.qact_pre_proj(x=x, act_scaling_factor=act_scaling_factor)
+            x, act_scaling_factor = self.proj(x=x, act_scaling_factor=act_scaling_factor)
+            x, act_scaling_factor = self.qact_proj_drop(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            x = self.proj(x)
+            act_scaling_factor = None
         save_tensor_from_pathname(x, self.block_name+"4_output", observe_stat=self.observe_stat)
         return x, act_scaling_factor
 
@@ -309,14 +387,17 @@ class IBlock(nn.Module):
         use_cae=True,
         num_bits=8,
         observe_stat=False,
-        block_name=""
+        block_name="",
+        quant_components=None,
     ):
         super().__init__()
-        self.norm1 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"0_norm1/", observe_stat=observe_stat)
-        self.norm2 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"4_norm2/", observe_stat=observe_stat)
-        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits, observe_stat=observe_stat, block_name=block_name+"1_attn/")
+        self.quant_components = _component_set(quant_components)
+        self.quant_layernorm = "layernorm" in self.quant_components
+        self.norm1 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"0_norm1/", observe_stat=observe_stat) if self.quant_layernorm else nn.LayerNorm(dim, eps=1e-6)
+        self.norm2 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"4_norm2/", observe_stat=observe_stat) if self.quant_layernorm else nn.LayerNorm(dim, eps=1e-6)
+        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits, observe_stat=observe_stat, block_name=block_name+"1_attn/", quant_components=self.quant_components)
         self.mlp = IFeedForward(
-            dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits
+            dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits, quant_components=self.quant_components
         )
         self.window = window
 
@@ -344,8 +425,14 @@ class IBlock(nn.Module):
         B, HW, C = x.shape
         shortcut = x
         shortcut_scale = act_scaling_factor
-        x, act_scaling_factor = self.norm1(x, act_scaling_factor)
-        x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_layernorm:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=None)
+            x, act_scaling_factor = self.norm1(x, act_scaling_factor)
+            x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            x = self.norm1(x)
+            act_scaling_factor = None
         save_tensor_from_pathname(x=x, component_path=self.block_name+"0_norm1", observe_stat=self.observe_stat)
         
         if not self.window:
@@ -365,7 +452,7 @@ class IBlock(nn.Module):
         # Cong: do i need to requantize after multiply?
         if self.use_cae:
             x = x * gamma_1
-            act_scaling_factor = act_scaling_factor * scale_gamma1
+            act_scaling_factor = act_scaling_factor * scale_gamma1 if act_scaling_factor is not None else None
             # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_1, scale_gamma1)
             x, act_scaling_factor = self.qact_post_gamma_1(x, act_scaling_factor)
             save_tensor_from_pathname(x=x, component_path=self.block_name+"2_gamma1", observe_stat=self.observe_stat)
@@ -376,16 +463,26 @@ class IBlock(nn.Module):
                 mask = mask.reshape(B, HW)
 
         # Residual connection with rounding
-        x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
-        x, act_scaling_factor = self.qact_drop_1(x=x, act_scaling_factor=act_scaling_factor)
+        if act_scaling_factor is None or shortcut_scale is None:
+            x = x + shortcut
+            act_scaling_factor = None
+        else:
+            x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
+            x, act_scaling_factor = self.qact_drop_1(x=x, act_scaling_factor=act_scaling_factor)
         save_tensor_from_pathname(x=x, component_path=self.block_name+"3_residual1", observe_stat=self.observe_stat)
         
         shortcut = x
         shortcut_scale = act_scaling_factor
 
         # FeedForward branch
-        x, act_scaling_factor = self.norm2(x=x, act_scaling_factor=act_scaling_factor)
-        x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)
+        if self.quant_layernorm:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=None)
+            x, act_scaling_factor = self.norm2(x=x, act_scaling_factor=act_scaling_factor)
+            x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)
+        else:
+            x = self.norm2(x)
+            act_scaling_factor = None
         save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2", observe_stat=self.observe_stat)
 
         x, act_scaling_factor = self.mlp(
@@ -395,15 +492,19 @@ class IBlock(nn.Module):
 
         if self.use_cae:
             x = x * gamma_2
-            act_scaling_factor = act_scaling_factor * scale_gamma2
+            act_scaling_factor = act_scaling_factor * scale_gamma2 if act_scaling_factor is not None else None
             # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_2, scale_gamma2)
             x, act_scaling_factor = self.qact_post_gamma_2(x, act_scaling_factor)
 
             save_tensor_from_pathname(x=x, component_path=self.block_name+"6_gamma2", observe_stat=self.observe_stat)
 
         # Residual connection with rounding
-        x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
-        x, act_scaling_factor = self.qact_drop_2(x=x, act_scaling_factor=act_scaling_factor)
+        if act_scaling_factor is None or shortcut_scale is None:
+            x = x + shortcut
+            act_scaling_factor = None
+        else:
+            x, act_scaling_factor = add_tensor_scale(x, act_scaling_factor, shortcut, shortcut_scale)
+            x, act_scaling_factor = self.qact_drop_2(x=x, act_scaling_factor=act_scaling_factor)
         save_tensor_from_pathname(x=x, component_path=self.block_name+"7_residual2", observe_stat=self.observe_stat)
 
         return x, act_scaling_factor

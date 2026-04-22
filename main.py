@@ -88,6 +88,16 @@ def get_args_parser():
                         choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--out_feature_indexes', default=[-1], type=int, nargs='+', help='only for vit now')
+    parser.add_argument('--backbone_quant_components', default=['vit', 'projector'], type=str, nargs='+',
+                        choices=('vit', 'projector'),
+                        help='Backbone components to quantize when --calib/--qat is used.')
+    parser.add_argument('--encoder_quant_blocks', default=None, type=int, nargs='+',
+                        help='ViT encoder block indexes to quantize. Default: all blocks.')
+    parser.add_argument('--encoder_quant_components',
+                        default=['linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm'],
+                        type=str, nargs='+',
+                        choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm'),
+                        help='Operation families to quantize inside quantized ViT blocks.')
 
     # * Transformer
     parser.add_argument('--dec_layers', default=3, type=int,
