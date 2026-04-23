@@ -19,6 +19,9 @@ projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu layernorm}
 act_observer="${ACT_OBSERVER:-percentile}"
 act_percentile="${ACT_PERCENTILE:-99}"
 
+read -r -a backbone_quant_component_args <<< "$backbone_quant_components"
+component_suffix="$(printf '%s\n' "${backbone_quant_component_args[@]}" | paste -sd '_' -)"
+
 case "$model_size" in
   tiny)
     model_name="lwdetr_tiny_coco"
@@ -59,7 +62,6 @@ if [[ "$encoder_quant_blocks" != "all" ]]; then
   quant_block_args=(--encoder_quant_blocks "${quant_block_args[@]}")
 fi
 
-read -r -a backbone_quant_component_args <<< "$backbone_quant_components"
 read -r -a encoder_quant_component_args <<< "$encoder_quant_components"
 read -r -a projector_quant_component_args <<< "$projector_quant_components"
 read -r -a window_block_args <<< "$window_block_indexes"
@@ -93,4 +95,4 @@ python main.py \
     --coco_path "$coco_path" \
     --square_resize_div_64 \
     --calib --resume "$checkpoint" \
-    --output_dir "output/${model_name}_quant_${model_size}"
+    --output_dir "output/${model_name}_quant_${component_suffix}_${model_size}"

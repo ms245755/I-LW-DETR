@@ -22,7 +22,7 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 model_name = 'lwdetr_tiny_coco_quant'
 # Run the distributed training job with `torch.distributed.launch`
 srun python -u -m torch.distributed.launch \
-    --nproc_per_node=4 \
+    --nproc_per_node=$NPROC_PER_NODE \
     --use_env \
     main.py \
     --lr 1e-4 \
