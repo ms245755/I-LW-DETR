@@ -135,6 +135,16 @@ class IViTAct(nn.Module):
         The mode for quantization. 'none' for no quantization.
     """
 
+    _default_observer_mode = "ema_minmax"
+    _default_percentile = 99.9
+
+    @classmethod
+    def configure_defaults(cls, observer_mode=None, percentile=None):
+        if observer_mode is not None:
+            cls._default_observer_mode = observer_mode
+        if percentile is not None:
+            cls._default_percentile = percentile
+
     def __init__(
         self,
         activation_bit=8,
@@ -142,6 +152,8 @@ class IViTAct(nn.Module):
         running_stat=True,
         per_channel=False,
         quant_mode="symmetric",
+        observer_mode=None,
+        percentile=None,
     ):
         super(IViTAct, self).__init__()
 
@@ -150,6 +162,8 @@ class IViTAct(nn.Module):
         self.running_stat = running_stat
         self.quant_mode = quant_mode
         self.per_channel = per_channel
+        self.observer_mode = observer_mode or self._default_observer_mode
+        self.percentile = self._default_percentile if percentile is None else percentile
 
         self.register_buffer("act_scaling_factor", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("out_scaling_factor", nn.Parameter(torch.tensor(1.0)))
@@ -169,11 +183,12 @@ class IViTAct(nn.Module):
     def __repr__(self):
         return (
             "{0}(activation_bit={1}, "
-            "quant_mode: {2}, Act_min: {3:.2f}, "
-            "Act_max: {4:.2f})".format(
+            "quant_mode: {2}, observer_mode: {3}, "
+            "Act_min: {4:.2f}, Act_max: {5:.2f})".format(
                 self.__class__.__name__,
                 self.activation_bit,
                 self.quant_mode,
+                self.observer_mode,
                 self.min_val.item(),
                 self.max_val.item(),
             )
@@ -209,8 +224,17 @@ class IViTAct(nn.Module):
                 v = x_act.reshape(-1, x_act.shape[-1])
                 v = v.transpose(0, 1)
 
-                cur_min = v.min(dim=1).values
-                cur_max = v.max(dim=1).values
+                if self.observer_mode == "percentile":
+                    upper_q = min(max(self.percentile / 100.0, 0.0), 1.0)
+                    lower_q = min(max(1.0 - upper_q, 0.0), 1.0)
+                    v_float = v.float()
+                    cur_min = torch.quantile(v_float, lower_q, dim=1).to(v.dtype)
+                    cur_max = torch.quantile(v_float, upper_q, dim=1).to(v.dtype)
+                elif self.observer_mode == "ema_minmax":
+                    cur_min = v.min(dim=1).values
+                    cur_max = v.max(dim=1).values
+                else:
+                    raise ValueError("unknown observer_mode: {}".format(self.observer_mode))
                 if torch.eq(self.min_val, self.max_val).all():
                     self.min_val = cur_min
                     self.max_val = cur_max

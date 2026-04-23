@@ -16,6 +16,8 @@ backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
 encoder_quant_blocks="${ENCODER_QUANT_BLOCKS:-all}"
 encoder_quant_components="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
 projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu layernorm}"
+act_observer="${ACT_OBSERVER:-percentile}"
+act_percentile="${ACT_PERCENTILE:-99}"
 
 case "$model_size" in
   tiny)
@@ -73,6 +75,8 @@ python main.py \
     "${quant_block_args[@]}" \
     --encoder_quant_components "${encoder_quant_component_args[@]}" \
     --projector_quant_components "${projector_quant_component_args[@]}" \
+    --act_observer "$act_observer" \
+    --act_percentile "$act_percentile" \
     --dec_layers 3 \
     --group_detr 13 \
     --two_stage \

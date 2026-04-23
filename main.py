@@ -103,6 +103,12 @@ def get_args_parser():
                         type=str, nargs='+',
                         choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm', 'silu'),
                         help='Operation families to quantize inside the projector. Only conv2d, gelu, and layernorm are used by the projector today.')
+    parser.add_argument('--act_observer', default='ema_minmax', type=str,
+                        choices=('ema_minmax', 'percentile'),
+                        help='Activation observer used by IViTAct during calibration/QAT.')
+    parser.add_argument('--act_percentile', default=99.9, type=float,
+                        help='Percentile used when --act_observer percentile is selected.')
+
 
     # * Transformer
     parser.add_argument('--dec_layers', default=3, type=int,
@@ -215,7 +221,7 @@ def main(args):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank() + 0
+    seed = args.seed + utils.get_rank() + 2
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -340,7 +346,7 @@ def main(args):
         )
         calibrate(
             model,
-            data_loader_val,
+            calib_loader,
             device,
             args=args,
             calib_batches=num_calib_batch,
