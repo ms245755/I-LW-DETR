@@ -5,6 +5,7 @@ set -euo pipefail
 #   bash setup/lwdetr_quant_calib.sh tiny /path/to/coco /path/to/checkpoint.pth
 #   BACKBONE_QUANT_COMPONENTS="vit" ENCODER_QUANT_BLOCKS="0 3 5" \
 #     ENCODER_QUANT_COMPONENTS="linear softmax layernorm gelu" \
+#     PROJECTOR_QUANT_COMPONENTS="conv2d layernorm" \
 #     bash setup/lwdetr_quant_calib.sh small /path/to/coco /path/to/checkpoint.pth
 
 model_size="${1:-tiny}"
@@ -14,6 +15,7 @@ checkpoint="${3:?Usage: bash setup/lwdetr_quant_calib.sh <tiny|small|medium> <co
 backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
 encoder_quant_blocks="${ENCODER_QUANT_BLOCKS:-all}"
 encoder_quant_components="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
+projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu layernorm}"
 
 case "$model_size" in
   tiny)
@@ -57,6 +59,7 @@ fi
 
 read -r -a backbone_quant_component_args <<< "$backbone_quant_components"
 read -r -a encoder_quant_component_args <<< "$encoder_quant_components"
+read -r -a projector_quant_component_args <<< "$projector_quant_components"
 read -r -a window_block_args <<< "$window_block_indexes"
 read -r -a out_feature_args <<< "$out_feature_indexes"
 
@@ -69,6 +72,7 @@ python main.py \
     --backbone_quant_components "${backbone_quant_component_args[@]}" \
     "${quant_block_args[@]}" \
     --encoder_quant_components "${encoder_quant_component_args[@]}" \
+    --projector_quant_components "${projector_quant_component_args[@]}" \
     --dec_layers 3 \
     --group_detr 13 \
     --two_stage \

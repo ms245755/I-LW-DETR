@@ -98,6 +98,11 @@ def get_args_parser():
                         type=str, nargs='+',
                         choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm'),
                         help='Operation families to quantize inside quantized ViT blocks.')
+    parser.add_argument('--projector_quant_components',
+                        default=['conv2d', 'gelu', 'layernorm'],
+                        type=str, nargs='+',
+                        choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm', 'silu'),
+                        help='Operation families to quantize inside the projector. Only conv2d, gelu, and layernorm are used by the projector today.')
 
     # * Transformer
     parser.add_argument('--dec_layers', default=3, type=int,
@@ -210,7 +215,7 @@ def main(args):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank() + 2
+    seed = args.seed + utils.get_rank() + 0
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -296,8 +301,8 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        # if args.qat or args.calib:
-        #     checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
+        if args.backbone_quant_components is not None and 'projector' in set(args.backbone_quant_components):
+            checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
         stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
 
         if args.use_ema:
@@ -335,7 +340,7 @@ def main(args):
         )
         calibrate(
             model,
-            calib_loader,
+            data_loader_val,
             device,
             args=args,
             calib_batches=num_calib_batch,

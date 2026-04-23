@@ -43,6 +43,7 @@ class Backbone(BackboneBase):
                  backbone_quant_components=None,
                  encoder_quant_blocks=None,
                  encoder_quant_components=None,
+                 projector_quant_components=None,
                  ):
         super().__init__()
         self.name = name
@@ -117,7 +118,8 @@ class Backbone(BackboneBase):
             out_channels=out_channels,
             scale_factors=scale_factors,
             observe_stat=observe_stat,
-            block_name=block_name+"projector/"
+            block_name=block_name+"projector/",
+            **({"quant_components": projector_quant_components} if self.quantize_projector else {})
         )
 
         self._export = False
@@ -135,10 +137,7 @@ class Backbone(BackboneBase):
         # (H, W, B, C)
         feats = self.encoder(tensor_list.tensors)
         if self.quantize_projector:
-            feats = [
-                (feat, scale) if scale is not None else self.encoder.qact_block_bridge[-1](x=feat, act_scaling_factor=None)
-                for (feat, scale) in feats
-            ]
+            feats = [(feat, scale) for (feat, scale) in feats]
         else:
             feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
@@ -159,6 +158,8 @@ class Backbone(BackboneBase):
         if not self.quantize_projector:
             feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
+        if self.quantize_projector:
+            feats = [feat for (feat, scale) in feats]
         out_feats = []
         out_masks = []
         for feat in feats:
