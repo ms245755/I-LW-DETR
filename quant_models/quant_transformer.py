@@ -24,7 +24,10 @@ from .quant_blocks import *
 from quant_models.fake_quantized.layers import *
 
 class ILinearBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, has_gelu=True):
+    def __init__(self, in_dim, out_dim, has_gelu=True, gelu=None):
+        super().__init__()
+        if gelu is not None:
+            has_gelu = gelu
         self.linear = IViTLinear(in_dim, out_dim)
         self.qact_post_linear = IViTAct()
         self.has_gelu = has_gelu
@@ -36,8 +39,8 @@ class ILinearBlock(nn.Module):
         x, act_scaling_factor = self.linear(x, act_scaling_factor)
         x, act_scaling_factor = self.qact_post_linear(x, act_scaling_factor)
         if self.has_gelu:
-            x, act_scaling_factor = self.linear(x, act_scaling_factor)
-            x, act_scaling_factor = self.linear(x, act_scaling_factor)
+            x, act_scaling_factor = self.act(x, act_scaling_factor)
+            x, act_scaling_factor = self.qact_post_gelu(x, act_scaling_factor)
         return x, act_scaling_factor
 
 class IMLP(nn.Module):
@@ -168,6 +171,7 @@ class Transformer(nn.Module):
         assert decoder_norm_type in ['LN', 'Identity']
         norm = { 
             "LN": lambda channels: IViTLayerNorm(channels),
+            "Identity": lambda channels: nn.Identity(),
         }
         decoder_norm = norm[decoder_norm_type](d_model)
 
@@ -205,7 +209,7 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         for m in self.modules():
-            if isinstance(m, MSDeformAttn):
+            if isinstance(m, (MSDeformAttn, IMSDeformAttn)):
                 m._reset_parameters()
     # Cong: keep this as float for now
     def get_valid_ratio(self, mask):
@@ -353,12 +357,22 @@ class TransformerDecoder(nn.Module):
         self.lite_refpoint_refine = lite_refpoint_refine
         self.bbox_reparam = bbox_reparam
 
+        # Keep the original ref_point_head width so pretrained weights remain reusable,
+        # and learn a quantization-friendly coordinate expansion in front of it.
         self.ref_point_head = IMLP(2 * d_model, d_model, d_model, 2)
+        self.ref_point_coord_proj = IMLP(4, d_model, 2 * d_model, 2)
 
         self._export = False
     
     def export(self):
         self._export = True
+
+    def _apply_norm(self, x, scale):
+        if self.norm is None:
+            return x, scale
+        if isinstance(self.norm, IViTLayerNorm):
+            return self.norm(x, scale)
+        return self.norm(x), scale
 
     def refpoints_refine(self, refpoints_unsigmoid, new_refpoints_delta):
         if self.bbox_reparam:
@@ -383,51 +397,50 @@ class TransformerDecoder(nn.Module):
                 spatial_shapes: Optional[Tensor] = None, # bs, num_levels, 2
                 valid_ratios: Optional[Tensor] = None):
         output = tgt
+        output_scale = query_scale
 
         intermediate = []
         hs_refpoints_unsigmoid = [refpoints_unsigmoid]
         
-        # Cong: hard to quantize gen_sineembed_for_position, if we train from beginning or use qat
         def get_reference(refpoints):
-            # [num_queries, batch_size, 4]
             obj_center = refpoints[..., :4]
             
             if self._export:
-                query_sine_embed = gen_sineembed_for_position(obj_center, self.d_model / 2) # bs, nq, 256*2 
                 refpoints_input = obj_center[:, :, None] # bs, nq, 1, 4
+                query_pos_input = obj_center
             else:
                 refpoints_input = obj_center[:, :, None] \
                                         * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # bs, nq, nlevel, 4
-                query_sine_embed = gen_sineembed_for_position(
-                    refpoints_input[:, :, 0, :], self.d_model / 2) # bs, nq, 256*2 
-            query_pos, query_pos_scale = self.ref_point_head(query_sine_embed, None)
-            return obj_center, refpoints_input, query_pos, query_sine_embed
+                query_pos_input = refpoints_input[:, :, 0, :]
+            query_pos_embed, query_pos_embed_scale = self.ref_point_coord_proj(query_pos_input, None)
+            query_pos, query_pos_scale = self.ref_point_head(query_pos_embed, query_pos_embed_scale)
+            return obj_center, refpoints_input, query_pos, query_pos_scale, query_pos_input
         
         # always use init refpoints
         if self.lite_refpoint_refine:
             if self.bbox_reparam:
-                obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid)
+                obj_center, refpoints_input, query_pos, query_pos_scale, query_sine_embed = get_reference(refpoints_unsigmoid)
             else:
-                obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
+                obj_center, refpoints_input, query_pos, query_pos_scale, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
 
         for layer_id, layer in enumerate(self.layers):
             # iter refine each layer
             if not self.lite_refpoint_refine:
                 if self.bbox_reparam:
-                    obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid)
+                    obj_center, refpoints_input, query_pos, query_pos_scale, query_sine_embed = get_reference(refpoints_unsigmoid)
                 else:
-                    obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
+                    obj_center, refpoints_input, query_pos, query_pos_scale, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
 
             # For the first decoder layer, we do not apply transformation over p_s
             pos_transformation = 1
 
             query_pos = query_pos * pos_transformation
             
-            output = layer(output, query_scale, memory, memory_scale, tgt_mask=tgt_mask,
+            output, output_scale = layer(output, output_scale, memory, memory_scale, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
-                           pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed, 
+                           pos=pos, query_pos=query_pos, query_pos_scale=query_pos_scale, query_sine_embed=query_sine_embed, 
                            is_first=(layer_id == 0),
                            reference_points=refpoints_input, refpoint_scale = refpoint_scale,
                            spatial_shapes=spatial_shapes,
@@ -435,17 +448,18 @@ class TransformerDecoder(nn.Module):
 
             if not self.lite_refpoint_refine:
                 # box iterative update
-                new_refpoints_delta = self.bbox_embed(output)
+                new_refpoints_delta, _ = self.bbox_embed(output, output_scale)
                 new_refpoints_unsigmoid = self.refpoints_refine(refpoints_unsigmoid, new_refpoints_delta)
                 if layer_id != self.num_layers - 1:
                     hs_refpoints_unsigmoid.append(new_refpoints_unsigmoid)
                 refpoints_unsigmoid = new_refpoints_unsigmoid.detach()
 
             if self.return_intermediate:
-                intermediate.append(self.norm(output))
+                normed_output, _ = self._apply_norm(output, output_scale)
+                intermediate.append(normed_output)
 
         if self.norm is not None:
-            output = self.norm(output)
+            output, output_scale = self._apply_norm(output, output_scale)
             if self.return_intermediate:
                 intermediate.pop()
                 intermediate.append(output)
@@ -474,6 +488,57 @@ class TransformerDecoder(nn.Module):
         return output.unsqueeze(0)
 
 
+class QuantDecoderSelfAttention(nn.Module):
+
+    def __init__(self, d_model, nhead):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = IViTLinear(d_model, d_model)
+        self.k_proj = IViTLinear(d_model, d_model)
+        self.v_proj = IViTLinear(d_model, d_model)
+        self.out_proj = IViTLinear(d_model, d_model)
+
+        self.qact_q = IViTAct()
+        self.qact_k = IViTAct()
+        self.qact_v = IViTAct()
+        self.qact_attn = IViTAct()
+        self.qact_out = IViTAct()
+        self.matmul = IViTMatMul()
+        self.softmax = IViTSoftmax(output_bit=16, dim=-1)
+
+    def forward(self, tgt, tgt_scale, query_pos, query_pos_scale):
+        qk_input, qk_scale = add_tensor_scale(tgt, tgt_scale, query_pos, query_pos_scale)
+        v_input, v_scale = tgt, tgt_scale
+
+        q, q_scale = self.q_proj(qk_input, qk_scale)
+        q, q_scale = self.qact_q(q, q_scale)
+        k, k_scale = self.k_proj(qk_input, qk_scale)
+        k, k_scale = self.qact_k(k, k_scale)
+        v, v_scale = self.v_proj(v_input, v_scale)
+        v, v_scale = self.qact_v(v, v_scale)
+
+        bs, num_queries, _ = q.shape
+        q = q.view(bs, num_queries, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(bs, num_queries, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(bs, num_queries, self.nhead, self.head_dim).transpose(1, 2)
+
+        attn, attn_scale = self.matmul(q, q_scale, k.transpose(-2, -1), k_scale)
+        attn = attn * self.scale
+        attn_scale = attn_scale * self.scale
+        attn, attn_scale = self.qact_attn(attn, attn_scale)
+        attn, attn_scale = self.softmax(attn, attn_scale)
+
+        out, out_scale = self.matmul(attn, attn_scale, v, v_scale)
+        out = out.transpose(1, 2).reshape(bs, num_queries, self.d_model)
+        out, out_scale = self.qact_out(out, out_scale)
+        out, out_scale = self.out_proj(out, out_scale)
+        return out, out_scale
+
+
 class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, sa_nhead, ca_nhead, dim_feedforward=2048, dropout=0.1,
@@ -482,12 +547,12 @@ class TransformerDecoderLayer(nn.Module):
                  skip_self_attn=False):
         super().__init__()
         # Decoder Self-Attention
-        self.self_attn = IAttention(dim=d_model, heads=sa_nhead, dropout=dropout)
+        self.self_attn = QuantDecoderSelfAttention(d_model, sa_nhead)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = IViTLayerNorm(d_model)
 
         # Decoder Cross-Attention
-        self.cross_attn = MSDeformAttn(
+        self.cross_attn = IMSDeformAttn(
             d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points)
 
         self.nhead = ca_nhead
@@ -506,6 +571,8 @@ class TransformerDecoderLayer(nn.Module):
         self.activation = ISegGELU()
         self.normalize_before = normalize_before
         self.group_detr = group_detr
+        self.qact_ffn_1 = IViTAct()
+        self.qact_ffn_2 = IViTAct()
         
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
@@ -518,6 +585,7 @@ class TransformerDecoderLayer(nn.Module):
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
+                     query_pos_scale = None,
                      query_sine_embed = None,
                      is_first = False,
                      reference_points = None, refpoint_scale = None,
@@ -529,40 +597,47 @@ class TransformerDecoderLayer(nn.Module):
         # ========== Begin of Self-Attention =============
         # Apply projections here
         # shape: batch_size x num_queries x 256
-        q = k = tgt + query_pos
-        v = tgt
         if self.training:
-            q = torch.cat(q.split(num_queries // self.group_detr, dim=1), dim=0)
-            k = torch.cat(k.split(num_queries // self.group_detr, dim=1), dim=0)
-            v = torch.cat(v.split(num_queries // self.group_detr, dim=1), dim=0)
+            group_queries = num_queries // self.group_detr
+            tgt_sa = torch.cat(tgt.split(group_queries, dim=1), dim=0)
+            query_pos_sa = torch.cat(query_pos.split(group_queries, dim=1), dim=0)
+        else:
+            tgt_sa = tgt
+            query_pos_sa = query_pos
 
-        tgt2 = self.self_attn(q, k, v, attn_mask=tgt_mask,
-                            key_padding_mask=tgt_key_padding_mask)[0]
+        tgt2, tgt2_scale = self.self_attn(tgt_sa, query_scale, query_pos_sa, query_pos_scale)
         
         if self.training:
             tgt2 = torch.cat(tgt2.split(bs, dim=0), dim=1)
         # ========== End of Self-Attention =============
 
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
+        tgt, query_scale = add_tensor_scale(tgt, query_scale, self.dropout1(tgt2), tgt2_scale)
+        tgt, query_scale = self.norm1(tgt, query_scale)
 
         # ========== Begin of Cross-Attention =============
-        tgt2 = self.cross_attn(
-            self.with_pos_embed(tgt, query_pos),
+        query_with_pos, query_with_pos_scale = add_tensor_scale(tgt, query_scale, query_pos, query_pos_scale)
+        tgt2, tgt2_scale = self.cross_attn(
+            query_with_pos,
             reference_points,
             memory,
             spatial_shapes,
             level_start_index,
-            memory_key_padding_mask
+            memory_key_padding_mask,
+            query_with_pos_scale,
+            memory_scale,
         )
         # ========== End of Cross-Attention =============
 
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-        tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
-        return tgt
+        tgt, query_scale = add_tensor_scale(tgt, query_scale, self.dropout2(tgt2), tgt2_scale)
+        tgt, query_scale = self.norm2(tgt, query_scale)
+        tgt2, tgt2_scale = self.linear1(tgt, query_scale)
+        tgt2, tgt2_scale = self.qact_ffn_1(tgt2, tgt2_scale)
+        tgt2, tgt2_scale = self.activation(tgt2, tgt2_scale)
+        tgt2, tgt2_scale = self.linear2(tgt2, tgt2_scale)
+        tgt2, tgt2_scale = self.qact_ffn_2(tgt2, tgt2_scale)
+        tgt, query_scale = add_tensor_scale(tgt, query_scale, self.dropout3(tgt2), tgt2_scale)
+        tgt, query_scale = self.norm3(tgt, query_scale)
+        return tgt, query_scale
 
     def forward(self, tgt, query_scale, memory, memory_scale,
                 tgt_mask: Optional[Tensor] = None,
@@ -571,13 +646,14 @@ class TransformerDecoderLayer(nn.Module):
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None,
+                query_pos_scale = None,
                 query_sine_embed = None,
                 is_first = False,
                 reference_points = None, refpoint_scale = None,
                 spatial_shapes=None,
                 level_start_index=None):
         return self.forward_post(tgt, query_scale, memory, memory_scale, tgt_mask, memory_mask,
-                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos, 
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos, query_pos_scale,
                                  query_sine_embed, is_first,
                                  reference_points, refpoint_scale, spatial_shapes, level_start_index)
 

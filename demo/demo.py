@@ -96,6 +96,8 @@ def get_args_parser():
                         help='the number of sampling points')
     parser.add_argument('--decoder_norm', default='LN', type=str)
     parser.add_argument('--bbox_reparam', action='store_true')
+    parser.add_argument('--easy_quantize', action='store_true',
+                        help='use quantization-friendly float components: learned ref pos encoding and nearest deformable sampling')
 
     # * Dataset infomation
     parser.add_argument('--dataset_file', default='coco')

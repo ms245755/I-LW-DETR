@@ -37,7 +37,7 @@ def _is_power_of_2(n):
 class MSDeformAttn(nn.Module):
     """Multi-Scale Deformable Attention Module"""
 
-    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
+    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, sampling_mode="bilinear"):
         """
         Multi-Scale Deformable Attention Module
         :param d_model      hidden dimension
@@ -63,6 +63,7 @@ class MSDeformAttn(nn.Module):
         self.n_levels = n_levels
         self.n_heads = n_heads
         self.n_points = n_points
+        self.sampling_mode = sampling_mode
 
         self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
@@ -147,6 +148,12 @@ class MSDeformAttn(nn.Module):
         attention_weights = F.softmax(attention_weights, -1)
 
         value = value.transpose(1, 2).contiguous().view(N, self.n_heads, self.d_model // self.n_heads, Len_in)
-        output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
+        output = ms_deform_attn_core_pytorch(
+            value,
+            input_spatial_shapes,
+            sampling_locations,
+            attention_weights,
+            mode=self.sampling_mode,
+        )
         output = self.output_proj(output)
         return output

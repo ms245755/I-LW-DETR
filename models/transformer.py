@@ -134,6 +134,7 @@ class Transformer(nn.Module):
                  two_stage=False,
                  num_feature_levels=4, dec_n_points=4,
                  lite_refpoint_refine=False,
+                 easy_quantize=False,
                  decoder_norm_type='LN',
                  bbox_reparam=False):
         super().__init__()
@@ -144,6 +145,7 @@ class Transformer(nn.Module):
                                                 group_detr=group_detr,
                                                 num_feature_levels=num_feature_levels,
                                                 dec_n_points=dec_n_points,
+                                                easy_quantize=easy_quantize,
                                                 skip_self_attn=False,)
         assert decoder_norm_type in ['LN', 'Identity']
         norm = { 
@@ -156,6 +158,7 @@ class Transformer(nn.Module):
                                           return_intermediate=return_intermediate_dec,
                                           d_model=d_model,
                                           lite_refpoint_refine=lite_refpoint_refine,
+                                          easy_quantize=easy_quantize,
                                           bbox_reparam=bbox_reparam)
         
         
@@ -297,6 +300,7 @@ class TransformerDecoder(nn.Module):
                  return_intermediate=False,
                  d_model=256,
                  lite_refpoint_refine=False,
+                 easy_quantize=False,
                  bbox_reparam=False):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -305,9 +309,11 @@ class TransformerDecoder(nn.Module):
         self.norm = norm
         self.return_intermediate = return_intermediate
         self.lite_refpoint_refine = lite_refpoint_refine
+        self.easy_quantize = easy_quantize
         self.bbox_reparam = bbox_reparam
 
         self.ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
+        self.ref_point_coord_proj = MLP(4, d_model, 2 * d_model, 2) if easy_quantize else None
 
         self._export = False
     
@@ -345,15 +351,27 @@ class TransformerDecoder(nn.Module):
             # [num_queries, batch_size, 4]
             obj_center = refpoints[..., :4]
             
-            if self._export:
-                query_sine_embed = gen_sineembed_for_position(obj_center, self.d_model / 2) # bs, nq, 256*2 
-                refpoints_input = obj_center[:, :, None] # bs, nq, 1, 4
+            if self.easy_quantize:
+                if self._export:
+                    refpoints_input = obj_center[:, :, None] # bs, nq, 1, 4
+                    query_pos_input = obj_center
+                else:
+                    refpoints_input = obj_center[:, :, None] \
+                                            * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # bs, nq, nlevel, 4
+                    query_pos_input = refpoints_input[:, :, 0, :]
+                query_pos_embed = self.ref_point_coord_proj(query_pos_input)
+                query_pos = self.ref_point_head(query_pos_embed)
+                query_sine_embed = query_pos_input
             else:
-                refpoints_input = obj_center[:, :, None] \
-                                        * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # bs, nq, nlevel, 4
-                query_sine_embed = gen_sineembed_for_position(
-                    refpoints_input[:, :, 0, :], self.d_model / 2) # bs, nq, 256*2 
-            query_pos = self.ref_point_head(query_sine_embed)
+                if self._export:
+                    query_sine_embed = gen_sineembed_for_position(obj_center, self.d_model / 2) # bs, nq, 256*2 
+                    refpoints_input = obj_center[:, :, None] # bs, nq, 1, 4
+                else:
+                    refpoints_input = obj_center[:, :, None] \
+                                            * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # bs, nq, nlevel, 4
+                    query_sine_embed = gen_sineembed_for_position(
+                        refpoints_input[:, :, 0, :], self.d_model / 2) # bs, nq, 256*2 
+                query_pos = self.ref_point_head(query_sine_embed)
             return obj_center, refpoints_input, query_pos, query_sine_embed
         
         # always use init refpoints
@@ -432,6 +450,7 @@ class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, sa_nhead, ca_nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False, group_detr=1, 
                  num_feature_levels=4, dec_n_points=4, 
+                 easy_quantize=False,
                  skip_self_attn=False):
         super().__init__()
         # Decoder Self-Attention
@@ -441,7 +460,8 @@ class TransformerDecoderLayer(nn.Module):
 
         # Decoder Cross-Attention
         self.cross_attn = MSDeformAttn(
-            d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points)
+            d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points,
+            sampling_mode="nearest" if easy_quantize else "bilinear")
 
         self.nhead = ca_nhead
 
@@ -559,6 +579,7 @@ def build_transformer(args):
         num_feature_levels=args.num_feature_levels,
         dec_n_points=args.dec_n_points,
         lite_refpoint_refine=args.lite_refpoint_refine,
+        easy_quantize=args.easy_quantize,
         decoder_norm_type=args.decoder_norm,
         bbox_reparam=args.bbox_reparam,
     )

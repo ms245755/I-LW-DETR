@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 
-def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights):
+def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights, mode="bilinear"):
     """ "for debug and test only, need to use cuda version instead"""
     # B, n_heads, head_dim, N
     B, n_heads, head_dim, _ = value.shape
@@ -36,7 +36,7 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
         sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
         # B*n_heads, head_dim, Len_q, P
         sampling_value_l_ = F.grid_sample(
-            value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False
+            value_l_, sampling_grid_l_, mode=mode, padding_mode="zeros", align_corners=False
         )
         sampling_value_list.append(sampling_value_l_)
     # (B, Len_q, n_heads, L * P) -> (B, n_heads, Len_q, L, P) -> (B*n_heads, 1, Len_q, L*P)

@@ -674,8 +674,11 @@ class IMSDeformAttn(nn.Module):
         self.qact_input            = IViTAct()   # quantize input_flatten
         self.qact_query            = IViTAct()   # quantize query
         self.qact_value            = IViTAct()   # after value_proj
+        self.qact_reference_points = IViTAct()   # quantize reference point coordinates
         self.qact_sampling_offsets = IViTAct()   # after sampling_offsets
+        self.qact_sampling_locs    = IViTAct()   # quantize sampling locations
         self.qact_attn_weights     = IViTAct()   # after attention_weights + softmax
+        self.qact_sampled_values   = IViTAct()   # after grid sampling
         self.qact_output           = IViTAct()   # after ms_deform_attn_core
 
         self._reset_parameters()
@@ -731,7 +734,7 @@ class IMSDeformAttn(nn.Module):
 
         # ── value projection ───────────────────────────────────────────
         value, value_scale = self.value_proj(flatten_int, flatten_scale)
-        value, value_scale = self.qact_value(flatten_int, flatten_scale)
+        value, value_scale = self.qact_value(value, value_scale)
         # value: (N, Len_in, d_model)
 
         if input_padding_mask is not None:
@@ -739,14 +742,18 @@ class IMSDeformAttn(nn.Module):
 
         # ── sampling offsets ───────────────────────────────────────────
         sampling_offsets, sampling_scale = self.sampling_offsets(query_int, query_scale)
-        sampling_offsets, sampling_scale = self.qact_sampling_offsets(query_int, query_scale)
+        sampling_offsets, sampling_scale = self.qact_sampling_offsets(sampling_offsets, sampling_scale)
         # dequant for view + normalizer division (non-quantizable ops)
-        sampling_offsets = sampling_offsets * sampling_scale
         sampling_offsets = sampling_offsets.view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
 
         # ── attention weights ──────────────────────────────────────────
         attn_weights, attn_scale = self.attention_weights(query_int, query_scale)
-        attn_weights, attn_scale = self.softmax(query_int, query_scale)
+        attn_weights, attn_scale = self.softmax(attn_weights, attn_scale)
+        attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
+
+        # Quantize reference points before geometric ops so coordinate inputs
+        # are also tracked by the activation observer.
+        reference_points, reference_points_scale = self.qact_reference_points(reference_points, None)
         
 
         # ── sampling locations (float op — not quantizable) ────────────
@@ -765,26 +772,23 @@ class IMSDeformAttn(nn.Module):
             raise ValueError(
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
             )
+        sampling_locations, sampling_locations_scale = self.qact_sampling_locs(sampling_locations, None)
 
         # ── deformable attention core ──────────────────────────────────
-        # dequant value for cuda kernel — ms_deform_attn_core expects float
-        value_float = value * value_scale
-        value_float = value_float.transpose(1, 2).contiguous().view(
+        value_float = value.transpose(1, 2).contiguous().view(
             N, self.n_heads, self.d_model // self.n_heads, Len_in
         )
-        # attn_weights dequant for cuda kernel
-        attn_weights_float = attn_weights * attn_scale
-
-        output = ms_deform_attn_core_pytorch(
+        output = quantized_ms_deform_attn_core_pytorch(
             value_float,
+            value_scale,
             input_spatial_shapes,
             sampling_locations,
-            attn_weights_float,
+            sampling_locations_scale,
+            attn_weights,
+            attn_scale,
+            qact_sampled_values=self.qact_sampled_values,
         )
-        # output: (N, Len_q, d_model) — float
-
-        # requant before output_proj
-        output, output_scale = self.qact_output(output)
+        output, output_scale = self.qact_output(output, None)
 
         # ── output projection ──────────────────────────────────────────
         output, output_scale = self.output_proj(output, output_scale)
@@ -814,4 +818,95 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
     # B*n_heads, head_dim, Len_q, L*P
     sampling_value_list = torch.stack(sampling_value_list, dim=-2).flatten(-2)
     output = (sampling_value_list * attention_weights).sum(-1).view(B, n_heads * head_dim, Len_q)
+    return output.transpose(1, 2).contiguous()
+
+
+def quant_grid_sample_nearest(value, value_scale, sampling_grid):
+    """Quantization-friendly nearest-neighbor sampler.
+
+    Args:
+        value: Tensor of shape [B, C, H, W], already fake-quantized.
+        value_scale: Per-channel or scalar activation scale for `value`.
+        sampling_grid: Tensor of shape [B, Len_q, P, 2] in normalized [-1, 1].
+
+    Returns:
+        Sampled tensor of shape [B, C, Len_q, P] gathered with integer-like
+        nearest-neighbor indexing using the align_corners=False convention.
+    """
+    B, C, H, W = value.shape
+
+    if torch.is_tensor(value_scale) and value_scale.numel() > 1:
+        scale = value_scale.view(1, C, 1, 1)
+    else:
+        scale = value.new_tensor(value_scale).view(1, 1, 1, 1)
+
+    value_int = round_ste.apply(value / scale)
+
+    x_norm = sampling_grid[..., 0]
+    y_norm = sampling_grid[..., 1]
+
+    # Match grid_sample(..., align_corners=False) normalization.
+    x = ((x_norm + 1.0) * W - 1.0) / 2.0
+    y = ((y_norm + 1.0) * H - 1.0) / 2.0
+
+    x_idx = round_ste.apply(x)
+    y_idx = round_ste.apply(y)
+
+    valid = (x_idx >= 0) & (x_idx <= (W - 1)) & (y_idx >= 0) & (y_idx <= (H - 1))
+
+    x_idx = x_idx.clamp(0, W - 1).long()
+    y_idx = y_idx.clamp(0, H - 1).long()
+
+    linear_idx = (y_idx * W + x_idx).view(B, 1, -1).expand(-1, C, -1)
+    value_flat = value_int.view(B, C, H * W)
+    sampled_int = torch.gather(value_flat, dim=2, index=linear_idx).view(B, C, sampling_grid.shape[1], sampling_grid.shape[2])
+    sampled_int = sampled_int * valid.unsqueeze(1).to(sampled_int.dtype)
+
+    return sampled_int * scale
+
+
+def quantized_ms_deform_attn_core_pytorch(
+    value,
+    value_scale,
+    value_spatial_shapes,
+    sampling_locations,
+    sampling_locations_scale,
+    attention_weights,
+    attention_weights_scale,
+    qact_sampled_values=None,
+):
+    """Fake-quantized deformable attention core.
+
+    The geometric sampler still uses float `grid_sample`, but sampled features
+    and attention weights are requantized before the weighted accumulation so
+    the MAC path is executed in an INT8-emulated form.
+    """
+    B, n_heads, head_dim, _ = value.shape
+    _, Len_q, n_heads, L, P, _ = sampling_locations.shape
+    value_list = value.split([H * W for H, W in value_spatial_shapes], dim=3)
+    sampling_grids = 2 * sampling_locations - 1
+    sampling_value_list = []
+
+    for lid_, (H, W) in enumerate(value_spatial_shapes):
+        value_l_ = value_list[lid_].view(B * n_heads, head_dim, H, W)
+        sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
+        if torch.is_tensor(value_scale) and value_scale.numel() > 1:
+            value_scale_l_ = value_scale.view(n_heads, head_dim)[None].expand(B, -1, -1).reshape(B * n_heads, head_dim)
+        else:
+            value_scale_l_ = value_scale
+        sampling_value_l_ = quant_grid_sample_nearest(value_l_, value_scale_l_, sampling_grid_l_)
+        sampling_value_list.append(sampling_value_l_)
+
+    sampling_value_list = torch.stack(sampling_value_list, dim=-2).flatten(-2)
+    if qact_sampled_values is not None:
+        sampling_value_list, sampled_scale = qact_sampled_values(sampling_value_list, None)
+    else:
+        sampled_scale = value_scale
+
+    attention_weights = attention_weights.transpose(1, 2).reshape(B * n_heads, 1, Len_q, L * P)
+    prod, prod_scale = multiply_tensor_scale(
+        sampling_value_list, sampled_scale, attention_weights, attention_weights_scale
+    )
+    prod_int = round_ste.apply(prod / prod_scale)
+    output = prod_int.sum(-1).view(B, n_heads * head_dim, Len_q) * prod_scale
     return output.transpose(1, 2).contiguous()
