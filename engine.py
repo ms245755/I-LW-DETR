@@ -233,17 +233,26 @@ def calibrate(
     metric_logger.synchronize_between_processes()
     print("Calibration done. Processed batches:", calib_batches)
 
-    # Freeze stats (preferred: call model.fix())
     freeze_model(model)
 
     return model
 
 def make_random_calib_loader(original_dataset, batch_size, seed, n_samples=800, **loader_kwargs):
-    # Sample random, non-repeating indices
-    indices = list(range(len(original_dataset)))
-    random.seed(seed)
-    random.shuffle(indices)
-    indices = indices[:n_samples]
+    # Sample a deterministic, coverage-oriented subset instead of a purely random one.
+    # This makes calibration less sensitive to which exact images were drawn.
+    dataset_len = len(original_dataset)
+    if n_samples >= dataset_len:
+        indices = list(range(dataset_len))
+    else:
+        rng = random.Random(seed)
+        stride = dataset_len / float(n_samples)
+        indices = []
+        for i in range(n_samples):
+            start = int(i * stride)
+            end = int((i + 1) * stride)
+            end = min(max(end, start + 1), dataset_len)
+            indices.append(rng.randrange(start, end))
+
     subset = Subset(original_dataset, indices)
     
     # Return a new loader that only uses this random subset
