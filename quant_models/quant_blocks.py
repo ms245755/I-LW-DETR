@@ -50,6 +50,7 @@ class IPatchEmbed(nn.Module):
         ) if not self.quant_conv else conv_cls(
             in_chans, embed_dim, kernel_size=kernel_size, stride=stride, weight_bit=num_bits, bias_bit=num_bits*4
         )
+        self.qact_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact = IViTAct(activation_bit=num_bits*2)
         self.observe_stat = observe_stat
         self.block_name = block_name
@@ -58,7 +59,7 @@ class IPatchEmbed(nn.Module):
         
         if self.quant_conv:
             if act_scaling_factor is None:
-                x, act_scaling_factor = self.qact(x=x, act_scaling_factor=None)
+                x, act_scaling_factor = self.qact_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.proj(x=x, act_scaling_factor=act_scaling_factor)
         else:
             x = self.proj(x)
@@ -122,8 +123,11 @@ class IFeedForward(nn.Module):
         self.gelu_choice = gelu_choice
 
         # Quantization activations around GELU and dropout
+        self.qact_fc1_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_pre_gelu = IViTAct(activation_bit=num_bits)
+        self.qact_gelu_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_post_gelu = IViTAct(activation_bit=num_bits)
+        self.qact_fc2_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_drop2_stub = IViTAct(activation_bit=num_bits*2)
 
         # Observation flags
@@ -140,7 +144,7 @@ class IFeedForward(nn.Module):
         # First linear projection
         if self.quant_linear:
             if act_scaling_factor is None:
-                x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=None)
+                x, act_scaling_factor = self.qact_fc1_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.fc1(x=x, act_scaling_factor=act_scaling_factor)
             x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=act_scaling_factor)
         else:
@@ -175,20 +179,22 @@ class IFeedForward(nn.Module):
             self.iseg_rmse += torch.mean((self.act(x, act_scaling_factor)[0] - self.act_fp(x)) ** 2)
 
         # GELU activation choice
-        if not self.quant_gelu or self.gelu_choice == "gelu":
+        if not self.quant_gelu:
             x = F.gelu(x)
             act_scaling_factor = None
-        elif self.gelu_choice == "l_shiftgelu":
-            x, act_scaling_factor = self.act(x=x, act_scaling_factor=act_scaling_factor)
-        elif self.gelu_choice == "shiftgelu":
-            x, act_scaling_factor = self.act_no_lambda(x=x, act_scaling_factor=act_scaling_factor)
-        if self.quant_gelu:
+        else:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=None)
+            if self.gelu_choice == "l_shiftgelu":
+                x, act_scaling_factor = self.act(x=x, act_scaling_factor=act_scaling_factor)
+            elif self.gelu_choice == "shiftgelu":
+                x, act_scaling_factor = self.act_no_lambda(x=x, act_scaling_factor=act_scaling_factor)
             x, act_scaling_factor = self.qact_post_gelu(x=x, act_scaling_factor=act_scaling_factor)
 
         # Second linear projection + quantized dropout
         if self.quant_linear:
             if act_scaling_factor is None:
-                x, act_scaling_factor = self.qact_drop2_stub(x=x, act_scaling_factor=None)
+                x, act_scaling_factor = self.qact_post_gelu(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.fc2(x=x, act_scaling_factor=act_scaling_factor)
             x, act_scaling_factor = self.qact_drop2_stub(x=x, act_scaling_factor=act_scaling_factor)
         else:
@@ -237,10 +243,12 @@ class IAttention(nn.Module):
 
         # Quantized activations
         self.qact_qkv = IViTAct(activation_bit=num_bits)
+        self.qact_qkv_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_q = IViTAct(activation_bit=num_bits)
         self.qact_k = IViTAct(activation_bit=num_bits)
         self.qact_v = IViTAct(activation_bit=num_bits)
         self.qact_attn_out = IViTAct(activation_bit=num_bits)
+        self.qact_attn_matmul_bridge = IViTAct(activation_bit=num_bits)
         self.qact_pre_proj = IViTAct(activation_bit=num_bits)
         self.qact_proj_drop = IViTAct(activation_bit=num_bits)
 
@@ -258,7 +266,7 @@ class IAttention(nn.Module):
         # Project input into Q, K, V (x: [B, N, 3C])
         if self.quant_linear:
             if act_scaling_factor is None:
-                x, act_scaling_factor = self.qact_qkv(x=x, act_scaling_factor=None)
+                x, act_scaling_factor = self.qact_qkv_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.qkv(x=x, act_scaling_factor=act_scaling_factor)
         else:
             x = self.qkv(x)
@@ -325,7 +333,7 @@ class IAttention(nn.Module):
         # Apply attention to values
         if self.quant_matmul:
             if act_scaling_factor is None:
-                attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=None)
+                attn, act_scaling_factor = self.qact_attn_matmul_bridge(x=attn, act_scaling_factor=None)
             if act_scaling_factor_qkv is None:
                 v, act_scaling_factor_qkv = self.qact_v(x=v, act_scaling_factor=None)
             x, act_scaling_factor = self.matmul(
@@ -402,8 +410,10 @@ class IBlock(nn.Module):
         self.window = window
 
         # Quantized activations around residual paths
+        self.qact_norm1_input_bridge = IViTAct(activation_bit=num_bits)
         self.pre_attn_scaler = IViTAct(activation_bit=num_bits)
         self.qact_drop_1 = IViTAct(activation_bit=num_bits*2)
+        self.qact_norm2_input_bridge = IViTAct(activation_bit=num_bits)
         self.pre_mlp_scaler = IViTAct(activation_bit=num_bits)
         self.qact_drop_2 = IViTAct(activation_bit=num_bits*2)
         self.use_cae = use_cae
@@ -427,7 +437,7 @@ class IBlock(nn.Module):
         shortcut_scale = act_scaling_factor
         if self.quant_layernorm:
             if act_scaling_factor is None:
-                x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=None)
+                x, act_scaling_factor = self.qact_norm1_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.norm1(x, act_scaling_factor)
             x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
         else:
@@ -477,7 +487,7 @@ class IBlock(nn.Module):
         # FeedForward branch
         if self.quant_layernorm:
             if act_scaling_factor is None:
-                x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=None)
+                x, act_scaling_factor = self.qact_norm2_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.norm2(x=x, act_scaling_factor=act_scaling_factor)
             x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)
         else:
