@@ -248,6 +248,11 @@ def save_tensor_from_pathname(
     #     raise ValueError(f"component_path must be a safe relative path, got: {component_path!r}")
 
     file_path = Path(component_path)
+    if not file_path.is_absolute() and (not file_path.parts or file_path.parts[0] != "observed_tensor"):
+        file_path = Path(out_dir) / file_path
+    observed_tensor_root = os.environ.get("OBSERVED_TENSOR_ROOT")
+    if observed_tensor_root and file_path.parts and file_path.parts[0] == "observed_tensor":
+        file_path = Path(observed_tensor_root).joinpath(*file_path.parts[1:])
     file_path = file_path.with_suffix(ext)
     file_path.parent.mkdir(parents=True, exist_ok=True)
 

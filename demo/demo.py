@@ -51,6 +51,45 @@ COCO_CLASSES = [
     'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
+
+def adapt_checkpoint_keys_for_model(state_dict, model):
+    """Load float Linear/MLP weights into quant wrappers that store them under `.linear`."""
+    model_keys = set(model.state_dict().keys())
+    adapted = dict(state_dict)
+    for key, value in state_dict.items():
+        if key.endswith("self_attn.in_proj_weight"):
+            prefix = key[: -len("in_proj_weight")]
+            q, k, v = value.chunk(3, dim=0)
+            converted = False
+            for name, tensor in (("q_proj.weight", q), ("k_proj.weight", k), ("v_proj.weight", v)):
+                target_key = f"{prefix}{name}"
+                if target_key in model_keys and target_key not in adapted:
+                    adapted[target_key] = tensor
+                    converted = True
+            if converted and key not in model_keys:
+                adapted.pop(key, None)
+            continue
+        if key.endswith("self_attn.in_proj_bias"):
+            prefix = key[: -len("in_proj_bias")]
+            q, k, v = value.chunk(3, dim=0)
+            converted = False
+            for name, tensor in (("q_proj.bias", q), ("k_proj.bias", k), ("v_proj.bias", v)):
+                target_key = f"{prefix}{name}"
+                if target_key in model_keys and target_key not in adapted:
+                    adapted[target_key] = tensor
+                    converted = True
+            if converted and key not in model_keys:
+                adapted.pop(key, None)
+            continue
+        if not (key.endswith(".weight") or key.endswith(".bias")):
+            continue
+        prefix, suffix = key.rsplit(".", 1)
+        linear_key = f"{prefix}.linear.{suffix}"
+        if key not in model_keys and linear_key in model_keys and linear_key not in adapted:
+            adapted[linear_key] = value
+            adapted.pop(key, None)
+    return adapted
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     # Model parameters
@@ -71,6 +110,29 @@ def get_args_parser():
                         choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--out_feature_indexes', default=[-1], type=int, nargs='+', help='only for vit now')
+    parser.add_argument('--quant_model_components', default=['backbone'], type=str, nargs='+',
+                        choices=('backbone', 'transformer'),
+                        help='Top-level model components to quantize in quant demo mode.')
+    parser.add_argument('--backbone_quant_components', default=['vit', 'projector'], type=str, nargs='+',
+                        choices=('vit', 'projector'),
+                        help='Backbone components to quantize in quant demo mode.')
+    parser.add_argument('--encoder_quant_blocks', default=None, type=int, nargs='+',
+                        help='ViT encoder block indexes to quantize. Default: all blocks.')
+    parser.add_argument('--encoder_quant_components',
+                        default=['linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm'],
+                        type=str, nargs='+',
+                        choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm'),
+                        help='Operation families to quantize inside quantized ViT blocks.')
+    parser.add_argument('--projector_quant_components',
+                        default=['conv2d', 'gelu', 'layernorm'],
+                        type=str, nargs='+',
+                        choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm', 'silu'),
+                        help='Operation families to quantize inside the projector.')
+    parser.add_argument('--act_observer', default='ema_minmax', type=str,
+                        choices=('ema_minmax', 'percentile'),
+                        help='Activation observer used by IViTAct.')
+    parser.add_argument('--act_percentile', default=99.9, type=float,
+                        help='Percentile used when --act_observer percentile is selected.')
 
     # * Transformer
     parser.add_argument('--dec_layers', default=3, type=int,
@@ -210,7 +272,14 @@ def main(args):
 
     if args.weights:
         checkpoint = torch.load(args.weights, map_location='cpu')
-        model.load_state_dict(checkpoint['model'], strict=False)
+        state_dict = checkpoint['model']
+        if args.mode == 'quant':
+            state_dict = adapt_checkpoint_keys_for_model(state_dict, model)
+        load_state = model.load_state_dict(state_dict, strict=False)
+        print(
+            f"Loaded weights: missing_keys={len(load_state.missing_keys)}, "
+            f"unexpected_keys={len(load_state.unexpected_keys)}"
+        )
 
     # preprocess
     image, orig_image_size = preprocess_image(args.input)

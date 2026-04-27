@@ -1,4 +1,4 @@
-import seaborn as sns
+import argparse
 import torch
 import torch.nn.functional as F
 import os
@@ -6,15 +6,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import csv
 import re
-
-# Define the paths for the float and quantized tensors
-float_root_folder = 'observed_tensor/float/backbone/'
-quant_root_folder = 'observed_tensor/quant/backbone/'
-output_folder = 'observed_tensor/comparison'  # Root folder for comparison results
-
-# Create output folder if doesn't exist
-os.makedirs(output_folder, exist_ok=True)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def extract_numeric_prefix(name):
     match = re.match(r'^(\d+)(?:_(.*))?$', name)
@@ -31,7 +22,7 @@ def sort_key_from_relative_path(relative_path):
 
 
 # Define a function to load tensor files recursively from subdirectories
-def load_tensor_files_recursively(folder_path):
+def load_tensor_files_recursively(folder_path, device):
     tensor_files = {}
     ordered_tensor_names = []
     tensor_paths = []
@@ -62,7 +53,7 @@ def load_tensor_files_recursively(folder_path):
     for _, relative_path, tensor_path in tensor_paths:
         tensor_name = relative_path.replace('.pt', '')
         ordered_tensor_names.append(tensor_name)
-        tensor_files[tensor_name] = torch.load(tensor_path).to(device)
+        tensor_files[tensor_name] = torch.load(tensor_path, map_location=device).to(device)
 
     return tensor_files, ordered_tensor_names
 
@@ -226,27 +217,100 @@ def process_and_save_results(tensors_float, tensors_quant, folder_path, output_c
     # Save the results to a CSV file
     save_results_to_csv(results, output_csv_path, ordered_tensor_names)
 
-components = ['vit', 'projector']
 
-for component in components:
-    float_folder = os.path.join(float_root_folder, component)
-    quant_folder = os.path.join(quant_root_folder, component)
+def filter_common_tensors(tensors_float, tensors_quant, float_tensor_order, quant_tensor_order, component):
+    common_names = set(tensors_float).intersection(tensors_quant)
+    only_float = [name for name in float_tensor_order if name not in common_names]
+    only_quant = [name for name in quant_tensor_order if name not in common_names]
+    ordered_common_names = [name for name in float_tensor_order if name in common_names]
 
-    float_tensors, float_tensor_order = load_tensor_files_recursively(float_folder)
-    quant_tensors, quant_tensor_order = load_tensor_files_recursively(quant_folder)
+    if only_float:
+        print(f"{component}: skipping {len(only_float)} float-only tensors.")
+    if only_quant:
+        print(f"{component}: skipping {len(only_quant)} quant-only tensors.")
+    if not ordered_common_names:
+        raise ValueError(f"No common float/quant tensors found for {component}.")
 
-    if float_tensor_order != quant_tensor_order:
-        raise ValueError(
-            f"Float and quant tensor orders do not match for {component}. "
-            "Please check observed_tensor folder contents."
+    return (
+        {name: tensors_float[name] for name in ordered_common_names},
+        {name: tensors_quant[name] for name in ordered_common_names},
+        ordered_common_names,
+    )
+
+
+def get_args_parser():
+    parser = argparse.ArgumentParser(
+        description="Generate tensor statistics and per-layer histogram comparisons."
+    )
+    parser.add_argument(
+        "--components",
+        nargs="+",
+        default=["vit", "projector"],
+        choices=("vit", "projector"),
+        help="Backbone components to compare.",
+    )
+    parser.add_argument("--observed-root", default="observed_tensor")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--skip-missing",
+        action="store_true",
+        help="Skip components whose float or quant tensor folder does not exist.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail if float and quant tensor names do not match exactly.",
+    )
+    return parser
+
+
+def main(args):
+    float_root_folder = os.path.join(args.observed_root, "float", "backbone")
+    quant_root_folder = os.path.join(args.observed_root, "quant", "backbone")
+    output_folder = os.path.join(args.observed_root, "comparison")
+    os.makedirs(output_folder, exist_ok=True)
+
+    for component in args.components:
+        float_folder = os.path.join(float_root_folder, component)
+        quant_folder = os.path.join(quant_root_folder, component)
+
+        if not os.path.isdir(float_folder) or not os.path.isdir(quant_folder):
+            message = (
+                f"Missing tensor folders for {component}: "
+                f"float={float_folder}, quant={quant_folder}"
+            )
+            if args.skip_missing:
+                print(f"Skipping {component}. {message}")
+                continue
+            raise FileNotFoundError(message)
+
+        float_tensors, float_tensor_order = load_tensor_files_recursively(float_folder, args.device)
+        quant_tensors, quant_tensor_order = load_tensor_files_recursively(quant_folder, args.device)
+
+        if args.strict and float_tensor_order != quant_tensor_order:
+            raise ValueError(
+                f"Float and quant tensor orders do not match for {component}. "
+                f"Please check {args.observed_root} folder contents."
+            )
+        if float_tensor_order != quant_tensor_order:
+            float_tensors, quant_tensors, float_tensor_order = filter_common_tensors(
+                float_tensors,
+                quant_tensors,
+                float_tensor_order,
+                quant_tensor_order,
+                component,
+            )
+
+        output_csv_path = os.path.join(args.observed_root, f"comparison_results_{component}.csv")
+
+        process_and_save_results(
+            float_tensors,
+            quant_tensors,
+            os.path.join(output_folder, f"backbone/{component}"),
+            output_csv_path,
+            float_tensor_order,
         )
 
-    output_csv_path = f'observed_tensor/comparison_results_{component}.csv'
 
-    process_and_save_results(
-        float_tensors,
-        quant_tensors,
-        os.path.join(output_folder, f'backbone/{component}'),
-        output_csv_path,
-        float_tensor_order,
-    )
+if __name__ == "__main__":
+    main(get_args_parser().parse_args())

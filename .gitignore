@@ -26,4 +26,4 @@ pretrain_weights/*
 output/
 data/
 experiments/
-observed_tensor/
+observation/

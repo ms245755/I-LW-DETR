@@ -209,7 +209,7 @@ class MultiScaleProjector(nn.Module):
                     # a hack to reduce the FLOPs and Params when the dimention of output feature is too large
                     if in_dim > 512:
                         layers = [
-                            ConvX(in_dim, in_dim // 2, kernel=1),
+                            ConvX(in_dim, in_dim // 2, kernel=1, observe_stat=observe_stat, block_name=block_name+"scale2/reduce/"),
                             nn.ConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
                         ]
                         out_dim = in_dim // 4
@@ -220,7 +220,7 @@ class MultiScaleProjector(nn.Module):
                     layers = []
                 elif scale == 0.5:
                     layers = [
-                        ConvX(in_dim, in_dim, 3, 2),
+                        ConvX(in_dim, in_dim, 3, 2, observe_stat=observe_stat, block_name=block_name+"scale0_5/downsample/"),
                         ]
                 elif scale == 0.25:
                     self.use_extra_pool = True
@@ -233,7 +233,7 @@ class MultiScaleProjector(nn.Module):
 
             in_dim = out_dim * len(in_channels)
             layers = [
-                C2f(in_dim, out_channels, num_blocks, block_name=block_name+"c2f/"),
+                C2f(in_dim, out_channels, num_blocks, block_name=block_name+"c2f/", observe_stat=observe_stat),
                 get_norm('LN', out_channels),
             ]
             layers = nn.Sequential(*layers)

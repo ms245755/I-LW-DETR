@@ -23,7 +23,7 @@ python demo/demo.py \
     --num_queries 100 \
     --weights $checkpoint \
     --input $image_path \
-    --output $output_dir/$model_name \
+    --output_dir $output_dir/$model_name \
     --observe_stat \
     --mode $mode \
     --confidence_threshold 0.5
