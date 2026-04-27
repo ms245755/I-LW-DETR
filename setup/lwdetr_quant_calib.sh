@@ -13,6 +13,7 @@ coco_path="${2:?Usage: bash setup/lwdetr_quant_calib.sh <tiny|small|medium> <coc
 checkpoint="${3:?Usage: bash setup/lwdetr_quant_calib.sh <tiny|small|medium> <coco_path> <checkpoint>}"
 
 backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
+quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
 encoder_quant_blocks="${ENCODER_QUANT_BLOCKS:-all}"
 encoder_quant_components="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
 projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu layernorm}"
@@ -20,6 +21,7 @@ act_observer="${ACT_OBSERVER:-percentile}"
 act_percentile="${ACT_PERCENTILE:-99}"
 
 read -r -a backbone_quant_component_args <<< "$backbone_quant_components"
+read -r -a quant_model_component_args <<< "$quant_model_components"
 component_suffix="$(printf '%s\n' "${backbone_quant_component_args[@]}" | paste -sd '_' -)"
 
 case "$model_size" in
@@ -73,6 +75,7 @@ python main.py \
     --vit_encoder_num_layers "$vit_encoder_num_layers" \
     --window_block_indexes "${window_block_args[@]}" \
     --out_feature_indexes "${out_feature_args[@]}" \
+    --quant_model_components "${quant_model_component_args[@]}" \
     --backbone_quant_components "${backbone_quant_component_args[@]}" \
     "${quant_block_args[@]}" \
     --encoder_quant_components "${encoder_quant_component_args[@]}" \

@@ -259,8 +259,21 @@ class fixedpoint_mul(Function):
 
         return grad_output, None, None, None, None, identity_grad, None
 
+def _stackable_scale(scale):
+    if not torch.is_tensor(scale):
+        return torch.tensor(scale)
+    if scale.numel() == 1:
+        return scale.reshape(())
+    return scale
+
+
+def _max_compatible_scale(scales):
+    scales = [_stackable_scale(scale) for scale in scales]
+    return torch.stack([scale.max() for scale in scales]).max()
+
+
 def concat_list_tensor_scale(tensor_list, dim = 0):
-    max_scale = torch.stack([scale for (_, scale) in tensor_list]).max()
+    max_scale = _max_compatible_scale([scale for (_, scale) in tensor_list])
 
     result = []
     for tmp, scale in tensor_list:
@@ -271,7 +284,7 @@ def concat_list_tensor_scale(tensor_list, dim = 0):
     return result, max_scale
 
 def add_tensor_scale(x, scale_x, y, scale_y):
-    max_scale = torch.stack([scale_x, scale_y]).max()
+    max_scale = _max_compatible_scale([scale_x, scale_y])
     x = round_ste.apply(x / max_scale)
     y = round_ste.apply(y / max_scale)
 

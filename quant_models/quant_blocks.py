@@ -751,11 +751,6 @@ class IMSDeformAttn(nn.Module):
         attn_weights, attn_scale = self.softmax(attn_weights, attn_scale)
         attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
 
-        # Quantize reference points before geometric ops so coordinate inputs
-        # are also tracked by the activation observer.
-        reference_points, reference_points_scale = self.qact_reference_points(reference_points, None)
-        
-
         # ── sampling locations (float op — not quantizable) ────────────
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
@@ -772,7 +767,8 @@ class IMSDeformAttn(nn.Module):
             raise ValueError(
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
             )
-        sampling_locations, sampling_locations_scale = self.qact_sampling_locs(sampling_locations, None)
+        # print(sampling_locations)
+        # sampling_locations, sampling_locations_scale = self.qact_sampling_locs(sampling_locations, None)
 
         # ── deformable attention core ──────────────────────────────────
         value_float = value.transpose(1, 2).contiguous().view(
@@ -783,7 +779,7 @@ class IMSDeformAttn(nn.Module):
             value_scale,
             input_spatial_shapes,
             sampling_locations,
-            sampling_locations_scale,
+            None,
             attn_weights,
             attn_scale,
             qact_sampled_values=self.qact_sampled_values,

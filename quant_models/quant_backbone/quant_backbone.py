@@ -40,6 +40,7 @@ class Backbone(BackboneBase):
                  projector_scale: list=None,
                  observe_stat = False,
                  block_name = "observed_tensor/quant/backbone/",
+                 quant_model_components=None,
                  backbone_quant_components=None,
                  encoder_quant_blocks=None,
                  encoder_quant_components=None,
@@ -48,8 +49,10 @@ class Backbone(BackboneBase):
         super().__init__()
         self.name = name
         self.backbone_quant_components = {"vit", "projector"} if backbone_quant_components is None else set(backbone_quant_components)
+        self.quant_model_components = {"backbone"} if quant_model_components is None else set(quant_model_components)
         self.quantize_vit = "vit" in self.backbone_quant_components
         self.quantize_projector = "projector" in self.backbone_quant_components
+        self.return_quant_scales = "transformer" in self.quant_model_components
         if 'vit' in name:
             if name == 'vit_tiny':
                 img_size, embed_dim, depth, num_heads, dp = 1024, 192, 12, 12, 0.
@@ -143,14 +146,20 @@ class Backbone(BackboneBase):
         feats = self.projector(feats)
         # x: [(B, C, H, W)]
         out = []
-        for feat in feats:
+        for item in feats:
+            if isinstance(item, tuple):
+                feat, scale = item
+            else:
+                feat, scale = item, None
             if isinstance(feat, tuple):
                 feat = feat[0]
             m = tensor_list.mask
             assert m is not None
             mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
-            # out.append(NestedTensor((feat, scale), mask))
-            out.append(NestedTensor(feat, mask))
+            if self.return_quant_scales:
+                out.append(NestedTensor((feat, scale), mask))
+            else:
+                out.append(NestedTensor(feat, mask))
         return out
 
     def forward_export(self, tensors:torch.Tensor):

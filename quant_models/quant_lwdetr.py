@@ -30,9 +30,11 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
 
 from .fake_quantized.layers import *
 from .quant_backbone import build_backbone
+from .quant_transformer import build_transformer as build_quant_transformer
+from .quant_transformer import ILinearBlock as TransformerILinearBlock, IMLP as TransformerIMLP
 from models.matcher import build_matcher
-from models.transformer import build_transformer
 from models.lwdetr import LWDETR
+from models.transformer import build_transformer as build_float_transformer
 
 class ILWDETR(nn.Module):
     """ This is the Group DETR v3 module that performs object detection """
@@ -61,8 +63,8 @@ class ILWDETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.class_embed = ILinearBlock(hidden_dim, num_classes, gelu=False)
-        self.bbox_embed = IMLP(hidden_dim, hidden_dim, 4, 3)
+        self.class_embed = TransformerILinearBlock(hidden_dim, num_classes, gelu=False)
+        self.bbox_embed = TransformerIMLP(hidden_dim, hidden_dim, 4, 3)
 
         query_dim=4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -70,6 +72,7 @@ class ILWDETR(nn.Module):
 
         self.qact_refpoint = IViTAct()
         self.qact_query_feat = IViTAct()
+        self.qact_hs_enc = IViTAct()
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
         self.backbone = backbone
@@ -88,11 +91,11 @@ class ILWDETR(nn.Module):
         # init prior_prob setting for focal loss
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+        self.class_embed.linear.bias.data = torch.ones(num_classes) * bias_value
 
         # init bbox_mebed
-        nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.bbox_embed.layers[-1].linear.weight.data, 0)
+        nn.init.constant_(self.bbox_embed.layers[-1].linear.bias.data, 0)
 
         # two_stage
         self.two_stage = two_stage
@@ -133,9 +136,9 @@ class ILWDETR(nn.Module):
 
         srcs = []
         masks = []
-        for l, (feat, scale) in enumerate(features):
+        for l, feat in enumerate(features):
             src, mask = feat.decompose()
-            srcs.append((src, scale))
+            srcs.append(src)
             masks.append(mask)
             assert mask is not None
 
@@ -147,31 +150,35 @@ class ILWDETR(nn.Module):
             refpoint_embed_weight, refpoint_scale = self.qact_refpoint(self.refpoint_embed.weight[:self.num_queries], None)
             query_feat_weight, query_scale = self.qact_query_feat(self.query_feat.weight[:self.num_queries], None)
 
-        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
+        hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self.transformer(
             srcs, masks, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
 
         if self.bbox_reparam:
-            outputs_coord_delta = self.bbox_embed(hs)
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
             outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
             outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
             outputs_coord = torch.concat(
                 [outputs_coord_cxcy, outputs_coord_wh], dim=-1
             )
         else:
-            outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
+            outputs_coord, _ = add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
+            outputs_coord = outputs_coord.sigmoid()
 
-        outputs_class = self.class_embed(hs)
+        outputs_class, _ = self.class_embed(hs, hs_scale)
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
         if self.two_stage:
+            if hs_enc_scale is None:
+                hs_enc, hs_enc_scale = self.qact_hs_enc(hs_enc, None)
             hs_enc_list = hs_enc.split(self.num_queries, dim=1)
             cls_enc = []
             group_detr = self.group_detr if self.training else 1
             for g_idx in range(group_detr):
-                cls_enc_gidx = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx])
+                cls_enc_gidx, _ = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx], hs_enc_scale)
                 cls_enc.append(cls_enc_gidx)
             cls_enc = torch.cat(cls_enc, dim=1)
             out['enc_outputs'] = {'pred_logits': cls_enc, 'pred_boxes': ref_enc}
@@ -180,22 +187,24 @@ class ILWDETR(nn.Module):
     def forward_export(self, tensors):
         srcs, _, poss = self.backbone(tensors)
         # only use one group in inference
-        refpoint_embed_weight = self.refpoint_embed.weight[:self.num_queries]
-        query_feat_weight = self.query_feat.weight[:self.num_queries]
+        refpoint_embed_weight, refpoint_scale = self.qact_refpoint(self.refpoint_embed.weight[:self.num_queries], None)
+        query_feat_weight, query_scale = self.qact_query_feat(self.query_feat.weight[:self.num_queries], None)
 
-        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
-            srcs, None, poss, refpoint_embed_weight, query_feat_weight)
+        hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self.transformer(
+            srcs, None, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
 
         if self.bbox_reparam:
-            outputs_coord_delta = self.bbox_embed(hs)
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
             outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
             outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
             outputs_coord = torch.concat(
                 [outputs_coord_cxcy, outputs_coord_wh], dim=-1
             )
         else:
-            outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
-        outputs_class = self.class_embed(hs)
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
+            outputs_coord, _ = add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
+            outputs_coord = outputs_coord.sigmoid()
+        outputs_class, _ = self.class_embed(hs, hs_scale)
         return outputs_coord, outputs_class
 
     @torch.jit.unused
@@ -573,7 +582,10 @@ class IMLP(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(ILinearBlock(n, k, x) for n, k, x in zip([input_dim] + h, h + [output_dim], [True] * len(input_dim) + False))
+        self.layers = nn.ModuleList(
+            ILinearBlock(n, k, x)
+            for n, k, x in zip([input_dim] + h, h + [output_dim], [True] * (num_layers - 1) + [False])
+        )
 
     def forward(self, x, act_scaling_factor = None):
         for layer in self.layers:
@@ -598,9 +610,13 @@ def build(args):
     backbone = build_backbone(args)
 
     args.num_feature_levels = len(args.projector_scale)
-    transformer = build_transformer(args)
+    quant_model_components = set(getattr(args, "quant_model_components", ["backbone"]) or [])
+    quantize_transformer = "transformer" in quant_model_components
+    transformer = build_quant_transformer(args) if quantize_transformer else build_float_transformer(args)
+    print(quant_model_components)
+    model_cls = ILWDETR if quantize_transformer else LWDETR
 
-    model = LWDETR(
+    model = model_cls(
         backbone,
         transformer,
         num_classes=num_classes,
@@ -614,7 +630,7 @@ def build(args):
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
-    # TODO this is a hack
+
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):

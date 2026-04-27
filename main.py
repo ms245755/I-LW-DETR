@@ -39,6 +39,61 @@ from util.utils import ModelEma, BestMetricHolder, clean_state_dict
 from util.benchmark import benchmark
 
 
+def adapt_checkpoint_keys_for_model(state_dict, model):
+    """Load float Linear/MLP weights into quant wrappers that store them under `.linear`."""
+    model_keys = set(model.state_dict().keys())
+    adapted = dict(state_dict)
+    for key, value in state_dict.items():
+        if key.endswith("self_attn.in_proj_weight"):
+            prefix = key[: -len("in_proj_weight")]
+            q, k, v = value.chunk(3, dim=0)
+            converted = False
+            for name, tensor in (("q_proj.weight", q), ("k_proj.weight", k), ("v_proj.weight", v)):
+                target_key = f"{prefix}{name}"
+                if target_key in model_keys and target_key not in adapted:
+                    adapted[target_key] = tensor
+                    converted = True
+            if converted and key not in model_keys:
+                adapted.pop(key, None)
+            continue
+        if key.endswith("self_attn.in_proj_bias"):
+            prefix = key[: -len("in_proj_bias")]
+            q, k, v = value.chunk(3, dim=0)
+            converted = False
+            for name, tensor in (("q_proj.bias", q), ("k_proj.bias", k), ("v_proj.bias", v)):
+                target_key = f"{prefix}{name}"
+                if target_key in model_keys and target_key not in adapted:
+                    adapted[target_key] = tensor
+                    converted = True
+            if converted and key not in model_keys:
+                adapted.pop(key, None)
+            continue
+        if not (key.endswith(".weight") or key.endswith(".bias")):
+            continue
+        prefix, suffix = key.rsplit(".", 1)
+        linear_key = f"{prefix}.linear.{suffix}"
+        if key not in model_keys and linear_key in model_keys and linear_key not in adapted:
+            adapted[linear_key] = value
+            adapted.pop(key, None)
+    return adapted
+
+
+def print_load_state(prefix, load_state):
+    if not utils.is_main_process():
+        return
+    missing = getattr(load_state, "missing_keys", [])
+    unexpected = getattr(load_state, "unexpected_keys", [])
+    missing_params = [k for k in missing if k.endswith(".weight") or k.endswith(".bias")]
+    print(f"{prefix}: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
+    print(f"{prefix}: missing trainable weight/bias keys={len(missing_params)}")
+    if missing_params:
+        print(f"{prefix}: first missing trainable keys: {missing_params[:20]}")
+    if missing:
+        print(f"{prefix}: first missing keys: {missing[:20]}")
+    if unexpected:
+        print(f"{prefix}: first unexpected keys: {unexpected[:20]}")
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
@@ -88,6 +143,9 @@ def get_args_parser():
                         choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--out_feature_indexes', default=[-1], type=int, nargs='+', help='only for vit now')
+    parser.add_argument('--quant_model_components', default=None, type=str, nargs='+',
+                        choices=('backbone', 'transformer'),
+                        help='Top-level model components to quantize when --calib/--qat is used.')
     parser.add_argument('--backbone_quant_components', default=['vit', 'projector'], type=str, nargs='+',
                         choices=('vit', 'projector'),
                         help='Backbone components to quantize when --calib/--qat is used.')
@@ -293,7 +351,9 @@ def main(args):
                     model_without_ddp.state_dict()[modify_key_to_load],
                     checkpoint['model'][modify_key_to_load]
                 )
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        checkpoint['model'] = adapt_checkpoint_keys_for_model(checkpoint['model'], model_without_ddp)
+        stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        print_load_state("pretrain load", stat)
         if args.use_ema:
             del ema_m
             ema_m = ModelEma(model_without_ddp)
@@ -309,9 +369,12 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        if args.backbone_quant_components is not None and 'projector' in set(args.backbone_quant_components):
+        if  args.backbone_quant_components is not None and 'projector' in set(args.backbone_quant_components):
             checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
+        checkpoint['model'] = adapt_checkpoint_keys_for_model(checkpoint['model'], model_without_ddp)
         stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        print_load_state("resume load", stat)
+        # return
 
         if args.use_ema:
             if 'ema_model' in checkpoint:

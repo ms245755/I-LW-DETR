@@ -20,7 +20,9 @@ class Joiner(nn.Sequential):
         x = self[0](tensor_list)
         pos = []
         for x_ in x:
-            pos.append(self[1](x_, align_dim_orders=False).to(x_.tensors[0].dtype))
+            tensors = x_.tensors[0] if isinstance(x_.tensors, tuple) else x_.tensors
+            pos_tensor_list = NestedTensor(tensors, x_.mask)
+            pos.append(self[1](pos_tensor_list, align_dim_orders=False).to(tensors.dtype))
         return x, pos
 
     def export(self):
@@ -59,6 +61,7 @@ def build_backbone(args):
             out_feature_indexes=args.out_feature_indexes,
             projector_scale=args.projector_scale,
             observe_stat=args.observe_stat,
+            quant_model_components=getattr(args, "quant_model_components", None),
             backbone_quant_components=getattr(args, "backbone_quant_components", None),
             encoder_quant_blocks=getattr(args, "encoder_quant_blocks", None),
             encoder_quant_components=getattr(args, "encoder_quant_components", None),
