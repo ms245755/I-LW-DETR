@@ -31,7 +31,8 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
 from .fake_quantized.layers import *
 from .quant_backbone import build_backbone
 from .quant_transformer import build_transformer as build_quant_transformer
-from .quant_transformer import ILinearBlock as TransformerILinearBlock, IMLP as TransformerIMLP
+from .quant_transformer import IMLP as TransformerIMLP
+from .quant_transformer import ScaleLinear, _add_tensor_scale, _component_set
 from models.matcher import build_matcher
 from models.lwdetr import LWDETR
 from models.transformer import build_transformer as build_float_transformer
@@ -47,7 +48,8 @@ class ILWDETR(nn.Module):
                  group_detr=1,
                  two_stage=False,
                  lite_refpoint_refine=False,
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 lwdetr_quant_components=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -60,11 +62,13 @@ class ILWDETR(nn.Module):
             lite_refpoint_refine: TODO
         """
         super().__init__()
+        self.quant_components = _component_set(lwdetr_quant_components)
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.class_embed = TransformerILinearBlock(hidden_dim, num_classes, gelu=False)
-        self.bbox_embed = TransformerIMLP(hidden_dim, hidden_dim, 4, 3)
+        linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
+        self.class_embed = linear_cls(hidden_dim, num_classes)
+        self.bbox_embed = TransformerIMLP(hidden_dim, hidden_dim, 4, 3, quant_components=self.quant_components)
 
         query_dim=4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -91,11 +95,11 @@ class ILWDETR(nn.Module):
         # init prior_prob setting for focal loss
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        self.class_embed.linear.bias.data = torch.ones(num_classes) * bias_value
+        self.class_embed.bias.data = torch.ones(num_classes) * bias_value
 
         # init bbox_mebed
-        nn.init.constant_(self.bbox_embed.layers[-1].linear.weight.data, 0)
-        nn.init.constant_(self.bbox_embed.layers[-1].linear.bias.data, 0)
+        nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
 
         # two_stage
         self.two_stage = two_stage
@@ -162,7 +166,7 @@ class ILWDETR(nn.Module):
             )
         else:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
-            outputs_coord, _ = add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
+            outputs_coord, _ = _add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
             outputs_coord = outputs_coord.sigmoid()
 
         outputs_class, _ = self.class_embed(hs, hs_scale)
@@ -202,7 +206,7 @@ class ILWDETR(nn.Module):
             )
         else:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
-            outputs_coord, _ = add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
+            outputs_coord, _ = _add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
             outputs_coord = outputs_coord.sigmoid()
         outputs_class, _ = self.class_embed(hs, hs_scale)
         return outputs_coord, outputs_class
@@ -557,42 +561,6 @@ class PostProcess(nn.Module):
         return results
 
 
-class ILinearBlock(nn.Module):
-    def __init__(self, input_dim, output_dim, gelu=True):
-        super().__init__()
-        self.linear = IViTLinear(input_dim, output_dim)
-        self.qact_post_linear = IViTAct()
-        self.gelu = gelu
-        if gelu:
-            self.gelu_layer = ISegGELU()
-            self.qact_post_gelu = IViTAct()
-    
-    def forward(self, x, act_scaling_factor = None):
-        x, act_scaling_factor = self.linear(x, act_scaling_factor)
-        x, act_scaling_factor = self.qact_post_linear(x, act_scaling_factor)
-        if self.gelu:
-            x, act_scaling_factor = self.gelu_layer(x, act_scaling_factor)
-            x, act_scaling_factor = self.qact_post_gelu(x, act_scaling_factor)
-        return x, act_scaling_factor
-
-class IMLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(
-            ILinearBlock(n, k, x)
-            for n, k, x in zip([input_dim] + h, h + [output_dim], [True] * (num_layers - 1) + [False])
-        )
-
-    def forward(self, x, act_scaling_factor = None):
-        for layer in self.layers:
-            x, act_scaling_factor = layer(x, act_scaling_factor)
-        return x, act_scaling_factor
-
-
 def build(args):
     # the `num_classes` naming here is somewhat misleading.
     # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
@@ -626,6 +594,7 @@ def build(args):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        lwdetr_quant_components=getattr(args, "lwdetr_quant_components", None),
     )
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}

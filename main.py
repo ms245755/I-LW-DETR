@@ -40,7 +40,7 @@ from util.benchmark import benchmark
 
 
 def adapt_checkpoint_keys_for_model(state_dict, model):
-    """Load float Linear/MLP weights into quant wrappers that store them under `.linear`."""
+    """Load float self-attention weights into quant q/k/v projections."""
     model_keys = set(model.state_dict().keys())
     adapted = dict(state_dict)
     for key, value in state_dict.items():
@@ -68,13 +68,6 @@ def adapt_checkpoint_keys_for_model(state_dict, model):
             if converted and key not in model_keys:
                 adapted.pop(key, None)
             continue
-        if not (key.endswith(".weight") or key.endswith(".bias")):
-            continue
-        prefix, suffix = key.rsplit(".", 1)
-        linear_key = f"{prefix}.linear.{suffix}"
-        if key not in model_keys and linear_key in model_keys and linear_key not in adapted:
-            adapted[linear_key] = value
-            adapted.pop(key, None)
     return adapted
 
 
@@ -161,8 +154,18 @@ def get_args_parser():
                         type=str, nargs='+',
                         choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm', 'silu'),
                         help='Operation families to quantize inside the projector. Only conv2d, gelu, and layernorm are used by the projector today.')
+    parser.add_argument('--transformer_quant_components',
+                        default=['linear', 'matmul', 'softmax', 'layernorm', 'deformable_attention'],
+                        type=str, nargs='+',
+                        choices=('linear', 'matmul', 'softmax', 'layernorm', 'deformable_attention', 'none'),
+                        help='Operation families to quantize inside the quantized transformer.')
+    parser.add_argument('--lwdetr_quant_components',
+                        default=['linear'],
+                        type=str, nargs='+',
+                        choices=('linear', 'none'),
+                        help='Operation families to quantize inside LW-DETR prediction heads.')
     parser.add_argument('--act_observer', default='ema_minmax', type=str,
-                        choices=('ema_minmax', 'percentile'),
+                        choices=('ema_minmax', 'percentile', 'mean'),
                         help='Activation observer used by IViTAct during calibration/QAT.')
     parser.add_argument('--act_percentile', default=99.9, type=float,
                         help='Percentile used when --act_observer percentile is selected.')
@@ -192,8 +195,10 @@ def get_args_parser():
                         help='the number of sampling points')
     parser.add_argument('--decoder_norm', default='LN', type=str)
     parser.add_argument('--bbox_reparam', action='store_true')
-    parser.add_argument('--easy_quantize', default='False', action='store_true',
+    parser.add_argument('--easy_quantize', default=False, action='store_true',
                         help='use quantization-friendly float components: learned ref pos encoding and nearest deformable sampling')
+    parser.add_argument('--decoder_cross_attn_float', default=False, action='store_true',
+                        help='keep quantized decoder deformable cross-attention in a float fallback path')
 
     # * Matcher
     parser.add_argument('--set_cost_class', default=2, type=float,
@@ -369,7 +374,7 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        if  args.backbone_quant_components is not None and 'projector' in set(args.backbone_quant_components):
+        if (args.qat or args.calib) and args.backbone_quant_components is not None and 'projector' in set(args.backbone_quant_components):
             checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
         checkpoint['model'] = adapt_checkpoint_keys_for_model(checkpoint['model'], model_without_ddp)
         stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
@@ -400,12 +405,12 @@ def main(args):
     
     if args.calib:
         # 1) calibrate using val set (or train set). val is usually fine.
-        num_calib_batch = 200
+        num_calib_batch = 50
         calib_loader = make_random_calib_loader(
             dataset_val,
-            batch_size=args.batch_size,
+            batch_size=1,
             seed=seed,                  # <--- fixed seed for reproducibility!
-            n_samples=num_calib_batch * args.batch_size,
+            n_samples=num_calib_batch * 1,
             collate_fn=utils.collate_fn,
             num_workers=0
         )

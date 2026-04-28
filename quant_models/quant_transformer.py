@@ -23,19 +23,92 @@ from torch import nn, Tensor
 from .quant_blocks import *
 from quant_models.fake_quantized.layers import *
 
-class ILinearBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, has_gelu=True, gelu=None):
+
+def _component_set(components):
+    if components is None:
+        return {"linear", "matmul", "softmax", "layernorm", "deformable_attention"}
+    return {component for component in components if component != "none"}
+
+
+def _scale_mul(scale, value):
+    return None if scale is None else scale * value
+
+
+def _add_tensor_scale(x, scale_x, y, scale_y):
+    if scale_x is None or scale_y is None:
+        return x + y, None
+    return add_tensor_scale(x, scale_x, y, scale_y)
+
+
+class ScaleLinear(nn.Linear):
+    def forward(self, x, act_scaling_factor=None):
+        return super().forward(x), None
+
+
+class ScaleLayerNorm(nn.LayerNorm):
+    def __init__(self, normalized_shape, eps=1e-6, elementwise_affine=True):
+        super().__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+
+    def forward(self, x, act_scaling_factor=None):
+        return super().forward(x), None
+
+
+class ScaleMatMul(nn.Module):
+    def forward(self, A, pre_act_scaling_factor_A, B, pre_act_scaling_factor_B):
+        return A @ B, None
+
+
+class ScaleSoftmax(nn.Module):
+    def __init__(self, dim=-1):
         super().__init__()
-        if gelu is not None:
-            has_gelu = gelu
-        self.linear = IViTLinear(in_dim, out_dim)
+        self.dim = dim
+
+    def forward(self, x, act_scaling_factor=None):
+        return F.softmax(x, dim=self.dim), None
+
+
+class ScaleMSDeformAttn(MSDeformAttn):
+    def __init__(self, *args, use_float_path=False, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(
+        self,
+        query,
+        reference_points,
+        input_flatten,
+        input_spatial_shapes,
+        input_level_start_index,
+        input_padding_mask=None,
+        query_scaling_factor=None,
+        input_scaling_factor=None,
+    ):
+        return super().forward(
+            query,
+            reference_points,
+            input_flatten,
+            input_spatial_shapes,
+            input_level_start_index,
+            input_padding_mask,
+        ), None
+
+
+class IMLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, bias_bit=32, quant_components=None):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.quant_components = _component_set(quant_components)
+        linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
+        self.layers = nn.ModuleList(
+            linear_cls(n, k, bias_bit=bias_bit) if linear_cls is IViTLinear else linear_cls(n, k)
+            for n, k in zip([input_dim] + h, h + [output_dim])
+        )
         self.qact_input_bridge = IViTAct()
-        self.qact_post_linear = IViTAct()
-        self.has_gelu = has_gelu
-        if has_gelu:
-            self.act = ISegGELU()
-            self.qact_post_gelu = IViTAct()
-    
+        self.qact_post_linears = nn.ModuleList(IViTAct() for _ in range(num_layers))
+        self.qact_post_relu = nn.ModuleList(IViTAct() for _ in range(num_layers - 1))
+
     def _qact_channel_last(self, qact, x, act_scaling_factor):
         if x.dim() != 4:
             return qact(x, act_scaling_factor)
@@ -45,28 +118,15 @@ class ILinearBlock(nn.Module):
         x, act_scaling_factor = qact(x, act_scaling_factor)
         return x.reshape(original_shape), act_scaling_factor
 
-    def forward(self, x, act_scaling_factor=None):
-        if act_scaling_factor is None or act_scaling_factor.numel() != 1:
-            x, act_scaling_factor = self._qact_channel_last(self.qact_input_bridge, x, None)
-        x, act_scaling_factor = self.linear(x, act_scaling_factor)
-        x, act_scaling_factor = self._qact_channel_last(self.qact_post_linear, x, act_scaling_factor)
-        if self.has_gelu:
-            x, act_scaling_factor = self.act(x, act_scaling_factor)
-            x, act_scaling_factor = self._qact_channel_last(self.qact_post_gelu, x, act_scaling_factor)
-        return x, act_scaling_factor
-
-class IMLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(ILinearBlock(n, k, h) for n, k, h in zip([input_dim] + h, h + [output_dim], [True] * (num_layers-1) + [False]))
-
     def forward(self, x, act_scaling_factor = None):
         for i, layer in enumerate(self.layers):
+            if i == 0 and (act_scaling_factor is None or act_scaling_factor.numel() != 1):
+                x, act_scaling_factor = self._qact_channel_last(self.qact_input_bridge, x, None)
             x, act_scaling_factor = layer(x, act_scaling_factor)
+            x, act_scaling_factor = self._qact_channel_last(self.qact_post_linears[i], x, act_scaling_factor)
+            if i < self.num_layers - 1:
+                x = F.relu(x)
+                x, act_scaling_factor = self._qact_channel_last(self.qact_post_relu[i], x, act_scaling_factor)
         return x, act_scaling_factor
 
 
@@ -171,19 +231,24 @@ class Transformer(nn.Module):
                  lite_refpoint_refine=False,
                  easy_quantize=False,
                  decoder_norm_type='LN',
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 decoder_cross_attn_float=False,
+                 transformer_quant_components=None):
         super().__init__()
         self.encoder = None
+        self.quant_components = _component_set(transformer_quant_components)
 
         decoder_layer = TransformerDecoderLayer(d_model, sa_nhead, ca_nhead, dim_feedforward,
                                                 dropout, activation, normalize_before, 
                                                 group_detr=group_detr,
                                                 num_feature_levels=num_feature_levels,
                                                 dec_n_points=dec_n_points,
-                                                skip_self_attn=False,)
+                                                decoder_cross_attn_float=decoder_cross_attn_float,
+                                                skip_self_attn=False,
+                                                quant_components=self.quant_components)
         assert decoder_norm_type in ['LN', 'Identity']
         norm = { 
-            "LN": lambda channels: IViTLayerNorm(channels),
+            "LN": lambda channels: IViTLayerNorm(channels) if "layernorm" in self.quant_components else ScaleLayerNorm(channels),
             "Identity": lambda channels: nn.Identity(),
         }
         decoder_norm = norm[decoder_norm_type](d_model)
@@ -193,14 +258,17 @@ class Transformer(nn.Module):
                                           d_model=d_model,
                                           lite_refpoint_refine=lite_refpoint_refine,
                                           easy_quantize=easy_quantize,
-                                          bbox_reparam=bbox_reparam)
+                                          bbox_reparam=bbox_reparam,
+                                          quant_components=self.quant_components)
         
         self.int_exp = IViTExp()
         self.qact_output_proposal = IViTAct()
         self.two_stage = two_stage
         if two_stage:
-            self.enc_output = nn.ModuleList([IViTLinear(d_model, d_model) for _ in range(group_detr)])
-            self.enc_output_norm = nn.ModuleList([IViTLayerNorm(d_model) for _ in range(group_detr)])
+            linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
+            norm_cls = IViTLayerNorm if "layernorm" in self.quant_components else ScaleLayerNorm
+            self.enc_output = nn.ModuleList([linear_cls(d_model, d_model) for _ in range(group_detr)])
+            self.enc_output_norm = nn.ModuleList([norm_cls(d_model) for _ in range(group_detr)])
             self.qact_post_linear_output = nn.ModuleList([IViTAct() for _ in range(group_detr)])
             self.qact_post_norm_output = nn.ModuleList([IViTAct() for _ in range(group_detr)])
 
@@ -297,7 +365,7 @@ class Transformer(nn.Module):
 
                 else:
                     tmp, tmp_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
-                    enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = add_tensor_scale(tmp, tmp_scale, output_proposals, output_proposals_scale)
+                    enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = _add_tensor_scale(tmp, tmp_scale, output_proposals, output_proposals_scale)
 
                 topk = self.num_queries
                 # Return the index of top k, not the value
@@ -330,13 +398,13 @@ class Transformer(nn.Module):
             if self.bbox_reparam:
                 # Cong: dont use this function
                 tmp, tmp_scale = multiply_tensor_scale(refpoint_embed[..., :2], refpoint_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
-                refpoint_embed_cxcy, refpoint_embed_cxcy_scale = add_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., :2], refpoint_embed_ts_scale)
+                refpoint_embed_cxcy, refpoint_embed_cxcy_scale = _add_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., :2], refpoint_embed_ts_scale)
 
                 tmp, tmp_scale = self.int_exp(refpoint_embed[..., 2:], refpoint_scale)
                 refpoint_embed_wh, refpoint_embed_wh_scale = multiply_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
                 refpoint_embed, refpoint_scale = concat_list_tensor_scale([(refpoint_embed_cxcy, refpoint_embed_cxcy_scale), (refpoint_embed_wh, refpoint_embed_wh_scale)], dim=-1)
             else:
-                refpoint_embed, refpoint_scale = add_tensor_scale(refpoint_embed, refpoint_scale, refpoint_embed_ts, refpoint_embed_ts_scale)
+                refpoint_embed, refpoint_scale = _add_tensor_scale(refpoint_embed, refpoint_scale, refpoint_embed_ts, refpoint_embed_ts_scale)
 
         hs, hs_scale, references, references_scale = self.decoder(tgt, query_scale, memory, memory_scale, memory_key_padding_mask=mask_flatten,
                           pos=None, refpoints_unsigmoid=refpoint_embed, refpoint_scale=refpoint_scale,
@@ -361,8 +429,10 @@ class TransformerDecoder(nn.Module):
                  d_model=256,
                  lite_refpoint_refine=False,
                  easy_quantize=False,
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 quant_components=None):
         super().__init__()
+        self.quant_components = _component_set(quant_components)
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.d_model = d_model
@@ -374,9 +444,10 @@ class TransformerDecoder(nn.Module):
 
         # Keep the original ref_point_head width so pretrained weights remain reusable,
         # and learn a quantization-friendly coordinate expansion in front of it.
-        self.ref_point_head = IMLP(2 * d_model, d_model, d_model, 2)
-        self.ref_point_coord_proj = IMLP(4, d_model, 2 * d_model, 2) if easy_quantize else None
+        self.ref_point_head = IMLP(2 * d_model, d_model, d_model, 2, quant_components=self.quant_components)
+        self.ref_point_coord_proj = IMLP(4, d_model, 2 * d_model, 2, quant_components=self.quant_components) if easy_quantize else None
         self.qact_sine_embed = IViTAct()
+        self.qact_norm_input = IViTAct()
         self._export = False
     
     def export(self):
@@ -385,7 +456,9 @@ class TransformerDecoder(nn.Module):
     def _apply_norm(self, x, scale):
         if self.norm is None:
             return x, scale
-        if isinstance(self.norm, IViTLayerNorm):
+        if isinstance(self.norm, IViTLayerNorm) and scale is None:
+            x, scale = self.qact_norm_input(x, None)
+        if isinstance(self.norm, (IViTLayerNorm, ScaleLayerNorm)):
             return self.norm(x, scale)
         return self.norm(x), scale
 
@@ -397,7 +470,7 @@ class TransformerDecoder(nn.Module):
                 refpoints_unsigmoid[..., 2:],
                 refpoints_scale,
             )
-            new_refpoints_cxcy, new_refpoints_cxcy_scale = add_tensor_scale(
+            new_refpoints_cxcy, new_refpoints_cxcy_scale = _add_tensor_scale(
                 tmp,
                 tmp_scale,
                 refpoints_unsigmoid[..., :2],
@@ -410,7 +483,7 @@ class TransformerDecoder(nn.Module):
                 dim=-1,
             )
         else:
-            new_refpoints_unsigmoid, new_refpoints_scale = add_tensor_scale(
+            new_refpoints_unsigmoid, new_refpoints_scale = _add_tensor_scale(
                 refpoints_unsigmoid,
                 refpoints_scale,
                 new_refpoints_delta,
@@ -553,30 +626,40 @@ class TransformerDecoder(nn.Module):
 
 class QuantDecoderSelfAttention(nn.Module):
 
-    def __init__(self, d_model, nhead):
+    def __init__(self, d_model, nhead, quant_components=None):
         super().__init__()
+        self.quant_components = _component_set(quant_components)
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = IViTLinear(d_model, d_model)
-        self.k_proj = IViTLinear(d_model, d_model)
-        self.v_proj = IViTLinear(d_model, d_model)
-        self.out_proj = IViTLinear(d_model, d_model)
+        linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
+        self.q_proj = linear_cls(d_model, d_model)
+        self.k_proj = linear_cls(d_model, d_model)
+        self.v_proj = linear_cls(d_model, d_model)
+        self.out_proj = linear_cls(d_model, d_model)
 
+        self.qact_qk_input = IViTAct()
+        self.qact_v_input = IViTAct()
         self.qact_q = IViTAct()
         self.qact_k = IViTAct()
         self.qact_v = IViTAct()
         self.qact_attn = IViTAct()
+        self.qact_softmax_out = IViTAct()
         self.qact_out = IViTAct()
         self.qact_proj_drop = IViTAct()
-        self.matmul = IViTMatMul()
-        self.softmax = IViTSoftmax(output_bit=16, dim=-1)
+        self.matmul = IViTMatMul() if "matmul" in self.quant_components else ScaleMatMul()
+        self.softmax = IViTSoftmax(output_bit=16, dim=-1) if "softmax" in self.quant_components else ScaleSoftmax(dim=-1)
 
     def forward(self, tgt, tgt_scale, query_pos, query_pos_scale):
-        qk_input, qk_scale = add_tensor_scale(tgt, tgt_scale, query_pos, query_pos_scale)
+        qk_input, qk_scale = _add_tensor_scale(tgt, tgt_scale, query_pos, query_pos_scale)
         v_input, v_scale = tgt, tgt_scale
+
+        if isinstance(self.q_proj, IViTLinear) and qk_scale is None:
+            qk_input, qk_scale = self.qact_qk_input(qk_input, None)
+        if isinstance(self.v_proj, IViTLinear) and v_scale is None:
+            v_input, v_scale = self.qact_v_input(v_input, None)
 
         q, q_scale = self.q_proj(qk_input, qk_scale)
         q, q_scale = self.qact_q(q, q_scale)
@@ -592,9 +675,11 @@ class QuantDecoderSelfAttention(nn.Module):
 
         attn, attn_scale = self.matmul(q, q_scale, k.transpose(-2, -1), k_scale)
         attn = attn * self.scale
-        attn_scale = attn_scale * self.scale
+        attn_scale = _scale_mul(attn_scale, self.scale)
         attn, attn_scale = self.qact_attn(attn, attn_scale)
         attn, attn_scale = self.softmax(attn, attn_scale)
+        if isinstance(self.matmul, IViTMatMul) and attn_scale is None:
+            attn, attn_scale = self.qact_softmax_out(attn, None)
 
         out, out_scale = self.matmul(attn, attn_scale, v, v_scale)
         out = out.transpose(1, 2).reshape(bs, num_queries, self.d_model)
@@ -608,35 +693,46 @@ class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, sa_nhead, ca_nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False, group_detr=1, 
-                 num_feature_levels=4, dec_n_points=4, 
-                 skip_self_attn=False):
+                 num_feature_levels=4, dec_n_points=4,
+                 decoder_cross_attn_float=False,
+                 skip_self_attn=False,
+                 quant_components=None):
         super().__init__()
+        self.quant_components = _component_set(quant_components)
+        linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
+        norm_cls = IViTLayerNorm if "layernorm" in self.quant_components else ScaleLayerNorm
         # Decoder Self-Attention
-        self.self_attn = QuantDecoderSelfAttention(d_model, sa_nhead)
+        self.self_attn = QuantDecoderSelfAttention(d_model, sa_nhead, quant_components=self.quant_components)
         self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = IViTLayerNorm(d_model)
+        self.norm1 = norm_cls(d_model)
 
         # Decoder Cross-Attention
-        self.cross_attn = IMSDeformAttn(
-            d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points)
+        cross_attn_cls = IMSDeformAttn if "deformable_attention" in self.quant_components else ScaleMSDeformAttn
+        self.cross_attn = cross_attn_cls(
+            d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points,
+            use_float_path=decoder_cross_attn_float)
 
         self.nhead = ca_nhead
 
         # Implementation of Feedforward model
-        self.linear1 = IViTLinear(d_model, dim_feedforward)
+        self.linear1 = linear_cls(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = IViTLinear(dim_feedforward, d_model)
+        self.linear2 = linear_cls(dim_feedforward, d_model)
 
-        self.norm2 = IViTLayerNorm(d_model)
-        self.norm3 = IViTLayerNorm(d_model)
+        self.norm2 = norm_cls(d_model)
+        self.norm3 = norm_cls(d_model)
         
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
 
-        self.activation = ISegGELU()
+        self.activation = F.relu
         self.normalize_before = normalize_before
         self.group_detr = group_detr
+        self.qact_norm1_input = IViTAct()
+        self.qact_norm2_input = IViTAct()
+        self.qact_norm3_input = IViTAct()
         self.qact_ffn_1 = IViTAct()
+        self.qact_ffn_relu = IViTAct()
         self.qact_ffn_2 = IViTAct()
         self.qact_self_attn_block = IViTAct()
         self.qact_cross_attn_block = IViTAct()
@@ -645,6 +741,13 @@ class TransformerDecoderLayer(nn.Module):
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
+
+    def _apply_norm(self, norm, qact, x, scale):
+        if isinstance(norm, IViTLayerNorm) and scale is None:
+            x, scale = qact(x, None)
+        if isinstance(norm, (IViTLayerNorm, ScaleLayerNorm)):
+            return norm(x, scale)
+        return norm(x), scale
 
     def forward_post(self, tgt, query_scale, memory, memory_scale,
                      tgt_mask: Optional[Tensor] = None,
@@ -679,12 +782,12 @@ class TransformerDecoderLayer(nn.Module):
             tgt2 = torch.cat(tgt2.split(bs, dim=0), dim=1)
         # ========== End of Self-Attention =============
 
-        tgt, query_scale = add_tensor_scale(tgt, query_scale, self.dropout1(tgt2), tgt2_scale)
-        tgt, query_scale = self.norm1(tgt, query_scale)
+        tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout1(tgt2), tgt2_scale)
+        tgt, query_scale = self._apply_norm(self.norm1, self.qact_norm1_input, tgt, query_scale)
         tgt, query_scale = self.qact_self_attn_block(tgt, query_scale)
 
         # ========== Begin of Cross-Attention =============
-        query_with_pos, query_with_pos_scale = add_tensor_scale(tgt, query_scale, query_pos, query_pos_scale)
+        query_with_pos, query_with_pos_scale = _add_tensor_scale(tgt, query_scale, query_pos, query_pos_scale)
         tgt2, tgt2_scale = self.cross_attn(
             query_with_pos,
             reference_points,
@@ -697,16 +800,17 @@ class TransformerDecoderLayer(nn.Module):
         )
         # ========== End of Cross-Attention =============
 
-        tgt, query_scale = add_tensor_scale(tgt, query_scale, self.dropout2(tgt2), tgt2_scale)
-        tgt, query_scale = self.norm2(tgt, query_scale)
+        tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout2(tgt2), tgt2_scale)
+        tgt, query_scale = self._apply_norm(self.norm2, self.qact_norm2_input, tgt, query_scale)
         tgt, query_scale = self.qact_cross_attn_block(tgt, query_scale)
         tgt2, tgt2_scale = self.linear1(tgt, query_scale)
         tgt2, tgt2_scale = self.qact_ffn_1(tgt2, tgt2_scale)
-        tgt2, tgt2_scale = self.activation(tgt2, tgt2_scale)
+        tgt2 = self.activation(tgt2)
+        tgt2, tgt2_scale = self.qact_ffn_relu(tgt2, tgt2_scale)
         tgt2, tgt2_scale = self.linear2(tgt2, tgt2_scale)
         tgt2, tgt2_scale = self.qact_ffn_2(tgt2, tgt2_scale)
-        tgt, query_scale = add_tensor_scale(tgt, query_scale, self.dropout3(tgt2), tgt2_scale)
-        tgt, query_scale = self.norm3(tgt, query_scale)
+        tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout3(tgt2), tgt2_scale)
+        tgt, query_scale = self._apply_norm(self.norm3, self.qact_norm3_input, tgt, query_scale)
         tgt, query_scale = self.qact_ffn_block(tgt, query_scale)
         return tgt, query_scale
 
@@ -757,4 +861,6 @@ def build_transformer(args):
         easy_quantize=args.easy_quantize,
         decoder_norm_type=args.decoder_norm,
         bbox_reparam=args.bbox_reparam,
+        decoder_cross_attn_float=getattr(args, "decoder_cross_attn_float", False),
+        transformer_quant_components=getattr(args, "transformer_quant_components", None),
     )

@@ -53,7 +53,7 @@ COCO_CLASSES = [
 
 
 def adapt_checkpoint_keys_for_model(state_dict, model):
-    """Load float Linear/MLP weights into quant wrappers that store them under `.linear`."""
+    """Load float self-attention weights into quant q/k/v projections."""
     model_keys = set(model.state_dict().keys())
     adapted = dict(state_dict)
     for key, value in state_dict.items():
@@ -81,13 +81,6 @@ def adapt_checkpoint_keys_for_model(state_dict, model):
             if converted and key not in model_keys:
                 adapted.pop(key, None)
             continue
-        if not (key.endswith(".weight") or key.endswith(".bias")):
-            continue
-        prefix, suffix = key.rsplit(".", 1)
-        linear_key = f"{prefix}.linear.{suffix}"
-        if key not in model_keys and linear_key in model_keys and linear_key not in adapted:
-            adapted[linear_key] = value
-            adapted.pop(key, None)
     return adapted
 
 def get_args_parser():
@@ -128,8 +121,18 @@ def get_args_parser():
                         type=str, nargs='+',
                         choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm', 'silu'),
                         help='Operation families to quantize inside the projector.')
+    parser.add_argument('--transformer_quant_components',
+                        default=['linear', 'matmul', 'softmax', 'layernorm', 'deformable_attention'],
+                        type=str, nargs='+',
+                        choices=('linear', 'matmul', 'softmax', 'layernorm', 'deformable_attention', 'none'),
+                        help='Operation families to quantize inside the quantized transformer.')
+    parser.add_argument('--lwdetr_quant_components',
+                        default=['linear'],
+                        type=str, nargs='+',
+                        choices=('linear', 'none'),
+                        help='Operation families to quantize inside LW-DETR prediction heads.')
     parser.add_argument('--act_observer', default='ema_minmax', type=str,
-                        choices=('ema_minmax', 'percentile'),
+                        choices=('ema_minmax', 'percentile', 'mean'),
                         help='Activation observer used by IViTAct.')
     parser.add_argument('--act_percentile', default=99.9, type=float,
                         help='Percentile used when --act_observer percentile is selected.')
