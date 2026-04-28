@@ -22,5 +22,6 @@ python main.py \
     --dataset_file coco \
     --coco_path $coco_path \
     --square_resize_div_64 \
+    --act_observer mean \
     --calib --resume $checkpoint \
     --output_dir output/$model_name

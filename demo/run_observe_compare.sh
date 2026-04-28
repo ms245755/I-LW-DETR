@@ -143,7 +143,7 @@ python demo/demo.py \
   "${quant_block_args[@]}" \
   --encoder_quant_components "${encoder_quant_component_args[@]}" \
   --projector_quant_components "${projector_quant_component_args[@]}" \
-  --act_observer "${ACT_OBSERVER:-percentile}" \
+  --act_observer "${ACT_OBSERVER:-mean}" \
   --act_percentile "${ACT_PERCENTILE:-99}"
 
 echo "[3/4] Generating tensor statistics..."
