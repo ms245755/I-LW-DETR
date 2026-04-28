@@ -95,7 +95,7 @@ class IViTLinear(nn.Linear):
 
         bias_scaling_factor = self.fc_scaling_factor * act_scaling_factor
 
-        if self.bias is not None:
+        if self.bias is not None and self.quantize_bias:
             self.bias_integer = self.weight_function(
                 self.bias, self.bias_bit, bias_scaling_factor, True
             )
@@ -109,6 +109,8 @@ class IViTLinear(nn.Linear):
         x_out = round_ste.apply(x_out)
 
         x_out *= bias_scaling_factor
+        if self.bias is not None and not self.quantize_bias:
+            x_out += self.bias
 
         return x_out, bias_scaling_factor
 
@@ -133,6 +135,9 @@ class IViTAct(nn.Module):
         Specify the channel length when using the per_channel mode.
     quant_mode : 'none' or 'asymmetric', default 'none'
         The mode for quantization. 'none' for no quantization.
+    observer_mode : 'ema_minmax', 'percentile', or 'mean', default 'ema_minmax'
+        Activation range observer used while running statistics are enabled.
+        'mean' uses min/max observations with equal-weight averaging across batches.
     """
 
     _default_observer_mode = "ema_minmax"
@@ -169,6 +174,7 @@ class IViTAct(nn.Module):
         self.register_buffer("out_scaling_factor", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("min_val", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("max_val", nn.Parameter(torch.tensor(1.0)))
+        self.register_buffer("n_batches", torch.tensor(0, dtype=torch.long))
 
         self.quant_mode = quant_mode
         self.per_channel = per_channel
@@ -230,14 +236,20 @@ class IViTAct(nn.Module):
                     v_float = v.float()
                     cur_min = torch.quantile(v_float, lower_q, dim=1).to(v.dtype)
                     cur_max = torch.quantile(v_float, upper_q, dim=1).to(v.dtype)
-                elif self.observer_mode == "ema_minmax":
+                elif self.observer_mode in ("ema_minmax", "mean"):
                     cur_min = v.min(dim=1).values
                     cur_max = v.max(dim=1).values
                 else:
                     raise ValueError("unknown observer_mode: {}".format(self.observer_mode))
-                if torch.eq(self.min_val, self.max_val).all():
+                cur_min = cur_min.min()
+                cur_max = cur_max.max()
+                if self.n_batches.item() == 0:
                     self.min_val = cur_min
                     self.max_val = cur_max
+                elif self.observer_mode == "mean":
+                    batch_count = self.n_batches.to(dtype=cur_min.dtype, device=cur_min.device) + 1
+                    self.min_val = self.min_val + (cur_min - self.min_val) / batch_count
+                    self.max_val = self.max_val + (cur_max - self.max_val) / batch_count
                 else:
                     self.min_val = self.min_val * self.act_range_momentum + cur_min * (
                         1 - self.act_range_momentum
@@ -245,8 +257,7 @@ class IViTAct(nn.Module):
                     self.max_val = self.max_val * self.act_range_momentum + cur_max * (
                         1 - self.act_range_momentum
                     )
-                self.max_val = self.max_val.max()
-                self.min_val = self.min_val.min()
+                self.n_batches += 1
 
             self.act_scaling_factor = symmetric_linear_quantization_params(
                 self.activation_bit, self.min_val, self.max_val
@@ -736,7 +747,7 @@ class IViTExp(nn.Module):
       y_scaling_factor: scale Sy such that y_real ≈ y_int * Sy
     """
 
-    def __init__(self, output_bit=16, n=23, clamp_min_real=-10.0, clamp_max_real=10.0):
+    def __init__(self, output_bit=None, n=23, clamp_min_real=-10.0, clamp_max_real=10.0):
         super().__init__()
         self.output_bit = output_bit
         self.n = n
@@ -1017,6 +1028,19 @@ class IViTSoftmax(nn.Module):
         return exp_int
 
     def forward(self, x, act_scaling_factor):
+        if torch.is_tensor(act_scaling_factor) and act_scaling_factor.numel() > 1:
+            scale = act_scaling_factor.reshape(-1)
+            if scale.numel() == x.shape[-1]:
+                scale = scale.reshape(*([1] * (x.dim() - 1)), x.shape[-1])
+                x = round_ste.apply(x / scale) * scale
+                act_scaling_factor = scale.max()
+            elif x.dim() >= 2 and scale.numel() == x.shape[-2] * x.shape[-1]:
+                scale = scale.reshape(*([1] * (x.dim() - 2)), x.shape[-2], x.shape[-1])
+                x = round_ste.apply(x / scale) * scale
+                act_scaling_factor = scale.max(dim=-1, keepdim=True).values
+            else:
+                act_scaling_factor = scale.max()
+
         x_int = round_ste.apply(x / act_scaling_factor)
         x_int_max, _ = x_int.max(dim=-1, keepdim=True)
         x_int = x_int - x_int_max

@@ -644,7 +644,7 @@ class MSDeformAttn(nn.Module):
 class IMSDeformAttn(nn.Module):
     """Quantized Multi-Scale Deformable Attention Module"""
 
-    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
+    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, use_float_path=False):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads, but got {} and {}".format(d_model, n_heads))
@@ -661,6 +661,7 @@ class IMSDeformAttn(nn.Module):
         self.n_levels = n_levels
         self.n_heads  = n_heads
         self.n_points = n_points
+        self.use_float_path = use_float_path
 
         # ── quantized linear layers ────────────────────────────────────
         self.sampling_offsets  = IViTLinear(d_model, n_heads * n_levels * n_points * 2)
@@ -722,6 +723,40 @@ class IMSDeformAttn(nn.Module):
         N, Len_in, _ = input_flatten.shape
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
 
+        if self.use_float_path:
+            value = F.linear(input_flatten, self.value_proj.weight, self.value_proj.bias)
+            if input_padding_mask is not None:
+                value = value.masked_fill(input_padding_mask[..., None], 0)
+
+            sampling_offsets = F.linear(query, self.sampling_offsets.weight, self.sampling_offsets.bias)
+            sampling_offsets = sampling_offsets.view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+            attn_weights = F.linear(query, self.attention_weights.weight, self.attention_weights.bias)
+            attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+            attn_weights = F.softmax(attn_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+
+            if reference_points.shape[-1] == 2:
+                offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+                sampling_locations = (
+                    reference_points[:, :, None, :, None, :]
+                    + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+                )
+            elif reference_points.shape[-1] == 4:
+                sampling_locations = (
+                    reference_points[:, :, None, :, None, :2]
+                    + sampling_offsets / self.n_points * reference_points[:, :, None, :, None, 2:] * 0.5
+                )
+            else:
+                raise ValueError(
+                    "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
+                )
+
+            value = value.transpose(1, 2).contiguous().view(
+                N, self.n_heads, self.d_model // self.n_heads, Len_in
+            )
+            output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attn_weights)
+            output = F.linear(output, self.output_proj.weight, self.output_proj.bias)
+            return self.qact_output(output, None)
+
         if query_scaling_factor is None:
             query_int, query_scale = self.qact_query(query)
         else:
@@ -748,8 +783,13 @@ class IMSDeformAttn(nn.Module):
 
         # ── attention weights ──────────────────────────────────────────
         attn_weights, attn_scale = self.attention_weights(query_int, query_scale)
+        attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        attn_scale = attn_scale.view(self.n_heads, self.n_levels * self.n_points)
         attn_weights, attn_scale = self.softmax(attn_weights, attn_scale)
+        attn_weights = attn_weights.transpose(1, 2).reshape(N * self.n_heads, Len_q, self.n_levels * self.n_points)
         attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
+        attn_weights = attn_weights.reshape(N, self.n_heads, Len_q, self.n_levels * self.n_points).transpose(1, 2)
+        attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
 
         # ── sampling locations (float op — not quantizable) ────────────
         if reference_points.shape[-1] == 2:
@@ -832,7 +872,9 @@ def quant_grid_sample_nearest(value, value_scale, sampling_grid):
     B, C, H, W = value.shape
 
     if torch.is_tensor(value_scale) and value_scale.numel() > 1:
-        scale = value_scale.view(1, C, 1, 1)
+        scale = value_scale.reshape(1, C, 1, 1)
+    elif torch.is_tensor(value_scale):
+        scale = value_scale.to(device=value.device, dtype=value.dtype).reshape(1, 1, 1, 1)
     else:
         scale = value.new_tensor(value_scale).view(1, 1, 1, 1)
 
@@ -853,9 +895,9 @@ def quant_grid_sample_nearest(value, value_scale, sampling_grid):
     x_idx = x_idx.clamp(0, W - 1).long()
     y_idx = y_idx.clamp(0, H - 1).long()
 
-    linear_idx = (y_idx * W + x_idx).view(B, 1, -1).expand(-1, C, -1)
-    value_flat = value_int.view(B, C, H * W)
-    sampled_int = torch.gather(value_flat, dim=2, index=linear_idx).view(B, C, sampling_grid.shape[1], sampling_grid.shape[2])
+    linear_idx = (y_idx * W + x_idx).reshape(B, 1, -1).expand(-1, C, -1)
+    value_flat = value_int.reshape(B, C, H * W)
+    sampled_int = torch.gather(value_flat, dim=2, index=linear_idx).reshape(B, C, sampling_grid.shape[1], sampling_grid.shape[2])
     sampled_int = sampled_int * valid.unsqueeze(1).to(sampled_int.dtype)
 
     return sampled_int * scale
