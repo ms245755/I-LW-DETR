@@ -6,17 +6,25 @@ set -euo pipefail
 #   BACKBONE_QUANT_COMPONENTS="vit" ENCODER_QUANT_BLOCKS="0 3 5" \
 #     ENCODER_QUANT_COMPONENTS="linear softmax layernorm gelu" \
 #     PROJECTOR_QUANT_COMPONENTS="conv2d layernorm" \
+#     TRANSFORMER_QUANT_COMPONENTS="linear matmul softmax layernorm deformable_attention" \
+#     LWDETR_QUANT_COMPONENTS="linear" \
 #     bash setup/lwdetr_quant_qat.sh small /path/to/coco /path/to/checkpoint.pth
 
-model_size="${1:-tiny}"
-coco_path="${2:?Usage: bash setup/lwdetr_quant_qat.sh <tiny|small|medium> <coco_path> <checkpoint>}"
-checkpoint="${3:?Usage: bash setup/lwdetr_quant_qat.sh <tiny|small|medium> <coco_path> <checkpoint>}"
+# model_size="${1:-tiny}"
+# coco_path="${2:?Usage: bash setup/lwdetr_quant_qat.sh <tiny|small|medium> <coco_path> <checkpoint>}"
+# checkpoint="${3:?Usage: bash setup/lwdetr_quant_qat.sh <tiny|small|medium> <coco_path> <checkpoint>}"
+
+model_size='tiny'
+coco_path='../../../../../data/dataset/coco'
+checkpoint='pretrain_weights/LWDETR_tiny_60e_coco.pth'
 
 backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
 quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
 encoder_quant_blocks="${ENCODER_QUANT_BLOCKS:-all}"
 encoder_quant_components="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
 projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu layernorm}"
+transformer_quant_components="${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
+lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-linear}"
 act_observer="${ACT_OBSERVER:-ema_minmax}"
 act_percentile="${ACT_PERCENTILE:-99.9}"
 
@@ -62,9 +70,9 @@ case "$model_size" in
     vit_encoder_num_layers=6
     window_block_indexes="0 2 4"
     out_feature_indexes="1 3 5"
-    batch_size="${BATCH_SIZE:-1}"
-    epochs="${EPOCHS:-2}"
-    lr_drop="${LR_DROP:-60}"
+    batch_size="${BATCH_SIZE:-4}"
+    epochs="${EPOCHS:-30}"
+    lr_drop="${LR_DROP:-25}"
     lr_vit_layer_decay="${LR_VIT_LAYER_DECAY:-0.8}"
     lr_component_decay="${LR_COMPONENT_DECAY:-0.7}"
     num_queries=100
@@ -125,6 +133,8 @@ fi
 
 read -r -a encoder_quant_component_args <<< "$encoder_quant_components"
 read -r -a projector_quant_component_args <<< "$projector_quant_components"
+read -r -a transformer_quant_component_args <<< "$transformer_quant_components"
+read -r -a lwdetr_quant_component_args <<< "$lwdetr_quant_components"
 read -r -a window_block_args <<< "$window_block_indexes"
 read -r -a out_feature_args <<< "$out_feature_indexes"
 
@@ -149,6 +159,8 @@ python -u -m torch.distributed.launch \
     "${quant_block_args[@]}" \
     --encoder_quant_components "${encoder_quant_component_args[@]}" \
     --projector_quant_components "${projector_quant_component_args[@]}" \
+    --transformer_quant_components "${transformer_quant_component_args[@]}" \
+    --lwdetr_quant_components "${lwdetr_quant_component_args[@]}" \
     --act_observer "$act_observer" \
     --act_percentile "$act_percentile" \
     --dec_layers 3 \
@@ -173,4 +185,4 @@ python -u -m torch.distributed.launch \
     --resume "$checkpoint" \
     --qat \
     --pretrain_keys_modify_to_load "${pretrain_keys_modify_to_load[@]}" \
-    --output_dir "output/${model_name}_quant_${component_suffix}_${model_size}"
+    --output_dir "output/${model_name}_qat_${component_suffix}_${model_size}_prism"

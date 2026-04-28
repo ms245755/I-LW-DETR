@@ -6,6 +6,8 @@ set -euo pipefail
 #   BACKBONE_QUANT_COMPONENTS="vit" ENCODER_QUANT_BLOCKS="0 3 5" \
 #     ENCODER_QUANT_COMPONENTS="linear softmax layernorm gelu" \
 #     PROJECTOR_QUANT_COMPONENTS="conv2d layernorm" \
+#     TRANSFORMER_QUANT_COMPONENTS="linear matmul softmax layernorm deformable_attention" \
+#     LWDETR_QUANT_COMPONENTS="linear" \
 #     bash setup/lwdetr_quant_calib.sh small /path/to/coco /path/to/checkpoint.pth
 
 model_size="${1:-tiny}"
@@ -17,7 +19,9 @@ quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
 encoder_quant_blocks="${ENCODER_QUANT_BLOCKS:-all}"
 encoder_quant_components="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
 projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu layernorm}"
-act_observer="${ACT_OBSERVER:-percentile}"
+transformer_quant_components="${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
+lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-linear}"
+act_observer="${ACT_OBSERVER:-mean}"
 act_percentile="${ACT_PERCENTILE:-99}"
 
 read -r -a backbone_quant_component_args <<< "$backbone_quant_components"
@@ -26,12 +30,12 @@ component_suffix="$(printf '%s\n' "${backbone_quant_component_args[@]}" | paste 
 
 case "$model_size" in
   tiny)
-    model_name="lwdetr_tiny_coco"
+    model_name="lwdetr_tiny_coco_easy_quant"
     encoder="vit_tiny"
     vit_encoder_num_layers=6
     window_block_indexes="0 2 4"
     out_feature_indexes="1 3 5"
-    batch_size=4
+    batch_size="${BATCH_SIZE:-4}"
     num_select=100
     ;;
   small)
@@ -40,7 +44,7 @@ case "$model_size" in
     vit_encoder_num_layers=10
     window_block_indexes="0 1 3 6 7 9"
     out_feature_indexes="2 4 5 9"
-    batch_size=4
+    batch_size="${BATCH_SIZE:-4}"
     num_select=300
     ;;
   medium)
@@ -49,7 +53,7 @@ case "$model_size" in
     vit_encoder_num_layers=10
     window_block_indexes="0 1 3 6 7 9"
     out_feature_indexes="2 4 5 9"
-    batch_size=2
+    batch_size="${BATCH_SIZE:-2}"
     num_select=300
     ;;
   *)
@@ -66,6 +70,8 @@ fi
 
 read -r -a encoder_quant_component_args <<< "$encoder_quant_components"
 read -r -a projector_quant_component_args <<< "$projector_quant_components"
+read -r -a transformer_quant_component_args <<< "$transformer_quant_components"
+read -r -a lwdetr_quant_component_args <<< "$lwdetr_quant_components"
 read -r -a window_block_args <<< "$window_block_indexes"
 read -r -a out_feature_args <<< "$out_feature_indexes"
 
@@ -80,6 +86,8 @@ python main.py \
     "${quant_block_args[@]}" \
     --encoder_quant_components "${encoder_quant_component_args[@]}" \
     --projector_quant_components "${projector_quant_component_args[@]}" \
+    --transformer_quant_components "${transformer_quant_component_args[@]}" \
+    --lwdetr_quant_components "${lwdetr_quant_component_args[@]}" \
     --act_observer "$act_observer" \
     --act_percentile "$act_percentile" \
     --dec_layers 3 \
@@ -97,5 +105,6 @@ python main.py \
     --dataset_file coco \
     --coco_path "$coco_path" \
     --square_resize_div_64 \
+    --easy_quantize \
     --calib --resume "$checkpoint" \
     --output_dir "output/${model_name}_quant_${component_suffix}_${model_size}"
