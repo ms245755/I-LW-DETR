@@ -193,9 +193,11 @@ class MultiScaleProjector(nn.Module):
         # use_bias = norm == ""
         use_bias = False
         self.use_extra_pool = False
-        for scale in scale_factors:
+        for stage_idx, scale in enumerate(scale_factors):
+            stage_block_name = block_name + f"stage{stage_idx}/"
             stages_sampling.append([])
-            for in_dim in in_channels:
+            for input_idx, in_dim in enumerate(in_channels):
+                sampling_block_name = stage_block_name + f"0_sampling/input{input_idx}/"
                 out_dim = in_dim
                 if scale == 4.0:
                     layers = [
@@ -209,7 +211,7 @@ class MultiScaleProjector(nn.Module):
                     # a hack to reduce the FLOPs and Params when the dimention of output feature is too large
                     if in_dim > 512:
                         layers = [
-                            ConvX(in_dim, in_dim // 2, kernel=1, observe_stat=observe_stat, block_name=block_name+"scale2/reduce/"),
+                            ConvX(in_dim, in_dim // 2, kernel=1, observe_stat=observe_stat, block_name=sampling_block_name+"scale2/reduce/"),
                             nn.ConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
                         ]
                         out_dim = in_dim // 4
@@ -220,7 +222,7 @@ class MultiScaleProjector(nn.Module):
                     layers = []
                 elif scale == 0.5:
                     layers = [
-                        ConvX(in_dim, in_dim, 3, 2, observe_stat=observe_stat, block_name=block_name+"scale0_5/downsample/"),
+                        ConvX(in_dim, in_dim, 3, 2, observe_stat=observe_stat, block_name=sampling_block_name+"scale0_5/downsample/"),
                         ]
                 elif scale == 0.25:
                     self.use_extra_pool = True
@@ -233,7 +235,7 @@ class MultiScaleProjector(nn.Module):
 
             in_dim = out_dim * len(in_channels)
             layers = [
-                C2f(in_dim, out_channels, num_blocks, block_name=block_name+"c2f/", observe_stat=observe_stat),
+                C2f(in_dim, out_channels, num_blocks, block_name=stage_block_name+"1_c2f/", observe_stat=observe_stat),
                 get_norm('LN', out_channels),
             ]
             layers = nn.Sequential(*layers)
@@ -256,16 +258,16 @@ class MultiScaleProjector(nn.Module):
         # (H, W, B, C) --> (B, C, H, W)
         results = []
 
-        for i, stage in enumerate(self.stages):
+        for stage_idx, stage in enumerate(self.stages):
             feat_fuse = []
-            for j, stage_sampling in enumerate(self.stages_sampling[i]):
-                feat_fuse.append(stage_sampling(x[j]))
+            for input_idx, stage_sampling in enumerate(self.stages_sampling[stage_idx]):
+                feat_fuse.append(stage_sampling(x[input_idx]))
             if len(feat_fuse) > 1:
                 feat_fuse = torch.cat(feat_fuse, dim=1)
             else:
                 feat_fuse = feat_fuse[0]
             # save_tensor_from_pathname(feat_fuse, self.block_name+"feat", "observed_tensor/float/")
-            for i, layer in enumerate(stage):
+            for layer_idx, layer in enumerate(stage):
                 feat_fuse = layer(feat_fuse)
                 # save_tensor_from_pathname(feat_fuse, self.block_name+f"{i}", "observed_tensor/float/")
             results.append(feat_fuse)

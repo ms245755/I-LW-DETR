@@ -295,11 +295,13 @@ class IMultiScaleProjector(nn.Module):
         stages_qact_post = []
         self.use_extra_pool = False
         self.qact_post_fuse = IViTAct()
-        for scale in scale_factors:
+        for stage_idx, scale in enumerate(scale_factors):
+            stage_block_name = block_name + f"stage{stage_idx}/"
             stages_sampling.append([])
             stages_sampling_qact_bridge.append([])
             stages_sampling_qact_post.append([])
-            for in_dim in in_channels:
+            for input_idx, in_dim in enumerate(in_channels):
+                sampling_block_name = stage_block_name + f"0_sampling/input{input_idx}/"
                 out_dim = in_dim
                 if scale == 4.0:
                     layers = [
@@ -312,7 +314,14 @@ class IMultiScaleProjector(nn.Module):
                 elif scale == 2.0:
                     if in_dim > 512:
                         layers = [
-                            IConvX(in_dim, in_dim // 2, kernel=1, quant_components=self.quant_components),
+                            IConvX(
+                                in_dim,
+                                in_dim // 2,
+                                kernel=1,
+                                observe_stat=observe_stat,
+                                block_name=sampling_block_name + "scale2/reduce/",
+                                quant_components=self.quant_components,
+                            ),
                             _make_conv2d(self.quant_components, in_dim // 2, in_dim // 4, kernel_size=2, stride=2, bias=True, weight_bit=8, bias_bit=32, transpose=True),
                         ]
                         out_dim = in_dim // 4
@@ -325,7 +334,15 @@ class IMultiScaleProjector(nn.Module):
                     layers = []
                 elif scale == 0.5:
                     layers = [
-                        IConvX(in_dim, in_dim, 3, 2, quant_components=self.quant_components),
+                        IConvX(
+                            in_dim,
+                            in_dim,
+                            3,
+                            2,
+                            observe_stat=observe_stat,
+                            block_name=sampling_block_name + "scale0_5/downsample/",
+                            quant_components=self.quant_components,
+                        ),
                     ]
                 elif scale == 0.25:
                     self.use_extra_pool = True
@@ -342,7 +359,7 @@ class IMultiScaleProjector(nn.Module):
 
             in_dim = out_dim * len(in_channels)
             layers = [
-                IC2f(in_dim, out_channels, num_blocks, observe_stat=observe_stat, block_name=block_name + "c2f/", quant_components=self.quant_components),
+                IC2f(in_dim, out_channels, num_blocks, observe_stat=observe_stat, block_name=stage_block_name + "1_c2f/", quant_components=self.quant_components),
                 _make_norm(out_channels, self.quant_components),
             ]
             layers = nn.Sequential(*layers)
