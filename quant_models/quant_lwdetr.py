@@ -76,6 +76,7 @@ class ILWDETR(nn.Module):
 
         self.qact_refpoint = IViTAct()
         self.qact_query_feat = IViTAct()
+        self.qact_hs_head = IViTAct()
         self.qact_hs_enc = IViTAct()
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
@@ -157,19 +158,21 @@ class ILWDETR(nn.Module):
         hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self.transformer(
             srcs, masks, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
 
+        hs_head, hs_head_scale = self.qact_hs_head(hs, None)
+
         if self.bbox_reparam:
-            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
             outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
             outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
             outputs_coord = torch.concat(
                 [outputs_coord_cxcy, outputs_coord_wh], dim=-1
             )
         else:
-            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
             outputs_coord, _ = _add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
             outputs_coord = outputs_coord.sigmoid()
 
-        outputs_class, _ = self.class_embed(hs, hs_scale)
+        outputs_class, _ = self.class_embed(hs_head, hs_head_scale)
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
@@ -197,18 +200,20 @@ class ILWDETR(nn.Module):
         hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self.transformer(
             srcs, None, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
 
+        hs_head, hs_head_scale = self.qact_hs_head(hs, None)
+
         if self.bbox_reparam:
-            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
             outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
             outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
             outputs_coord = torch.concat(
                 [outputs_coord_cxcy, outputs_coord_wh], dim=-1
             )
         else:
-            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs, hs_scale)
+            outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
             outputs_coord, _ = _add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
             outputs_coord = outputs_coord.sigmoid()
-        outputs_class, _ = self.class_embed(hs, hs_scale)
+        outputs_class, _ = self.class_embed(hs_head, hs_head_scale)
         return outputs_coord, outputs_class
 
     @torch.jit.unused
