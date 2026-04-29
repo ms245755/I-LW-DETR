@@ -61,7 +61,7 @@ def get_args_parser():
         "--components",
         nargs="+",
         default=["vit", "projector"],
-        choices=("vit", "projector"),
+        choices=("vit", "projector", "transformer", "lwdetr"),
         help="Components whose comparison CSV files should be plotted.",
     )
     parser.add_argument("--observed-root", default="observed_tensor")

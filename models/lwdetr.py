@@ -27,6 +27,7 @@ from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size,
                        is_dist_avail_and_initialized)
+from util.decorators import save_tensor_from_pathname
 
 from .backbone import build_backbone
 from .matcher import build_matcher
@@ -44,7 +45,9 @@ class LWDETR(nn.Module):
                  group_detr=1,
                  two_stage=False,
                  lite_refpoint_refine=False,
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 observe_stat=False,
+                 block_name="observed_tensor/float/lwdetr/"):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -59,6 +62,8 @@ class LWDETR(nn.Module):
         super().__init__()
         self.num_queries = num_queries
         self.transformer = transformer
+        self.observe_stat = observe_stat
+        self.block_name = block_name
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -145,24 +150,35 @@ class LWDETR(nn.Module):
 
         hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
             srcs, masks, poss, refpoint_embed_weight, query_feat_weight)
+        save_tensor_from_pathname(hs, self.block_name + "0_transformer_hs", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(ref_unsigmoid, self.block_name + "1_transformer_ref_unsigmoid", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(hs, self.block_name + "2_head_input", observe_stat=self.observe_stat)
 
         if self.bbox_reparam:
             outputs_coord_delta = self.bbox_embed(hs)
+            save_tensor_from_pathname(outputs_coord_delta, self.block_name + "3_bbox_delta", observe_stat=self.observe_stat)
             outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
             outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
             outputs_coord = torch.concat(
                 [outputs_coord_cxcy, outputs_coord_wh], dim=-1
             )
         else:
-            outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
+            outputs_coord_delta = self.bbox_embed(hs)
+            save_tensor_from_pathname(outputs_coord_delta, self.block_name + "3_bbox_delta", observe_stat=self.observe_stat)
+            outputs_coord = (outputs_coord_delta + ref_unsigmoid).sigmoid()
+        save_tensor_from_pathname(outputs_coord, self.block_name + "4_bbox_output", observe_stat=self.observe_stat)
 
         outputs_class = self.class_embed(hs)
+        save_tensor_from_pathname(outputs_class, self.block_name + "5_class_logits", observe_stat=self.observe_stat)
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        save_tensor_from_pathname(out['pred_logits'], self.block_name + "6_pred_logits", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(out['pred_boxes'], self.block_name + "7_pred_boxes", observe_stat=self.observe_stat)
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
         if self.two_stage:
+            save_tensor_from_pathname(hs_enc, self.block_name + "8_encoder_head/0_hs_enc", observe_stat=self.observe_stat)
             hs_enc_list = hs_enc.split(self.num_queries, dim=1)
             cls_enc = []
             group_detr = self.group_detr if self.training else 1
@@ -170,6 +186,8 @@ class LWDETR(nn.Module):
                 cls_enc_gidx = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx])
                 cls_enc.append(cls_enc_gidx)
             cls_enc = torch.cat(cls_enc, dim=1)
+            save_tensor_from_pathname(cls_enc, self.block_name + "8_encoder_head/1_class_logits", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(ref_enc, self.block_name + "8_encoder_head/2_ref_boxes", observe_stat=self.observe_stat)
             out['enc_outputs'] = {'pred_logits': cls_enc, 'pred_boxes': ref_enc}
         return out
 
@@ -588,6 +606,7 @@ def build(args):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        observe_stat=getattr(args, "observe_stat", False),
     )
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}

@@ -246,8 +246,8 @@ def get_args_parser():
         "--components",
         nargs="+",
         default=["vit", "projector"],
-        choices=("vit", "projector"),
-        help="Backbone components to compare.",
+        choices=("vit", "projector", "transformer", "lwdetr"),
+        help="Components to compare.",
     )
     parser.add_argument("--observed-root", default="observed_tensor")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -264,49 +264,148 @@ def get_args_parser():
     return parser
 
 
+def component_folder(observed_root, mode, component):
+    if component in ("vit", "projector"):
+        return os.path.join(observed_root, mode, "backbone", component)
+    return os.path.join(observed_root, mode, component)
+
+
+def component_output_folder(output_root, component):
+    if component in ("vit", "projector"):
+        return os.path.join(output_root, "backbone", component)
+    return os.path.join(output_root, component)
+
+
+def load_component_pair(args, component):
+    float_folder = component_folder(args.observed_root, "float", component)
+    quant_folder = component_folder(args.observed_root, "quant", component)
+
+    if not os.path.isdir(float_folder) or not os.path.isdir(quant_folder):
+        message = (
+            f"Missing tensor folders for {component}: "
+            f"float={float_folder}, quant={quant_folder}"
+        )
+        if args.skip_missing:
+            print(f"Skipping {component}. {message}")
+            return None
+        raise FileNotFoundError(message)
+
+    float_tensors, float_tensor_order = load_tensor_files_recursively(float_folder, args.device)
+    quant_tensors, quant_tensor_order = load_tensor_files_recursively(quant_folder, args.device)
+
+    if args.strict and float_tensor_order != quant_tensor_order:
+        raise ValueError(
+            f"Float and quant tensor orders do not match for {component}. "
+            f"Please check {args.observed_root} folder contents."
+        )
+    if float_tensor_order != quant_tensor_order:
+        float_tensors, quant_tensors, float_tensor_order = filter_common_tensors(
+            float_tensors,
+            quant_tensors,
+            float_tensor_order,
+            quant_tensor_order,
+            component,
+        )
+
+    return float_tensors, quant_tensors, float_tensor_order
+
+
+def add_trace_tensor(trace_float, trace_quant, trace_order, row_name, source_name, tensors_float, tensors_quant):
+    if source_name not in tensors_float or source_name not in tensors_quant:
+        return False
+    trace_float[row_name] = tensors_float[source_name]
+    trace_quant[row_name] = tensors_quant[source_name]
+    trace_order.append(row_name)
+    return True
+
+
+def add_last_component_tensor(args, trace_float, trace_quant, trace_order, component, row_prefix):
+    loaded = load_component_pair(args, component)
+    if loaded is None:
+        return
+
+    tensors_float, tensors_quant, tensor_order = loaded
+    if not tensor_order:
+        return
+
+    source_name = tensor_order[-1]
+    row_name = f"{row_prefix}/{source_name}"
+    add_trace_tensor(trace_float, trace_quant, trace_order, row_name, source_name, tensors_float, tensors_quant)
+
+
+def add_transformer_decoder_tensors(args, trace_float, trace_quant, trace_order):
+    loaded = load_component_pair(args, "transformer")
+    if loaded is None:
+        return
+
+    tensors_float, tensors_quant, tensor_order = loaded
+    decoder_outputs = [name for name in ("3_hs", "4_references") if name in tensors_float and name in tensors_quant]
+    if not decoder_outputs:
+        decoder_outputs = [
+            name for name in tensor_order
+            if name.startswith("2_decoder/") and name.endswith("5_norm3")
+        ]
+
+    for source_name in decoder_outputs:
+        add_trace_tensor(
+            trace_float,
+            trace_quant,
+            trace_order,
+            f"2_transformer_decoder/{source_name}",
+            source_name,
+            tensors_float,
+            tensors_quant,
+        )
+
+
+def load_lwdetr_trace(args):
+    trace_float = {}
+    trace_quant = {}
+    trace_order = []
+
+    add_last_component_tensor(args, trace_float, trace_quant, trace_order, "vit", "0_vit_output")
+    add_last_component_tensor(args, trace_float, trace_quant, trace_order, "projector", "1_projector_output")
+    add_transformer_decoder_tensors(args, trace_float, trace_quant, trace_order)
+
+    loaded = load_component_pair(args, "lwdetr")
+    if loaded is not None:
+        tensors_float, tensors_quant, tensor_order = loaded
+        for source_name in tensor_order:
+            add_trace_tensor(
+                trace_float,
+                trace_quant,
+                trace_order,
+                f"3_lwdetr_head/{source_name}",
+                source_name,
+                tensors_float,
+                tensors_quant,
+            )
+
+    if not trace_order:
+        raise ValueError(f"No common float/quant tensors found for lwdetr trace.")
+
+    return trace_float, trace_quant, trace_order
+
+
 def main(args):
-    float_root_folder = os.path.join(args.observed_root, "float", "backbone")
-    quant_root_folder = os.path.join(args.observed_root, "quant", "backbone")
     output_folder = os.path.join(args.observed_root, "comparison")
     os.makedirs(output_folder, exist_ok=True)
 
     for component in args.components:
-        float_folder = os.path.join(float_root_folder, component)
-        quant_folder = os.path.join(quant_root_folder, component)
-
-        if not os.path.isdir(float_folder) or not os.path.isdir(quant_folder):
-            message = (
-                f"Missing tensor folders for {component}: "
-                f"float={float_folder}, quant={quant_folder}"
-            )
-            if args.skip_missing:
-                print(f"Skipping {component}. {message}")
+        if component == "lwdetr":
+            float_tensors, quant_tensors, float_tensor_order = load_lwdetr_trace(args)
+        else:
+            loaded = load_component_pair(args, component)
+            if loaded is None:
                 continue
-            raise FileNotFoundError(message)
-
-        float_tensors, float_tensor_order = load_tensor_files_recursively(float_folder, args.device)
-        quant_tensors, quant_tensor_order = load_tensor_files_recursively(quant_folder, args.device)
-
-        if args.strict and float_tensor_order != quant_tensor_order:
-            raise ValueError(
-                f"Float and quant tensor orders do not match for {component}. "
-                f"Please check {args.observed_root} folder contents."
-            )
-        if float_tensor_order != quant_tensor_order:
-            float_tensors, quant_tensors, float_tensor_order = filter_common_tensors(
-                float_tensors,
-                quant_tensors,
-                float_tensor_order,
-                quant_tensor_order,
-                component,
-            )
+            float_tensors, quant_tensors, float_tensor_order = loaded
 
         output_csv_path = os.path.join(args.observed_root, f"comparison_results_{component}.csv")
 
         process_and_save_results(
             float_tensors,
             quant_tensors,
-            os.path.join(output_folder, f"backbone/{component}"),
+            component_output_folder(output_folder, component),
             output_csv_path,
             float_tensor_order,
         )

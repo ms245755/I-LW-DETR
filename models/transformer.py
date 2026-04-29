@@ -22,6 +22,7 @@ from torch import nn, Tensor
 
 from .attention import MultiheadAttention
 from .ops.modules import MSDeformAttn
+from util.decorators import save_tensor_from_pathname
 
 
 class MLP(nn.Module):
@@ -136,9 +137,13 @@ class Transformer(nn.Module):
                  lite_refpoint_refine=False,
                  easy_quantize=False,
                  decoder_norm_type='LN',
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 observe_stat=False,
+                 block_name="observed_tensor/float/transformer/"):
         super().__init__()
         self.encoder = None
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
         decoder_layer = TransformerDecoderLayer(d_model, sa_nhead, ca_nhead, dim_feedforward,
                                                 dropout, activation, normalize_before, 
@@ -146,7 +151,9 @@ class Transformer(nn.Module):
                                                 num_feature_levels=num_feature_levels,
                                                 dec_n_points=dec_n_points,
                                                 easy_quantize=easy_quantize,
-                                                skip_self_attn=False,)
+                                                skip_self_attn=False,
+                                                observe_stat=observe_stat,
+                                                block_name=block_name + "2_decoder/layer/")
         assert decoder_norm_type in ['LN', 'Identity']
         norm = { 
             "LN": lambda channels: nn.LayerNorm(channels),
@@ -159,7 +166,9 @@ class Transformer(nn.Module):
                                           d_model=d_model,
                                           lite_refpoint_refine=lite_refpoint_refine,
                                           easy_quantize=easy_quantize,
-                                          bbox_reparam=bbox_reparam)
+                                          bbox_reparam=bbox_reparam,
+                                          observe_stat=observe_stat,
+                                          block_name=block_name + "2_decoder/")
         
         
         self.two_stage = two_stage
@@ -217,6 +226,7 @@ class Transformer(nn.Module):
                 mask = masks[lvl].flatten(1)                    # bs, hw
                 mask_flatten.append(mask)
         memory = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c 
+        save_tensor_from_pathname(memory, self.block_name + "0_memory", observe_stat=self.observe_stat)
         if masks is not None:
             mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
             valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
@@ -227,13 +237,25 @@ class Transformer(nn.Module):
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(
                 memory, mask_flatten, spatial_shapes, unsigmoid=not self.bbox_reparam)
+            save_tensor_from_pathname(output_memory, self.block_name + "1_two_stage/0_output_memory", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(output_proposals, self.block_name + "1_two_stage/1_output_proposals", observe_stat=self.observe_stat)
             # group detr for first stage
             refpoint_embed_ts, memory_ts, boxes_ts = [], [], []
             group_detr = self.group_detr if self.training else 1
             for g_idx in range(group_detr):
                 output_memory_gidx = self.enc_output_norm[g_idx](self.enc_output[g_idx](output_memory))
+                save_tensor_from_pathname(
+                    output_memory_gidx,
+                    self.block_name + f"1_two_stage/2_group{g_idx}/0_output_memory",
+                    observe_stat=self.observe_stat,
+                )
     
                 enc_outputs_class_unselected_gidx = self.enc_out_class_embed[g_idx](output_memory_gidx)
+                save_tensor_from_pathname(
+                    enc_outputs_class_unselected_gidx,
+                    self.block_name + f"1_two_stage/2_group{g_idx}/1_class_logits",
+                    observe_stat=self.observe_stat,
+                )
                 if self.bbox_reparam:
                     enc_outputs_coord_delta_gidx = self.enc_out_bbox_embed[g_idx](output_memory_gidx)
                     enc_outputs_coord_cxcy_gidx = enc_outputs_coord_delta_gidx[...,
@@ -265,6 +287,8 @@ class Transformer(nn.Module):
             # (bs, nq, d)
             memory_ts = torch.cat(memory_ts, dim=1)#.transpose(0, 1)
             boxes_ts = torch.cat(boxes_ts, dim=1)#.transpose(0, 1)
+            save_tensor_from_pathname(memory_ts, self.block_name + "1_two_stage/3_memory_topk", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(boxes_ts, self.block_name + "1_two_stage/4_boxes_topk", observe_stat=self.observe_stat)
         
         tgt = query_feat.unsqueeze(0).repeat(bs, 1, 1)
         refpoint_embed = refpoint_embed.unsqueeze(0).repeat(bs, 1, 1)
@@ -283,6 +307,8 @@ class Transformer(nn.Module):
                           level_start_index=level_start_index, 
                           spatial_shapes=spatial_shapes,
                           valid_ratios=valid_ratios.to(memory.dtype) if valid_ratios is not None else valid_ratios)
+        save_tensor_from_pathname(hs, self.block_name + "3_hs", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(references, self.block_name + "4_references", observe_stat=self.observe_stat)
         if self.two_stage:
             if self.bbox_reparam:
                 return hs, references, memory_ts, boxes_ts
@@ -301,7 +327,9 @@ class TransformerDecoder(nn.Module):
                  d_model=256,
                  lite_refpoint_refine=False,
                  easy_quantize=False,
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 observe_stat=False,
+                 block_name=""):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
@@ -311,6 +339,8 @@ class TransformerDecoder(nn.Module):
         self.lite_refpoint_refine = lite_refpoint_refine
         self.easy_quantize = easy_quantize
         self.bbox_reparam = bbox_reparam
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
         self.ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
         self.ref_point_coord_proj = MLP(4, d_model, 2 * d_model, 2) if easy_quantize else None
@@ -388,11 +418,14 @@ class TransformerDecoder(nn.Module):
                     obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid)
                 else:
                     obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
+            save_tensor_from_pathname(query_pos, self.block_name + f"1_layer{layer_id}/0_query_pos", observe_stat=self.observe_stat)
 
             # For the first decoder layer, we do not apply transformation over p_s
             pos_transformation = 1
 
             query_pos = query_pos * pos_transformation
+            if hasattr(layer, "block_name"):
+                layer.block_name = self.block_name + f"1_layer{layer_id}/"
             
             output = layer(output, memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
@@ -451,7 +484,9 @@ class TransformerDecoderLayer(nn.Module):
                  activation="relu", normalize_before=False, group_detr=1, 
                  num_feature_levels=4, dec_n_points=4, 
                  easy_quantize=False,
-                 skip_self_attn=False):
+                 skip_self_attn=False,
+                 observe_stat=False,
+                 block_name=""):
         super().__init__()
         # Decoder Self-Attention
         self.self_attn = MultiheadAttention(embed_dim=d_model, num_heads=sa_nhead, dropout=dropout, batch_first=True)
@@ -479,6 +514,8 @@ class TransformerDecoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
         self.group_detr = group_detr
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -513,10 +550,12 @@ class TransformerDecoderLayer(nn.Module):
         
         if self.training:
             tgt2 = torch.cat(tgt2.split(bs, dim=0), dim=1)
+        save_tensor_from_pathname(tgt2, self.block_name + "0_self_attn", observe_stat=self.observe_stat)
         # ========== End of Self-Attention =============
 
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
+        save_tensor_from_pathname(tgt, self.block_name + "1_norm1", observe_stat=self.observe_stat)
 
         # ========== Begin of Cross-Attention =============
         tgt2 = self.cross_attn(
@@ -527,13 +566,17 @@ class TransformerDecoderLayer(nn.Module):
             level_start_index,
             memory_key_padding_mask
         )
+        save_tensor_from_pathname(tgt2, self.block_name + "2_cross_attn", observe_stat=self.observe_stat)
         # ========== End of Cross-Attention =============
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
+        save_tensor_from_pathname(tgt, self.block_name + "3_norm2", observe_stat=self.observe_stat)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        save_tensor_from_pathname(tgt2, self.block_name + "4_ffn", observe_stat=self.observe_stat)
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+        save_tensor_from_pathname(tgt, self.block_name + "5_norm3", observe_stat=self.observe_stat)
         return tgt
 
     def forward(self, tgt, memory,
@@ -582,6 +625,7 @@ def build_transformer(args):
         easy_quantize=args.easy_quantize,
         decoder_norm_type=args.decoder_norm,
         bbox_reparam=args.bbox_reparam,
+        observe_stat=getattr(args, "observe_stat", False),
     )
 
 

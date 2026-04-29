@@ -22,6 +22,7 @@ from torch import nn, Tensor
 
 from .quant_blocks import *
 from quant_models.fake_quantized.layers import *
+from util.decorators import save_tensor_from_pathname
 
 
 def _component_set(components):
@@ -233,10 +234,14 @@ class Transformer(nn.Module):
                  decoder_norm_type='LN',
                  bbox_reparam=False,
                  decoder_cross_attn_float=False,
-                 transformer_quant_components=None):
+                 transformer_quant_components=None,
+                 observe_stat=False,
+                 block_name="observed_tensor/quant/transformer/"):
         super().__init__()
         self.encoder = None
         self.quant_components = _component_set(transformer_quant_components)
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
         decoder_layer = TransformerDecoderLayer(d_model, sa_nhead, ca_nhead, dim_feedforward,
                                                 dropout, activation, normalize_before, 
@@ -245,7 +250,9 @@ class Transformer(nn.Module):
                                                 dec_n_points=dec_n_points,
                                                 decoder_cross_attn_float=decoder_cross_attn_float,
                                                 skip_self_attn=False,
-                                                quant_components=self.quant_components)
+                                                quant_components=self.quant_components,
+                                                observe_stat=observe_stat,
+                                                block_name=block_name + "2_decoder/layer/")
         assert decoder_norm_type in ['LN', 'Identity']
         norm = { 
             "LN": lambda channels: IViTLayerNorm(channels) if "layernorm" in self.quant_components else ScaleLayerNorm(channels),
@@ -259,10 +266,14 @@ class Transformer(nn.Module):
                                           lite_refpoint_refine=lite_refpoint_refine,
                                           easy_quantize=easy_quantize,
                                           bbox_reparam=bbox_reparam,
-                                          quant_components=self.quant_components)
+                                          quant_components=self.quant_components,
+                                          observe_stat=observe_stat,
+                                          block_name=block_name + "2_decoder/")
         
         self.int_exp = IViTExp()
         self.qact_output_proposal = IViTAct()
+        self.qact_memory_cat = IViTAct()
+
         self.two_stage = two_stage
         if two_stage:
             linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
@@ -324,7 +335,9 @@ class Transformer(nn.Module):
                 mask_flatten.append(mask)
             
         memory = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c # Cong: should we cat them? because the scale would be lost
-        memory_scale = max_scale
+        memory, memory_scale = self.qact_memory_cat(memory, max_scale)   
+
+        save_tensor_from_pathname(memory, self.block_name + "0_memory", observe_stat=self.observe_stat)
         if masks is not None:
             mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
             valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
@@ -334,6 +347,8 @@ class Transformer(nn.Module):
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(
                 memory, mask_flatten, spatial_shapes, unsigmoid=not self.bbox_reparam)
+            save_tensor_from_pathname(output_memory, self.block_name + "1_two_stage/0_output_memory", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(output_proposals, self.block_name + "1_two_stage/1_output_proposals", observe_stat=self.observe_stat)
             
             output_proposals, output_proposals_scale = self.qact_output_proposal(output_proposals, None)
             # group detr for first stage
@@ -348,8 +363,18 @@ class Transformer(nn.Module):
                     output_memory_gidx, output_memory_gidx_scale)
                 output_memory_gidx, output_memory_gidx_scale = self.qact_post_norm_output[g_idx](
                     output_memory_gidx, output_memory_gidx_scale)
+                save_tensor_from_pathname(
+                    output_memory_gidx,
+                    self.block_name + f"1_two_stage/2_group{g_idx}/0_output_memory",
+                    observe_stat=self.observe_stat,
+                )
     
                 enc_outputs_class_unselected_gidx, enc_outputs_class_unselected_gidx_scale  = self.enc_out_class_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
+                save_tensor_from_pathname(
+                    enc_outputs_class_unselected_gidx,
+                    self.block_name + f"1_two_stage/2_group{g_idx}/1_class_logits",
+                    observe_stat=self.observe_stat,
+                )
                 if self.bbox_reparam:
                     enc_outputs_coord_delta_gidx, enc_outputs_coord_delta_gidx_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                     enc_outputs_coord_cxcy_gidx = enc_outputs_coord_delta_gidx[...,
@@ -391,6 +416,8 @@ class Transformer(nn.Module):
             # (bs, nq, d)
             memory_ts, memory_ts_scale = concat_list_tensor_scale(memory_ts, dim=1)#.transpose(0, 1)
             boxes_ts, boxes_ts_scale = concat_list_tensor_scale(boxes_ts, dim=1)#.transpose(0, 1)
+            save_tensor_from_pathname(memory_ts, self.block_name + "1_two_stage/3_memory_topk", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(boxes_ts, self.block_name + "1_two_stage/4_boxes_topk", observe_stat=self.observe_stat)
         
         tgt = query_feat.unsqueeze(0).repeat(bs, 1, 1)
         refpoint_embed = refpoint_embed.unsqueeze(0).repeat(bs, 1, 1)
@@ -411,6 +438,8 @@ class Transformer(nn.Module):
                           level_start_index=level_start_index, 
                           spatial_shapes=spatial_shapes,
                           valid_ratios=valid_ratios.to(memory.dtype) if valid_ratios is not None else valid_ratios)
+        save_tensor_from_pathname(hs, self.block_name + "3_hs", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(references, self.block_name + "4_references", observe_stat=self.observe_stat)
         if self.two_stage:
             if self.bbox_reparam:
                 return hs, hs_scale, references, references_scale, memory_ts, memory_ts_scale, boxes_ts
@@ -430,7 +459,9 @@ class TransformerDecoder(nn.Module):
                  lite_refpoint_refine=False,
                  easy_quantize=False,
                  bbox_reparam=False,
-                 quant_components=None):
+                 quant_components=None,
+                 observe_stat=False,
+                 block_name=""):
         super().__init__()
         self.quant_components = _component_set(quant_components)
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -441,6 +472,8 @@ class TransformerDecoder(nn.Module):
         self.lite_refpoint_refine = lite_refpoint_refine
         self.easy_quantize = easy_quantize
         self.bbox_reparam = bbox_reparam
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
         # Keep the original ref_point_head width so pretrained weights remain reusable,
         # and learn a quantization-friendly coordinate expansion in front of it.
@@ -551,11 +584,14 @@ class TransformerDecoder(nn.Module):
                     obj_center, refpoints_input, query_pos, query_pos_scale, query_sine_embed = get_reference(refpoints_unsigmoid, refpoint_scale)
                 else:
                     obj_center, refpoints_input, query_pos, query_pos_scale, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid(), refpoint_scale)
+            save_tensor_from_pathname(query_pos, self.block_name + f"1_layer{layer_id}/0_query_pos", observe_stat=self.observe_stat)
 
             # For the first decoder layer, we do not apply transformation over p_s
             pos_transformation = 1
 
             query_pos = query_pos * pos_transformation
+            if hasattr(layer, "block_name"):
+                layer.block_name = self.block_name + f"1_layer{layer_id}/"
             
             output, output_scale = layer(output, output_scale, memory, memory_scale, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
@@ -696,7 +732,9 @@ class TransformerDecoderLayer(nn.Module):
                  num_feature_levels=4, dec_n_points=4,
                  decoder_cross_attn_float=False,
                  skip_self_attn=False,
-                 quant_components=None):
+                 quant_components=None,
+                 observe_stat=False,
+                 block_name=""):
         super().__init__()
         self.quant_components = _component_set(quant_components)
         linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
@@ -728,6 +766,8 @@ class TransformerDecoderLayer(nn.Module):
         self.activation = F.relu
         self.normalize_before = normalize_before
         self.group_detr = group_detr
+        self.observe_stat = observe_stat
+        self.block_name = block_name
         self.qact_norm1_input = IViTAct()
         self.qact_norm2_input = IViTAct()
         self.qact_norm3_input = IViTAct()
@@ -780,11 +820,13 @@ class TransformerDecoderLayer(nn.Module):
         
         if self.training:
             tgt2 = torch.cat(tgt2.split(bs, dim=0), dim=1)
+        save_tensor_from_pathname(tgt2, self.block_name + "0_self_attn", observe_stat=self.observe_stat)
         # ========== End of Self-Attention =============
 
         tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout1(tgt2), tgt2_scale)
         tgt, query_scale = self._apply_norm(self.norm1, self.qact_norm1_input, tgt, query_scale)
         tgt, query_scale = self.qact_self_attn_block(tgt, query_scale)
+        save_tensor_from_pathname(tgt, self.block_name + "1_norm1", observe_stat=self.observe_stat)
 
         # ========== Begin of Cross-Attention =============
         query_with_pos, query_with_pos_scale = _add_tensor_scale(tgt, query_scale, query_pos, query_pos_scale)
@@ -798,20 +840,24 @@ class TransformerDecoderLayer(nn.Module):
             query_with_pos_scale,
             memory_scale,
         )
+        save_tensor_from_pathname(tgt2, self.block_name + "2_cross_attn", observe_stat=self.observe_stat)
         # ========== End of Cross-Attention =============
 
         tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout2(tgt2), tgt2_scale)
         tgt, query_scale = self._apply_norm(self.norm2, self.qact_norm2_input, tgt, query_scale)
         tgt, query_scale = self.qact_cross_attn_block(tgt, query_scale)
+        save_tensor_from_pathname(tgt, self.block_name + "3_norm2", observe_stat=self.observe_stat)
         tgt2, tgt2_scale = self.linear1(tgt, query_scale)
         tgt2, tgt2_scale = self.qact_ffn_1(tgt2, tgt2_scale)
         tgt2 = self.activation(tgt2)
         tgt2, tgt2_scale = self.qact_ffn_relu(tgt2, tgt2_scale)
         tgt2, tgt2_scale = self.linear2(tgt2, tgt2_scale)
         tgt2, tgt2_scale = self.qact_ffn_2(tgt2, tgt2_scale)
+        save_tensor_from_pathname(tgt2, self.block_name + "4_ffn", observe_stat=self.observe_stat)
         tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout3(tgt2), tgt2_scale)
         tgt, query_scale = self._apply_norm(self.norm3, self.qact_norm3_input, tgt, query_scale)
         tgt, query_scale = self.qact_ffn_block(tgt, query_scale)
+        save_tensor_from_pathname(tgt, self.block_name + "5_norm3", observe_stat=self.observe_stat)
         return tgt, query_scale
 
     def forward(self, tgt, query_scale, memory, memory_scale,
@@ -863,4 +909,5 @@ def build_transformer(args):
         bbox_reparam=args.bbox_reparam,
         decoder_cross_attn_float=getattr(args, "decoder_cross_attn_float", False),
         transformer_quant_components=getattr(args, "transformer_quant_components", None),
+        observe_stat=getattr(args, "observe_stat", False),
     )

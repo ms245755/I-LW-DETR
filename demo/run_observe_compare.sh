@@ -5,13 +5,14 @@ set -euo pipefail
 # tensor statistics and summary plots.
 #
 # Usage:
-#   bash demo/run_observe_compare.sh <vit|vit_projector> <tiny|small|medium> <float_checkpoint> <quant_checkpoint> <image> [run_dir]
+#   bash demo/run_observe_compare.sh <vit|vit_projector|transformer|full> <tiny|small|medium> <float_checkpoint> <quant_checkpoint> <image> [run_dir]
 #
 # Examples:
 #   bash demo/run_observe_compare.sh vit tiny pretrain_weights/lwdetr_tiny.pth output/lwdetr_tiny_quant/checkpoint.pth demo/catdog.jpg
 #   bash demo/run_observe_compare.sh vit_projector tiny pretrain_weights/lwdetr_tiny.pth output/lwdetr_tiny_quant/checkpoint.pth demo/catdog.jpg
+#   bash demo/run_observe_compare.sh full tiny pretrain_weights/lwdetr_tiny.pth output/lwdetr_tiny_quant/checkpoint.pth demo/catdog.jpg
 
-usage="Usage: bash demo/run_observe_compare.sh <vit|vit_projector> <tiny|small|medium> <float_checkpoint> <quant_checkpoint> <image> [run_dir]"
+usage="Usage: bash demo/run_observe_compare.sh <vit|vit_projector|transformer|full> <tiny|small|medium> <float_checkpoint> <quant_checkpoint> <image> [run_dir]"
 
 quant_scope="${1:?$usage}"
 model_size="${2:?$usage}"
@@ -38,16 +39,29 @@ fi
 case "$quant_scope" in
   vit)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit}"
+    quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
+    stats_components=(vit)
     ;;
   vit_projector)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
+    quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
+    stats_components=(vit projector)
+    ;;
+  transformer)
+    backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
+    quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone transformer}"
+    stats_components=(transformer lwdetr)
+    ;;
+  full)
+    backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
+    quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone transformer}"
+    stats_components=(vit projector transformer lwdetr)
     ;;
   *)
-    echo "Unsupported quant scope: $quant_scope. Use vit or vit_projector." >&2
+    echo "Unsupported quant scope: $quant_scope. Use vit, vit_projector, transformer, or full." >&2
     exit 2
     ;;
 esac
-stats_components=(vit projector)
 
 case "$model_size" in
   tiny)
@@ -81,9 +95,10 @@ case "$model_size" in
 esac
 
 read -r -a backbone_quant_component_args <<< "$backbone_quant_components"
-read -r -a quant_model_component_args <<< "${QUANT_MODEL_COMPONENTS:-backbone}"
+read -r -a quant_model_component_args <<< "$quant_model_components"
 read -r -a encoder_quant_component_args <<< "${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
 read -r -a projector_quant_component_args <<< "${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu silu layernorm}"
+read -r -a transformer_quant_component_args <<< "${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
 
 quant_block_args=()
 if [[ "${ENCODER_QUANT_BLOCKS:-all}" != "all" ]]; then
@@ -143,6 +158,7 @@ python demo/demo.py \
   "${quant_block_args[@]}" \
   --encoder_quant_components "${encoder_quant_component_args[@]}" \
   --projector_quant_components "${projector_quant_component_args[@]}" \
+  --transformer_quant_components "${transformer_quant_component_args[@]}" \
   --act_observer "${ACT_OBSERVER:-mean}" \
   --act_percentile "${ACT_PERCENTILE:-99}"
 
