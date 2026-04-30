@@ -14,7 +14,9 @@
 """
 Train and eval functions used in main.py
 """
+import fnmatch
 import math
+import re
 import sys
 from typing import Iterable
 import random
@@ -236,6 +238,310 @@ def calibrate(
     freeze_model(model)
 
     return model
+
+
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _flatten_tensors(value):
+    if torch.is_tensor(value):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        tensors = []
+        for item in value:
+            tensors.extend(_flatten_tensors(item))
+        return tensors
+    if isinstance(value, dict):
+        tensors = []
+        for item in value.values():
+            tensors.extend(_flatten_tensors(item))
+        return tensors
+    if hasattr(value, "tensors") and torch.is_tensor(value.tensors):
+        return [value.tensors]
+    return []
+
+
+def _pair_output_tensors(student_output, teacher_output):
+    student_tensors = _flatten_tensors(student_output)
+    teacher_tensors = _flatten_tensors(teacher_output)
+    pairs = []
+    used_teacher = set()
+    for student_tensor in student_tensors:
+        if student_tensor.numel() == 0:
+            continue
+        for teacher_idx, teacher_tensor in enumerate(teacher_tensors):
+            if teacher_idx in used_teacher:
+                continue
+            if student_tensor.shape == teacher_tensor.shape:
+                pairs.append((student_tensor.float(), teacher_tensor.detach().float()))
+                used_teacher.add(teacher_idx)
+                break
+    return pairs
+
+
+def _normalized_mse(student_tensor, teacher_tensor, eps=1e-6):
+    denom = teacher_tensor.detach().float().pow(2).mean().clamp_min(eps)
+    return torch.nn.functional.mse_loss(student_tensor.float(), teacher_tensor.detach().float()) / denom
+
+
+def _select_reconstruction_modules(student_model, teacher_model, patterns):
+    student_modules = dict(_unwrap_model(student_model).named_modules())
+    teacher_modules = dict(_unwrap_model(teacher_model).named_modules())
+    common_names = sorted(set(student_modules).intersection(teacher_modules))
+    selected = []
+
+    if patterns == ["auto"]:
+        auto_patterns = [
+            re.compile(r"backbone\.0\.encoder\.blocks\.\d+"),
+            re.compile(r"backbone\.0\.projector\.stages\.\d+"),
+            re.compile(r"backbone\.0\.projector\.stages_sampling\.\d+\.\d+"),
+            re.compile(r"transformer\.decoder\.layers\.\d+"),
+        ]
+        for name in common_names:
+            if any(pattern.fullmatch(name) for pattern in auto_patterns):
+                selected.append(name)
+        return selected
+
+    for pattern in patterns:
+        selected.extend(name for name in common_names if fnmatch.fnmatch(name, pattern))
+    return sorted(dict.fromkeys(selected))
+
+
+def _set_trainable_module(model, module_name):
+    model = _unwrap_model(model)
+    for param in model.parameters():
+        param.requires_grad = False
+    module = dict(model.named_modules())[module_name]
+    params = []
+    for param in module.parameters(recurse=True):
+        param.requires_grad = True
+        params.append(param)
+    return params
+
+
+def _run_reconstruction_step(student_model, teacher_model, module_name, samples):
+    student_cache = {}
+    teacher_cache = {}
+    student_module = dict(_unwrap_model(student_model).named_modules())[module_name]
+    teacher_module = dict(_unwrap_model(teacher_model).named_modules())[module_name]
+
+    def student_hook(_module, _inputs, output):
+        student_cache["output"] = output
+
+    def teacher_hook(_module, _inputs, output):
+        teacher_cache["output"] = output
+
+    student_handle = student_module.register_forward_hook(student_hook)
+    teacher_handle = teacher_module.register_forward_hook(teacher_hook)
+    try:
+        with torch.no_grad():
+            _ = teacher_model(samples)
+        _ = student_model(samples)
+    finally:
+        student_handle.remove()
+        teacher_handle.remove()
+
+    pairs = _pair_output_tensors(student_cache.get("output"), teacher_cache.get("output"))
+    if not pairs:
+        return None
+    return sum(_normalized_mse(student, teacher) for student, teacher in pairs) / len(pairs)
+
+
+def _output_distill_loss(student_output, teacher_output, logit_weight=1.0, box_weight=5.0, temperature=2.0):
+    losses = []
+    if isinstance(student_output, dict) and isinstance(teacher_output, dict):
+        if "pred_logits" in student_output and "pred_logits" in teacher_output:
+            student_logits = student_output["pred_logits"].float()
+            teacher_logits = teacher_output["pred_logits"].detach().float()
+            if student_logits.shape == teacher_logits.shape:
+                log_student = torch.nn.functional.log_softmax(student_logits / temperature, dim=-1)
+                prob_teacher = torch.nn.functional.softmax(teacher_logits / temperature, dim=-1)
+                losses.append(
+                    logit_weight
+                    * temperature
+                    * temperature
+                    * torch.nn.functional.kl_div(log_student, prob_teacher, reduction="batchmean")
+                )
+        if "pred_boxes" in student_output and "pred_boxes" in teacher_output:
+            student_boxes = student_output["pred_boxes"].float()
+            teacher_boxes = teacher_output["pred_boxes"].detach().float()
+            if student_boxes.shape == teacher_boxes.shape:
+                losses.append(box_weight * torch.nn.functional.l1_loss(student_boxes, teacher_boxes))
+        if "aux_outputs" in student_output and "aux_outputs" in teacher_output:
+            for student_aux, teacher_aux in zip(student_output["aux_outputs"], teacher_output["aux_outputs"]):
+                aux_loss = _output_distill_loss(
+                    student_aux,
+                    teacher_aux,
+                    logit_weight=logit_weight,
+                    box_weight=box_weight,
+                    temperature=temperature,
+                )
+                if aux_loss is not None:
+                    losses.append(0.5 * aux_loss)
+        if "enc_outputs" in student_output and "enc_outputs" in teacher_output:
+            enc_loss = _output_distill_loss(
+                student_output["enc_outputs"],
+                teacher_output["enc_outputs"],
+                logit_weight=logit_weight,
+                box_weight=box_weight,
+                temperature=temperature,
+            )
+            if enc_loss is not None:
+                losses.append(0.5 * enc_loss)
+    if not losses:
+        return None
+    return sum(losses) / len(losses)
+
+
+def reconstruct_output_distill(
+    student_model,
+    teacher_model,
+    data_loader,
+    device,
+    batches=0,
+    lr=1e-6,
+    weight_decay=0.0,
+    max_norm=0.1,
+    logit_weight=1.0,
+    box_weight=5.0,
+    temperature=2.0,
+):
+    if batches <= 0:
+        return {}
+
+    student_model.eval()
+    teacher_model.eval()
+    freeze_model(student_model)
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+    for param in _unwrap_model(student_model).parameters():
+        param.requires_grad = True
+
+    optimizer = torch.optim.AdamW(
+        [param for param in _unwrap_model(student_model).parameters() if param.requires_grad],
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = "PTQ output distill:"
+    losses = []
+
+    for batch_idx, (samples, _targets) in enumerate(metric_logger.log_every(data_loader, 1, header)):
+        if batch_idx >= batches:
+            break
+        samples = samples.to(device)
+        with torch.no_grad():
+            teacher_output = teacher_model(samples)
+        student_output = student_model(samples)
+        loss = _output_distill_loss(
+            student_output,
+            teacher_output,
+            logit_weight=logit_weight,
+            box_weight=box_weight,
+            temperature=temperature,
+        )
+        if loss is None:
+            print("PTQ output distill skipped: no matching output tensors")
+            break
+        if not math.isfinite(loss.item()):
+            raise RuntimeError(f"PTQ output distill loss is not finite: {loss.item()}")
+
+        optimizer.zero_grad()
+        loss.backward()
+        if max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(_unwrap_model(student_model).parameters(), max_norm)
+        optimizer.step()
+
+        loss_value = loss.item()
+        losses.append(loss_value)
+        metric_logger.update(ptq_output_distill_loss=loss_value)
+
+    student_model.eval()
+    freeze_model(student_model)
+    metric_logger.synchronize_between_processes()
+    if losses:
+        avg_loss = sum(losses) / len(losses)
+        print(f"PTQ output distill: loss={avg_loss:.6f}")
+        return {"output_distill": avg_loss}
+    return {}
+
+
+def reconstruct_ptq(
+    student_model,
+    teacher_model,
+    data_loader,
+    device,
+    args=None,
+    module_patterns=None,
+    batches_per_module=16,
+    lr=1e-5,
+    weight_decay=0.0,
+    max_norm=0.1,
+):
+    """
+    Block-wise unlabeled PTQ reconstruction.
+
+    The quantized student is optimized to match the frozen float teacher at selected
+    module outputs. Activation observers should already be calibrated and fixed.
+    """
+    student_model.eval()
+    teacher_model.eval()
+    freeze_model(student_model)
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+
+    patterns = module_patterns or ["auto"]
+    module_names = _select_reconstruction_modules(student_model, teacher_model, patterns)
+    if not module_names:
+        print("PTQ reconstruction skipped: no matched modules for patterns:", patterns)
+        return {}
+
+    print("PTQ reconstruction modules:", module_names)
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = "PTQ reconstruct:"
+    stats = {}
+
+    for module_idx, module_name in enumerate(module_names):
+        params = _set_trainable_module(student_model, module_name)
+        if not params:
+            print(f"PTQ reconstruction skip {module_name}: no trainable parameters")
+            continue
+
+        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        module_losses = []
+        for batch_idx, (samples, _targets) in enumerate(metric_logger.log_every(data_loader, 1, header)):
+            if batch_idx >= batches_per_module:
+                break
+            samples = samples.to(device)
+            loss = _run_reconstruction_step(student_model, teacher_model, module_name, samples)
+            if loss is None:
+                if batch_idx == 0:
+                    print(f"PTQ reconstruction skip {module_name}: no same-shaped tensor outputs")
+                break
+            if not math.isfinite(loss.item()):
+                raise RuntimeError(f"PTQ reconstruction loss is not finite for {module_name}: {loss.item()}")
+
+            optimizer.zero_grad()
+            loss.backward()
+            if max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(params, max_norm)
+            optimizer.step()
+
+            loss_value = loss.item()
+            module_losses.append(loss_value)
+            metric_logger.update(ptq_reconstruct_loss=loss_value, ptq_reconstruct_module=module_idx)
+
+        if module_losses:
+            stats[module_name] = sum(module_losses) / len(module_losses)
+            print(f"PTQ reconstruction {module_name}: loss={stats[module_name]:.6f}")
+
+    for param in _unwrap_model(student_model).parameters():
+        param.requires_grad = True
+    student_model.eval()
+    freeze_model(student_model)
+    metric_logger.synchronize_between_processes()
+    return stats
 
 def make_random_calib_loader(original_dataset, batch_size, seed, n_samples=800, **loader_kwargs):
     # Sample a deterministic, coverage-oriented subset instead of a purely random one.
