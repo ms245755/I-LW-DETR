@@ -26,6 +26,7 @@ from torch import nn
 from torch.nn.init import constant_, xavier_uniform_
 
 from models.ops.functions import ms_deform_attn_core_pytorch
+from util.decorators import save_tensor_from_pathname
 
 
 def _is_power_of_2(n):
@@ -37,7 +38,16 @@ def _is_power_of_2(n):
 class MSDeformAttn(nn.Module):
     """Multi-Scale Deformable Attention Module"""
 
-    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, sampling_mode="bilinear"):
+    def __init__(
+        self,
+        d_model=256,
+        n_levels=4,
+        n_heads=8,
+        n_points=4,
+        sampling_mode="bilinear",
+        observe_stat=False,
+        block_name="",
+    ):
         """
         Multi-Scale Deformable Attention Module
         :param d_model      hidden dimension
@@ -64,6 +74,8 @@ class MSDeformAttn(nn.Module):
         self.n_heads = n_heads
         self.n_points = n_points
         self.sampling_mode = sampling_mode
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
         self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
@@ -122,12 +134,19 @@ class MSDeformAttn(nn.Module):
         N, Len_in, _ = input_flatten.shape
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
 
+        save_tensor_from_pathname(query, self.block_name + "0_query", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(reference_points, self.block_name + "1_reference_points", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(input_flatten, self.block_name + "2_input_flatten", observe_stat=self.observe_stat)
+
         value = self.value_proj(input_flatten)
         if input_padding_mask is not None:
             value = value.masked_fill(input_padding_mask[..., None], float(0))
+        save_tensor_from_pathname(value, self.block_name + "3_value_proj", observe_stat=self.observe_stat)
 
         sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
         attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        save_tensor_from_pathname(sampling_offsets, self.block_name + "4_sampling_offsets", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(attention_weights, self.block_name + "5_attention_logits", observe_stat=self.observe_stat)
 
         # N, Len_q, n_heads, n_levels, n_points, 2
         if reference_points.shape[-1] == 2:
@@ -146,6 +165,8 @@ class MSDeformAttn(nn.Module):
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
             )
         attention_weights = F.softmax(attention_weights, -1)
+        save_tensor_from_pathname(sampling_locations, self.block_name + "6_sampling_locations", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(attention_weights, self.block_name + "7_attention_weights", observe_stat=self.observe_stat)
 
         value = value.transpose(1, 2).contiguous().view(N, self.n_heads, self.d_model // self.n_heads, Len_in)
         output = ms_deform_attn_core_pytorch(
@@ -155,5 +176,7 @@ class MSDeformAttn(nn.Module):
             attention_weights,
             mode=self.sampling_mode,
         )
+        save_tensor_from_pathname(output, self.block_name + "8_core_output", observe_stat=self.observe_stat)
         output = self.output_proj(output)
+        save_tensor_from_pathname(output, self.block_name + "9_output_proj", observe_stat=self.observe_stat)
         return output

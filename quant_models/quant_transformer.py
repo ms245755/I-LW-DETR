@@ -41,6 +41,12 @@ def _add_tensor_scale(x, scale_x, y, scale_y):
     return add_tensor_scale(x, scale_x, y, scale_y)
 
 
+def _concat_optional_tensor_scale(tensor_list, dim=0):
+    if any(scale is None for _, scale in tensor_list):
+        return torch.cat([tensor for tensor, _ in tensor_list], dim=dim), None
+    return concat_list_tensor_scale(tensor_list, dim=dim)
+
+
 class ScaleLinear(nn.Linear):
     def forward(self, x, act_scaling_factor=None):
         return super().forward(x), None
@@ -69,8 +75,10 @@ class ScaleSoftmax(nn.Module):
 
 
 class ScaleMSDeformAttn(MSDeformAttn):
-    def __init__(self, *args, use_float_path=False, **kwargs):
+    def __init__(self, *args, use_float_path=False, observe_stat=False, block_name="", **kwargs):
         super().__init__(*args, **kwargs)
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
     def forward(
         self,
@@ -83,14 +91,19 @@ class ScaleMSDeformAttn(MSDeformAttn):
         query_scaling_factor=None,
         input_scaling_factor=None,
     ):
-        return super().forward(
+        save_tensor_from_pathname(query, self.block_name + "0_query", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(reference_points, self.block_name + "1_reference_points", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(input_flatten, self.block_name + "2_input_flatten", observe_stat=self.observe_stat)
+        output = super().forward(
             query,
             reference_points,
             input_flatten,
             input_spatial_shapes,
             input_level_start_index,
             input_padding_mask,
-        ), None
+        )
+        save_tensor_from_pathname(output, self.block_name + "9_output_proj", observe_stat=self.observe_stat)
+        return output, None
 
 
 class IMLP(nn.Module):
@@ -273,6 +286,7 @@ class Transformer(nn.Module):
         self.int_exp = IViTExp()
         self.qact_output_proposal = IViTAct()
         self.qact_memory_cat = IViTAct()
+        self.qact_src_input_bridge = IViTAct()
 
         self.two_stage = two_stage
         if two_stage:
@@ -320,6 +334,10 @@ class Transformer(nn.Module):
         spatial_shapes = []
         valid_ratios = [] if masks is not None else None
 
+        srcs = [
+            self.qact_src_input_bridge(src, None) if scale is None else (src, scale)
+            for src, scale in srcs
+        ]
         max_scale = torch.stack([scale for (_, scale) in srcs]).max()
         for lvl, (src, scale) in enumerate(srcs):
             bs, c, h, w = src.shape
@@ -644,12 +662,12 @@ class TransformerDecoder(nn.Module):
                     ref_scale = refpoint_scale
                 return hs, hs_scale, ref, ref_scale
             # box iterative update
-            hs, hs_scale = concat_list_tensor_scale(
+            hs, hs_scale = _concat_optional_tensor_scale(
                 [(x.unsqueeze(0), scale) for x, scale in zip(intermediate, intermediate_scales)],
                 dim=0,
             )
             if self.bbox_embed is not None:
-                references, references_scale = concat_list_tensor_scale(
+                references, references_scale = _concat_optional_tensor_scale(
                     [(x.unsqueeze(0), scale) for x, scale in zip(hs_refpoints_unsigmoid, hs_refpoints_scales)],
                     dim=0,
                 )
@@ -748,7 +766,9 @@ class TransformerDecoderLayer(nn.Module):
         cross_attn_cls = IMSDeformAttn if "deformable_attention" in self.quant_components else ScaleMSDeformAttn
         self.cross_attn = cross_attn_cls(
             d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points,
-            use_float_path=decoder_cross_attn_float)
+            use_float_path=decoder_cross_attn_float,
+            observe_stat=observe_stat,
+            block_name=block_name + "2_cross_attn/")
 
         self.nhead = ca_nhead
 
@@ -830,6 +850,9 @@ class TransformerDecoderLayer(nn.Module):
 
         # ========== Begin of Cross-Attention =============
         query_with_pos, query_with_pos_scale = _add_tensor_scale(tgt, query_scale, query_pos, query_pos_scale)
+        save_tensor_from_pathname(query_with_pos, self.block_name + "2_cross_attn/0_pre_call_query", observe_stat=self.observe_stat)
+        if hasattr(self.cross_attn, "block_name"):
+            self.cross_attn.block_name = self.block_name + "2_cross_attn/"
         tgt2, tgt2_scale = self.cross_attn(
             query_with_pos,
             reference_points,
@@ -840,13 +863,14 @@ class TransformerDecoderLayer(nn.Module):
             query_with_pos_scale,
             memory_scale,
         )
-        save_tensor_from_pathname(tgt2, self.block_name + "2_cross_attn", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(tgt2, self.block_name + "2_cross_attn_output", observe_stat=self.observe_stat)
         # ========== End of Cross-Attention =============
 
         tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout2(tgt2), tgt2_scale)
+        save_tensor_from_pathname(tgt, self.block_name + "3_norm2/0_residual_input", observe_stat=self.observe_stat)
         tgt, query_scale = self._apply_norm(self.norm2, self.qact_norm2_input, tgt, query_scale)
         tgt, query_scale = self.qact_cross_attn_block(tgt, query_scale)
-        save_tensor_from_pathname(tgt, self.block_name + "3_norm2", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(tgt, self.block_name + "3_norm2/1_output", observe_stat=self.observe_stat)
         tgt2, tgt2_scale = self.linear1(tgt, query_scale)
         tgt2, tgt2_scale = self.qact_ffn_1(tgt2, tgt2_scale)
         tgt2 = self.activation(tgt2)

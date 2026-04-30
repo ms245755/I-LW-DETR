@@ -443,7 +443,7 @@ class IBlock(nn.Module):
         else:
             x = self.norm1(x)
             act_scaling_factor = None
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_norm1", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_norm1_output", observe_stat=self.observe_stat)
         
         if not self.window:
             x = x.reshape(B // 16, 16*HW, C)
@@ -493,7 +493,7 @@ class IBlock(nn.Module):
         else:
             x = self.norm2(x)
             act_scaling_factor = None
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2_output", observe_stat=self.observe_stat)
 
         x, act_scaling_factor = self.mlp(
             x=x, act_scaling_factor=act_scaling_factor, block_name=block_name
@@ -644,7 +644,16 @@ class MSDeformAttn(nn.Module):
 class IMSDeformAttn(nn.Module):
     """Quantized Multi-Scale Deformable Attention Module"""
 
-    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, use_float_path=False):
+    def __init__(
+        self,
+        d_model=256,
+        n_levels=4,
+        n_heads=8,
+        n_points=4,
+        use_float_path=False,
+        observe_stat=False,
+        block_name="",
+    ):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads, but got {} and {}".format(d_model, n_heads))
@@ -662,6 +671,8 @@ class IMSDeformAttn(nn.Module):
         self.n_heads  = n_heads
         self.n_points = n_points
         self.use_float_path = use_float_path
+        self.observe_stat = observe_stat
+        self.block_name = block_name
 
         # ── quantized linear layers ────────────────────────────────────
         self.sampling_offsets  = IViTLinear(d_model, n_heads * n_levels * n_points * 2)
@@ -723,15 +734,22 @@ class IMSDeformAttn(nn.Module):
         N, Len_in, _ = input_flatten.shape
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
 
+        save_tensor_from_pathname(query, self.block_name + "0_query", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(reference_points, self.block_name + "1_reference_points", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(input_flatten, self.block_name + "2_input_flatten", observe_stat=self.observe_stat)
+
         if self.use_float_path:
             value = F.linear(input_flatten, self.value_proj.weight, self.value_proj.bias)
             if input_padding_mask is not None:
                 value = value.masked_fill(input_padding_mask[..., None], 0)
+            save_tensor_from_pathname(value, self.block_name + "3_value_proj", observe_stat=self.observe_stat)
 
             sampling_offsets = F.linear(query, self.sampling_offsets.weight, self.sampling_offsets.bias)
             sampling_offsets = sampling_offsets.view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
             attn_weights = F.linear(query, self.attention_weights.weight, self.attention_weights.bias)
             attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+            save_tensor_from_pathname(sampling_offsets, self.block_name + "4_sampling_offsets", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(attn_weights, self.block_name + "5_attention_logits", observe_stat=self.observe_stat)
             attn_weights = F.softmax(attn_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
 
             if reference_points.shape[-1] == 2:
@@ -749,12 +767,16 @@ class IMSDeformAttn(nn.Module):
                 raise ValueError(
                     "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
                 )
+            save_tensor_from_pathname(sampling_locations, self.block_name + "6_sampling_locations", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(attn_weights, self.block_name + "7_attention_weights", observe_stat=self.observe_stat)
 
             value = value.transpose(1, 2).contiguous().view(
                 N, self.n_heads, self.d_model // self.n_heads, Len_in
             )
             output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attn_weights)
+            save_tensor_from_pathname(output, self.block_name + "8_core_output", observe_stat=self.observe_stat)
             output = F.linear(output, self.output_proj.weight, self.output_proj.bias)
+            save_tensor_from_pathname(output, self.block_name + "9_output_proj", observe_stat=self.observe_stat)
             return self.qact_output(output, None)
 
         if query_scaling_factor is None:
@@ -774,22 +796,26 @@ class IMSDeformAttn(nn.Module):
 
         if input_padding_mask is not None:
             value = value.masked_fill(input_padding_mask[..., None], 0)
+        save_tensor_from_pathname(value, self.block_name + "3_value_proj", observe_stat=self.observe_stat)
 
         # ── sampling offsets ───────────────────────────────────────────
         sampling_offsets, sampling_scale = self.sampling_offsets(query_int, query_scale)
         sampling_offsets, sampling_scale = self.qact_sampling_offsets(sampling_offsets, sampling_scale)
         # dequant for view + normalizer division (non-quantizable ops)
         sampling_offsets = sampling_offsets.view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+        save_tensor_from_pathname(sampling_offsets, self.block_name + "4_sampling_offsets", observe_stat=self.observe_stat)
 
         # ── attention weights ──────────────────────────────────────────
         attn_weights, attn_scale = self.attention_weights(query_int, query_scale)
         attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        save_tensor_from_pathname(attn_weights, self.block_name + "5_attention_logits", observe_stat=self.observe_stat)
         attn_scale = attn_scale.view(self.n_heads, self.n_levels * self.n_points)
         attn_weights, attn_scale = self.softmax(attn_weights, attn_scale)
         attn_weights = attn_weights.transpose(1, 2).reshape(N * self.n_heads, Len_q, self.n_levels * self.n_points)
         attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
         attn_weights = attn_weights.reshape(N, self.n_heads, Len_q, self.n_levels * self.n_points).transpose(1, 2)
         attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+        save_tensor_from_pathname(attn_weights, self.block_name + "7_attention_weights", observe_stat=self.observe_stat)
 
         # ── sampling locations (float op — not quantizable) ────────────
         if reference_points.shape[-1] == 2:
@@ -809,6 +835,7 @@ class IMSDeformAttn(nn.Module):
             )
         # print(sampling_locations)
         # sampling_locations, sampling_locations_scale = self.qact_sampling_locs(sampling_locations, None)
+        save_tensor_from_pathname(sampling_locations, self.block_name + "6_sampling_locations", observe_stat=self.observe_stat)
 
         # ── deformable attention core ──────────────────────────────────
         value_float = value.transpose(1, 2).contiguous().view(
@@ -824,10 +851,12 @@ class IMSDeformAttn(nn.Module):
             attn_scale,
             qact_sampled_values=self.qact_sampled_values,
         )
+        save_tensor_from_pathname(output, self.block_name + "8_core_output", observe_stat=self.observe_stat)
         output, output_scale = self.qact_output(output, None)
 
         # ── output projection ──────────────────────────────────────────
         output, output_scale = self.output_proj(output, output_scale)
+        save_tensor_from_pathname(output, self.block_name + "9_output_proj", observe_stat=self.observe_stat)
 
         return output, output_scale
 

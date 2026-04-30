@@ -496,7 +496,9 @@ class TransformerDecoderLayer(nn.Module):
         # Decoder Cross-Attention
         self.cross_attn = MSDeformAttn(
             d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points,
-            sampling_mode="nearest" if easy_quantize else "bilinear")
+            sampling_mode="nearest" if easy_quantize else "bilinear",
+            observe_stat=observe_stat,
+            block_name=block_name + "2_cross_attn/")
 
         self.nhead = ca_nhead
 
@@ -558,20 +560,25 @@ class TransformerDecoderLayer(nn.Module):
         save_tensor_from_pathname(tgt, self.block_name + "1_norm1", observe_stat=self.observe_stat)
 
         # ========== Begin of Cross-Attention =============
+        cross_attn_query = self.with_pos_embed(tgt, query_pos)
+        save_tensor_from_pathname(cross_attn_query, self.block_name + "2_cross_attn/0_pre_call_query", observe_stat=self.observe_stat)
+        if hasattr(self.cross_attn, "block_name"):
+            self.cross_attn.block_name = self.block_name + "2_cross_attn/"
         tgt2 = self.cross_attn(
-            self.with_pos_embed(tgt, query_pos),
+            cross_attn_query,
             reference_points,
             memory,
             spatial_shapes,
             level_start_index,
             memory_key_padding_mask
         )
-        save_tensor_from_pathname(tgt2, self.block_name + "2_cross_attn", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(tgt2, self.block_name + "2_cross_attn_output", observe_stat=self.observe_stat)
         # ========== End of Cross-Attention =============
 
         tgt = tgt + self.dropout2(tgt2)
+        save_tensor_from_pathname(tgt, self.block_name + "3_norm2/0_residual_input", observe_stat=self.observe_stat)
         tgt = self.norm2(tgt)
-        save_tensor_from_pathname(tgt, self.block_name + "3_norm2", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(tgt, self.block_name + "3_norm2/1_output", observe_stat=self.observe_stat)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         save_tensor_from_pathname(tgt2, self.block_name + "4_ffn", observe_stat=self.observe_stat)
         tgt = tgt + self.dropout3(tgt2)

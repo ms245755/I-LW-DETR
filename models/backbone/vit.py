@@ -31,13 +31,14 @@ class MyLayerNorm(nn.Module):
     https://github.com/facebookresearch/ConvNeXt/blob/d1fa8f6fef0a165b27399986cc2bdacc92777e40/models/convnext.py#L119
     """
 
-    def __init__(self, normalized_shape, eps=1e-6, observe_stat=None, block_name=""):
+    def __init__(self, normalized_shape, eps=1e-6, observe_stat=False, block_name=""):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
         self.eps = eps
         self.normalized_shape = (normalized_shape,)
         self.block_name = block_name
+        self.observe_stat = observe_stat
 
     def forward(self, x):
         """
@@ -47,15 +48,15 @@ class MyLayerNorm(nn.Module):
         #if x.dtype == torch.half:
         #    x = x / (x.max() + self.eps)
         u = x.mean(-1, keepdim=True)
-        save_tensor_from_pathname(u, self.block_name+"mean", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(u, self.block_name+"mean", observe_stat=self.observe_stat)
         s = (x - u).pow(2).mean(-1, keepdim=True)
-        save_tensor_from_pathname(s, self.block_name+"variance", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(s, self.block_name+"variance", observe_stat=self.observe_stat)
         std = torch.sqrt(s+self.eps)
-        save_tensor_from_pathname(std, self.block_name+"std", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(std, self.block_name+"std", observe_stat=self.observe_stat)
         x = (x - u) / std
-        save_tensor_from_pathname(x, self.block_name+"normalized_x", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"normalized_x", observe_stat=self.observe_stat)
         x = self.weight[None, None, :] * x + self.bias[None, None, :]
-        save_tensor_from_pathname(x, self.block_name+"output", out_dir="observed_tensor/float/")
+        save_tensor_from_pathname(x, self.block_name+"output", observe_stat=self.observe_stat)
         return x
     
 def get_abs_pos(abs_pos, has_cls_token, hw):
@@ -225,7 +226,7 @@ class Block(nn.Module):
             block_name (str): store name of block for visualization
         """
         super().__init__()
-        self.norm1 = norm_layer(dim, block_name=block_name+"0_norm1/")
+        self.norm1 = norm_layer(dim, observe_stat=observe_stat, block_name=block_name+"0_norm1/")
         self.attn = Attention(
             dim,
             num_heads=num_heads,
@@ -236,7 +237,7 @@ class Block(nn.Module):
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = norm_layer(dim, block_name=block_name+"4_norm2/")
+        self.norm2 = norm_layer(dim, observe_stat=observe_stat, block_name=block_name+"4_norm2/")
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
 
         self.window = window
@@ -256,7 +257,7 @@ class Block(nn.Module):
         shortcut = x
         x = self.norm1(x)
         
-        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_norm1", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_norm1_output", observe_stat=self.observe_stat)
 
         if not self.window:
             x = x.reshape(B // 16, 16 * HW, C)
@@ -283,7 +284,7 @@ class Block(nn.Module):
         if self.use_cae:
             shortcut = x
             x = self.norm2(x)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2_output", observe_stat=self.observe_stat)
             x = self.mlp(x)
             save_tensor_from_pathname(x=x, component_path=self.block_name+"5_mlp", observe_stat=self.observe_stat)
             x = x * self.gamma_2
@@ -296,7 +297,7 @@ class Block(nn.Module):
         else:
             shortcut = x
             x = self.norm2(x)
-            save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"4_norm2_output", observe_stat=self.observe_stat)
             x = self.mlp(x)
             save_tensor_from_pathname(x=x, component_path=self.block_name+"5_mlp", observe_stat=self.observe_stat)
             x = self.drop_path(x)

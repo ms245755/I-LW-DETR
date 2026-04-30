@@ -36,7 +36,7 @@ def _get_activation(name, inplace=False, quant=False):
     if name == "gelu":
         return ISegGELU() if quant else nn.GELU()
     if name == "silu":
-        return ISegGELU(temp=1.0) if quant else nn.SiLU()
+        return IViTSiLU() if quant else nn.SiLU()
     if name == "relu":
         return nn.ReLU(inplace=inplace)
     if name in ["LeakyReLU", "leakyrelu", "lrelu"]:
@@ -404,12 +404,23 @@ class IMultiScaleProjector(nn.Module):
 
             feat = feat_fuse
             scale = max_scale
-            feat, scale = _forward_projector_sequence(
-                stage,
-                self.stages_qact_bridge[stage_idx],
-                self.stages_qact_post[stage_idx],
+            for layer_idx, layer in enumerate(stage):
+                feat, scale = _forward_projector_layer(
+                    layer,
+                    feat,
+                    scale,
+                    self.stages_qact_bridge[stage_idx][layer_idx],
+                    self.stages_qact_post[stage_idx][layer_idx],
+                )
+                save_tensor_from_pathname(
+                    feat,
+                    self.block_name + f"stage{stage_idx}/2_stage/layer{layer_idx}",
+                    observe_stat=self.observe_stat,
+                )
+            save_tensor_from_pathname(
                 feat,
-                scale,
+                self.block_name + f"stage{stage_idx}/3_output",
+                observe_stat=self.observe_stat,
             )
             results.append((feat, scale))
 

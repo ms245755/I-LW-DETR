@@ -101,7 +101,7 @@ class ConvX(nn.Module):
         x = self.bn(self.conv(x))
         save_tensor_from_pathname(x, self.block_name+"0_conv", observe_stat=self.observe_stat)
         out = self.act(x)
-        save_tensor_from_pathname(x, self.block_name+"1_act", observe_stat=self.observe_stat)
+        save_tensor_from_pathname(out, self.block_name+"1_act", observe_stat=self.observe_stat)
         return out
 
 
@@ -269,7 +269,16 @@ class MultiScaleProjector(nn.Module):
             # save_tensor_from_pathname(feat_fuse, self.block_name+"feat", "observed_tensor/float/")
             for layer_idx, layer in enumerate(stage):
                 feat_fuse = layer(feat_fuse)
-                # save_tensor_from_pathname(feat_fuse, self.block_name+f"{i}", "observed_tensor/float/")
+                save_tensor_from_pathname(
+                    feat_fuse,
+                    self.block_name + f"stage{stage_idx}/2_stage/layer{layer_idx}",
+                    observe_stat=self.observe_stat,
+                )
+            save_tensor_from_pathname(
+                feat_fuse,
+                self.block_name + f"stage{stage_idx}/3_output",
+                observe_stat=self.observe_stat,
+            )
             results.append(feat_fuse)
 
         if self.use_extra_pool:
