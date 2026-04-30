@@ -46,6 +46,14 @@ read -r -a encoder_quant_component_args <<< "${ENCODER_QUANT_COMPONENTS:-linear 
 read -r -a projector_quant_component_args <<< "${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu silu layernorm}"
 read -r -a transformer_quant_component_args <<< "${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
 
+easy_quantize_args=()
+for component in "${quant_model_component_args[@]}"; do
+  if [[ "$component" == "transformer" ]]; then
+    easy_quantize_args=(--easy_quantize)
+    break
+  fi
+done
+
 export OBSERVED_TENSOR_ROOT="$observed_root"
 
 python demo/demo.py \
@@ -69,6 +77,7 @@ python demo/demo.py \
   --input "$image_path" \
   --output_dir "$output_dir" \
   --observe_stat \
+  "${easy_quantize_args[@]}" \
   --mode quant \
   --quant_model_components "${quant_model_component_args[@]}" \
   --backbone_quant_components "${backbone_quant_component_args[@]}" \

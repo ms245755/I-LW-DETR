@@ -100,6 +100,14 @@ read -r -a encoder_quant_component_args <<< "${ENCODER_QUANT_COMPONENTS:-linear 
 read -r -a projector_quant_component_args <<< "${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu silu layernorm}"
 read -r -a transformer_quant_component_args <<< "${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
 
+easy_quantize_args=()
+for component in "${quant_model_component_args[@]}"; do
+  if [[ "$component" == "transformer" ]]; then
+    easy_quantize_args=(--easy_quantize)
+    break
+  fi
+done
+
 quant_block_args=()
 if [[ "${ENCODER_QUANT_BLOCKS:-all}" != "all" ]]; then
   read -r -a encoder_quant_block_args <<< "${ENCODER_QUANT_BLOCKS}"
@@ -127,6 +135,7 @@ common_args=(
   --confidence_threshold "${CONFIDENCE_THRESHOLD:-0.5}"
   --device "${DEVICE:-cuda}"
   --observe_stat
+  "${easy_quantize_args[@]}"
 )
 
 mkdir -p "$output_root"
