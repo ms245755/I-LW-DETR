@@ -50,8 +50,9 @@ class Backbone(BackboneBase):
         self.name = name
         self.backbone_quant_components = {"vit", "projector"} if backbone_quant_components is None else set(backbone_quant_components)
         self.quant_model_components = {"backbone"} if quant_model_components is None else set(quant_model_components)
-        self.quantize_vit = "vit" in self.backbone_quant_components
-        self.quantize_projector = "projector" in self.backbone_quant_components
+        self.quantize_backbone = "backbone" in self.quant_model_components
+        self.quantize_vit = self.quantize_backbone and "vit" in self.backbone_quant_components
+        self.quantize_projector = self.quantize_backbone and "projector" in self.backbone_quant_components
         self.return_quant_scales = "transformer" in self.quant_model_components
         if 'vit' in name:
             if name == 'vit_tiny':
@@ -87,6 +88,7 @@ class Backbone(BackboneBase):
                 block_name=block_name+"vit/",
                 quant_blocks=encoder_quant_blocks if self.quantize_vit else [],
                 quant_components=encoder_quant_components,
+                quant_stem=self.quantize_vit,
             )
             # load pretrain model in main_process
             if pretrained_encoder is not None:

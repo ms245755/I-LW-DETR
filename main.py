@@ -206,6 +206,10 @@ def get_args_parser():
                         help='use quantization-friendly float components: learned ref pos encoding and nearest deformable sampling')
     parser.add_argument('--decoder_cross_attn_float', default=False, action='store_true',
                         help='keep quantized decoder deformable cross-attention in a float fallback path')
+    parser.add_argument('--decoder_cross_attn_value_per_channel', default=False, action='store_true',
+                        help='use per-channel activation scaling for quantized decoder deformable-attention value projection')
+    parser.add_argument('--decoder_norm_output_qact', default=False, action='store_true',
+                        help='add an activation quantizer after the final quantized decoder norm')
 
     # * Matcher
     parser.add_argument('--set_cost_class', default=2, type=float,
@@ -241,6 +245,8 @@ def get_args_parser():
                         help='epoch interval to save checkpoint')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume_optimizer', default=False, action='store_true',
+                        help='restore optimizer, scheduler, and start epoch from --resume checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
@@ -281,6 +287,8 @@ def get_args_parser():
                         help='url used to set up distributed training')
     parser.add_argument('--sync_bn', default=True, type=bool,
                         help='setup synchronized BatchNorm for distributed training')
+    parser.add_argument('--find_unused_parameters', default=False, action='store_true',
+                        help='enable unused parameter detection in DistributedDataParallel')
     
     # fp16
     parser.add_argument('--fp16_eval', default=False, action='store_true',
@@ -322,6 +330,7 @@ def main(args):
 
     if args.calib or args.qat:
         model, criterion, postprocessors = build_model_quant(args)
+
     else:
         model, criterion, postprocessors = build_model(args)
     model.to(device)
@@ -335,7 +344,11 @@ def main(args):
     if args.distributed:
         if args.sync_bn:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            find_unused_parameters=args.find_unused_parameters,
+        )
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -406,7 +419,13 @@ def main(args):
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         teacher_checkpoint_state = dict(checkpoint['model'])
-        if (args.qat or args.calib) and args.backbone_quant_components is not None and 'projector' in set(args.backbone_quant_components):
+        quant_model_components = set(args.quant_model_components or [])
+        backbone_quant_components = set(args.backbone_quant_components or [])
+        if (
+            (args.qat or args.calib)
+            and 'backbone' in quant_model_components
+            and 'projector' in backbone_quant_components
+        ):
             checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
         checkpoint['model'] = adapt_checkpoint_keys_for_model(checkpoint['model'], model_without_ddp)
         stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
@@ -419,10 +438,13 @@ def main(args):
             else:
                 del ema_m
                 ema_m = ModelEma(model) 
-        if not args.eval and not args.qat and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+        resume_training_state = not args.eval and (
+            args.resume_optimizer or not args.qat
+        )
+        if resume_training_state and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             checkpoint['optimizer']["param_groups"] = optimizer.state_dict()["param_groups"]
-            checkpoint['lr_scheduler'].pop("step_size")
-            checkpoint['lr_scheduler'].pop("_last_lr")
+            checkpoint['lr_scheduler'].pop("step_size", None)
+            checkpoint['lr_scheduler'].pop("_last_lr", None)
             
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -437,7 +459,7 @@ def main(args):
     
     if args.calib:
         # 1) calibrate using val set (or train set). val is usually fine.
-        num_calib_batch = 50
+        num_calib_batch = 200
         calib_loader = make_random_calib_loader(
             dataset_val,
             batch_size=1,

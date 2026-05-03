@@ -597,18 +597,27 @@ def build(args):
         num_classes = 366
     device = torch.device(args.device)
 
+    quant_model_components = set(getattr(args, "quant_model_components", ["backbone"]) or [])
+    transformer_quant_components = _component_set(getattr(args, "transformer_quant_components", None))
+    lwdetr_quant_components = _component_set(getattr(args, "lwdetr_quant_components", None))
+    quantize_transformer = "transformer" in quant_model_components and bool(transformer_quant_components)
+    quantize_lwdetr = bool(lwdetr_quant_components)
+
+    effective_quant_model_components = set(quant_model_components)
+    if not quantize_transformer:
+        effective_quant_model_components.discard("transformer")
+    args.quant_model_components = list(effective_quant_model_components)
+
     backbone = build_backbone(args)
 
     args.num_feature_levels = len(args.projector_scale)
-    quant_model_components = set(getattr(args, "quant_model_components", ["backbone"]) or [])
-    quantize_transformer = "transformer" in quant_model_components
     transformer = build_quant_transformer(args) if quantize_transformer else build_float_transformer(args)
-    print(quant_model_components)
-    model_cls = ILWDETR if quantize_transformer else LWDETR
+    print(effective_quant_model_components)
+    model_cls = ILWDETR if (quantize_transformer or quantize_lwdetr) else LWDETR
 
     model_kwargs = {}
     model_kwargs["block_name"] = "observed_tensor/quant/lwdetr/"
-    if quantize_transformer:
+    if model_cls is ILWDETR:
         model_kwargs["lwdetr_quant_components"] = getattr(args, "lwdetr_quant_components", None)
     model = model_cls(
         backbone,

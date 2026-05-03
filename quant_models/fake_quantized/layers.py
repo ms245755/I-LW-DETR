@@ -187,16 +187,19 @@ class IViTAct(nn.Module):
             raise ValueError("unknown quant mode: {}".format(self.quant_mode))
 
     def __repr__(self):
+        min_val = self.min_val.min().item() if self.min_val.numel() > 1 else self.min_val.item()
+        max_val = self.max_val.max().item() if self.max_val.numel() > 1 else self.max_val.item()
         return (
             "{0}(activation_bit={1}, "
-            "quant_mode: {2}, observer_mode: {3}, "
-            "Act_min: {4:.2f}, Act_max: {5:.2f})".format(
+            "quant_mode: {2}, observer_mode: {3}, per_channel: {4}, "
+            "Act_min: {5:.2f}, Act_max: {6:.2f})".format(
                 self.__class__.__name__,
                 self.activation_bit,
                 self.quant_mode,
                 self.observer_mode,
-                self.min_val.item(),
-                self.max_val.item(),
+                self.per_channel,
+                min_val,
+                max_val,
             )
         )
 
@@ -220,6 +223,19 @@ class IViTAct(nn.Module):
         """
         self.running_stat = True
 
+    def _broadcast_scale(self, scale, x):
+        if scale.numel() == 1:
+            return scale
+        if x.dim() == 2:
+            return scale.view(1, -1)
+        if x.dim() == 3:
+            return scale.view(1, 1, -1)
+        if x.dim() == 4:
+            return scale.view(1, -1, 1, 1)
+        if x.dim() == 1:
+            return scale
+        raise NotImplementedError
+
     def forward(self, x, act_scaling_factor=None, x_2=None, act_scaling_factor_2=None):
         # collect runnng stats
         with torch.no_grad():
@@ -241,8 +257,9 @@ class IViTAct(nn.Module):
                     cur_max = v.max(dim=1).values
                 else:
                     raise ValueError("unknown observer_mode: {}".format(self.observer_mode))
-                cur_min = cur_min.min()
-                cur_max = cur_max.max()
+                if not self.per_channel:
+                    cur_min = cur_min.min()
+                    cur_max = cur_max.max()
                 if self.n_batches.item() == 0:
                     self.min_val = cur_min
                     self.max_val = cur_max
@@ -280,8 +297,9 @@ class IViTAct(nn.Module):
             )
 
         correct_output_scale = self.act_scaling_factor.view(-1)
+        output_scale = self._broadcast_scale(correct_output_scale, x)
 
-        return quant_act_int * correct_output_scale, correct_output_scale
+        return quant_act_int * output_scale, correct_output_scale
 
 
 @track_init_args
@@ -303,6 +321,8 @@ class IViTMatMul(nn.Module):
     def forward(self, A, pre_act_scaling_factor_A, B, pre_act_scaling_factor_B):
         A = round_ste.apply(A / pre_act_scaling_factor_A)
         B = round_ste.apply(B / pre_act_scaling_factor_B)
+        # A = A / pre_act_scaling_factor_A
+        # B = B / pre_act_scaling_factor_B
         act_scaling_factor = pre_act_scaling_factor_A * pre_act_scaling_factor_B
         self.act_scaling_factor = act_scaling_factor
         out = A @ B

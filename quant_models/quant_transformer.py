@@ -75,7 +75,7 @@ class ScaleSoftmax(nn.Module):
 
 
 class ScaleMSDeformAttn(MSDeformAttn):
-    def __init__(self, *args, use_float_path=False, observe_stat=False, block_name="", **kwargs):
+    def __init__(self, *args, use_float_path=False, value_per_channel=False, observe_stat=False, block_name="", **kwargs):
         super().__init__(*args, **kwargs)
         self.observe_stat = observe_stat
         self.block_name = block_name
@@ -247,6 +247,8 @@ class Transformer(nn.Module):
                  decoder_norm_type='LN',
                  bbox_reparam=False,
                  decoder_cross_attn_float=False,
+                 decoder_cross_attn_value_per_channel=False,
+                 decoder_norm_output_qact=False,
                  transformer_quant_components=None,
                  observe_stat=False,
                  block_name="observed_tensor/quant/transformer/"):
@@ -262,6 +264,7 @@ class Transformer(nn.Module):
                                                 num_feature_levels=num_feature_levels,
                                                 dec_n_points=dec_n_points,
                                                 decoder_cross_attn_float=decoder_cross_attn_float,
+                                                decoder_cross_attn_value_per_channel=decoder_cross_attn_value_per_channel,
                                                 skip_self_attn=False,
                                                 quant_components=self.quant_components,
                                                 observe_stat=observe_stat,
@@ -279,6 +282,7 @@ class Transformer(nn.Module):
                                           lite_refpoint_refine=lite_refpoint_refine,
                                           easy_quantize=easy_quantize,
                                           bbox_reparam=bbox_reparam,
+                                          norm_output_qact=decoder_norm_output_qact,
                                           quant_components=self.quant_components,
                                           observe_stat=observe_stat,
                                           block_name=block_name + "2_decoder/")
@@ -477,6 +481,7 @@ class TransformerDecoder(nn.Module):
                  lite_refpoint_refine=False,
                  easy_quantize=False,
                  bbox_reparam=False,
+                 norm_output_qact=False,
                  quant_components=None,
                  observe_stat=False,
                  block_name=""):
@@ -490,6 +495,7 @@ class TransformerDecoder(nn.Module):
         self.lite_refpoint_refine = lite_refpoint_refine
         self.easy_quantize = easy_quantize
         self.bbox_reparam = bbox_reparam
+        self.norm_output_qact = norm_output_qact
         self.observe_stat = observe_stat
         self.block_name = block_name
 
@@ -499,6 +505,7 @@ class TransformerDecoder(nn.Module):
         self.ref_point_coord_proj = IMLP(4, d_model, 2 * d_model, 2, quant_components=self.quant_components) if easy_quantize else None
         self.qact_sine_embed = IViTAct()
         self.qact_norm_input = IViTAct()
+        self.qact_norm_output = IViTAct()
         self._export = False
     
     def export(self):
@@ -510,8 +517,12 @@ class TransformerDecoder(nn.Module):
         if isinstance(self.norm, IViTLayerNorm) and scale is None:
             x, scale = self.qact_norm_input(x, None)
         if isinstance(self.norm, (IViTLayerNorm, ScaleLayerNorm)):
-            return self.norm(x, scale)
-        return self.norm(x), scale
+            x, scale = self.norm(x, scale)
+        else:
+            x = self.norm(x)
+        if self.norm_output_qact:
+            return self.qact_norm_output(x, scale)
+        return x, scale
 
     def refpoints_refine(self, refpoints_unsigmoid, refpoints_scale, new_refpoints_delta, new_refpoints_delta_scale):
         if self.bbox_reparam:
@@ -749,6 +760,7 @@ class TransformerDecoderLayer(nn.Module):
                  activation="relu", normalize_before=False, group_detr=1, 
                  num_feature_levels=4, dec_n_points=4,
                  decoder_cross_attn_float=False,
+                 decoder_cross_attn_value_per_channel=False,
                  skip_self_attn=False,
                  quant_components=None,
                  observe_stat=False,
@@ -767,6 +779,7 @@ class TransformerDecoderLayer(nn.Module):
         self.cross_attn = cross_attn_cls(
             d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points,
             use_float_path=decoder_cross_attn_float,
+            value_per_channel=decoder_cross_attn_value_per_channel,
             observe_stat=observe_stat,
             block_name=block_name + "2_cross_attn/")
 
@@ -809,6 +822,11 @@ class TransformerDecoderLayer(nn.Module):
             return norm(x, scale)
         return norm(x), scale
 
+    def _qact_before_norm(self, norm, qact, x, scale):
+        if isinstance(norm, IViTLayerNorm):
+            return qact(x, scale)
+        return x, scale
+
     def forward_post(self, tgt, query_scale, memory, memory_scale,
                      tgt_mask: Optional[Tensor] = None,
                      memory_mask: Optional[Tensor] = None,
@@ -844,6 +862,7 @@ class TransformerDecoderLayer(nn.Module):
         # ========== End of Self-Attention =============
 
         tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout1(tgt2), tgt2_scale)
+        tgt, query_scale = self._qact_before_norm(self.norm1, self.qact_norm1_input, tgt, query_scale)
         tgt, query_scale = self._apply_norm(self.norm1, self.qact_norm1_input, tgt, query_scale)
         tgt, query_scale = self.qact_self_attn_block(tgt, query_scale)
         save_tensor_from_pathname(tgt, self.block_name + "1_norm1", observe_stat=self.observe_stat)
@@ -868,6 +887,7 @@ class TransformerDecoderLayer(nn.Module):
 
         tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout2(tgt2), tgt2_scale)
         save_tensor_from_pathname(tgt, self.block_name + "3_norm2/0_residual_input", observe_stat=self.observe_stat)
+        tgt, query_scale = self._qact_before_norm(self.norm2, self.qact_norm2_input, tgt, query_scale)
         tgt, query_scale = self._apply_norm(self.norm2, self.qact_norm2_input, tgt, query_scale)
         tgt, query_scale = self.qact_cross_attn_block(tgt, query_scale)
         save_tensor_from_pathname(tgt, self.block_name + "3_norm2/1_output", observe_stat=self.observe_stat)
@@ -879,6 +899,7 @@ class TransformerDecoderLayer(nn.Module):
         tgt2, tgt2_scale = self.qact_ffn_2(tgt2, tgt2_scale)
         save_tensor_from_pathname(tgt2, self.block_name + "4_ffn", observe_stat=self.observe_stat)
         tgt, query_scale = _add_tensor_scale(tgt, query_scale, self.dropout3(tgt2), tgt2_scale)
+        tgt, query_scale = self._qact_before_norm(self.norm3, self.qact_norm3_input, tgt, query_scale)
         tgt, query_scale = self._apply_norm(self.norm3, self.qact_norm3_input, tgt, query_scale)
         tgt, query_scale = self.qact_ffn_block(tgt, query_scale)
         save_tensor_from_pathname(tgt, self.block_name + "5_norm3", observe_stat=self.observe_stat)
@@ -932,6 +953,8 @@ def build_transformer(args):
         decoder_norm_type=args.decoder_norm,
         bbox_reparam=args.bbox_reparam,
         decoder_cross_attn_float=getattr(args, "decoder_cross_attn_float", False),
+        decoder_cross_attn_value_per_channel=getattr(args, "decoder_cross_attn_value_per_channel", False),
+        decoder_norm_output_qact=getattr(args, "decoder_norm_output_qact", False),
         transformer_quant_components=getattr(args, "transformer_quant_components", None),
         observe_stat=getattr(args, "observe_stat", False),
     )

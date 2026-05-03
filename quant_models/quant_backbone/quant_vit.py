@@ -99,6 +99,7 @@ class IViT(nn.Module):
         block_name = "",
         quant_blocks=None,
         quant_components=None,
+        quant_stem=True,
     ):
         """
         Args:
@@ -126,6 +127,7 @@ class IViT(nn.Module):
         """
         super().__init__()
         self.pretrain_use_cls_token = pretrain_use_cls_token
+        self.quant_stem = quant_stem
         self.quant_blocks = set(range(depth)) if quant_blocks is None else set(quant_blocks)
         self.quant_components = _component_set(quant_components)
         self.block_is_quant = []
@@ -138,7 +140,7 @@ class IViT(nn.Module):
             num_bits=num_bits,
             observe_stat = observe_stat,
             block_name = block_name + "1_patchembed/",
-            quant_components=self.quant_components,
+            quant_components=self.quant_components if self.quant_stem else [],
         )
 
         if use_abs_pos:
@@ -228,7 +230,9 @@ class IViT(nn.Module):
 
     def forward(self, x):
         save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", observe_stat=self.observe_stat)
-        x, act_scaling_factor = self.qact_input(x=x, act_scaling_factor=None)
+        act_scaling_factor = None
+        if self.quant_stem:
+            x, act_scaling_factor = self.qact_input(x=x, act_scaling_factor=None)
 
         x, act_scaling_factor = self.patch_embed(x, act_scaling_factor)
 

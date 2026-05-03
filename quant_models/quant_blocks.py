@@ -113,9 +113,9 @@ class IFeedForward(nn.Module):
         self.quant_gelu = "gelu" in self.quant_components
         linear_cls = IViTLinear if self.quant_linear else nn.Linear
         self.fc1 = linear_cls(in_features=dim, out_features=hidden_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, hidden_dim)
-        self.act = ISegGELU(output_bit=num_bits, n=gelu_n, lambda_scaler=gelu_lambda)
+        self.act = ISegGELU(output_bit=16, n=gelu_n, lambda_scaler=gelu_lambda)
         self.act_fp = IViTGELU(output_bit=num_bits)
-        self.act_no_lambda = IViTGELU(output_bit=num_bits)
+        self.act_no_lambda = IViTGELU(output_bit=16)
         if out_dim is None:
             out_dim = dim
         self.fc2 = linear_cls(in_features=hidden_dim, out_features=out_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(hidden_dim, out_dim)
@@ -126,7 +126,7 @@ class IFeedForward(nn.Module):
         self.qact_fc1_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_pre_gelu = IViTAct(activation_bit=num_bits)
         self.qact_gelu_input_bridge = IViTAct(activation_bit=num_bits)
-        self.qact_post_gelu = IViTAct(activation_bit=num_bits)
+        self.qact_post_gelu = IViTAct(activation_bit=16)
         self.qact_fc2_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_drop2_stub = IViTAct(activation_bit=num_bits*2)
 
@@ -247,8 +247,10 @@ class IAttention(nn.Module):
         self.qact_q = IViTAct(activation_bit=num_bits)
         self.qact_k = IViTAct(activation_bit=num_bits)
         self.qact_v = IViTAct(activation_bit=num_bits)
-        self.qact_attn_out = IViTAct(activation_bit=num_bits)
-        self.qact_attn_matmul_bridge = IViTAct(activation_bit=num_bits)
+        self.qact_attn_out = IViTAct(activation_bit=16)
+        self.qact_attn_matmul_bridge = IViTAct(activation_bit=16)
+        self.qact_qk_matmul_out = IViTAct(activation_bit=num_bits)
+        self.qact_av_matmul_out = IViTAct(activation_bit=num_bits)
         self.qact_pre_proj = IViTAct(activation_bit=num_bits)
         self.qact_proj_drop = IViTAct(activation_bit=num_bits)
 
@@ -299,12 +301,12 @@ class IAttention(nn.Module):
 
         # Attention scores
         if self.quant_matmul:
-            if act_scaling_factor_qkv is None:
-                q, scale_q = self.qact_q(x=q, act_scaling_factor=None)
-                k, scale_k = self.qact_k(x=k, act_scaling_factor=None)
-            else:
-                scale_q = act_scaling_factor_qkv
-                scale_k = act_scaling_factor_qkv
+            # q/k/v are [B_window, heads, tokens, head_dim].  The preceding
+            # qkv projection has one concatenated scale, but Q, K, and V often
+            # have different ranges after window attention reshaping and CAE
+            # bias injection, so calibrate them separately for attention matmul.
+            q, scale_q = self.qact_q(x=q, act_scaling_factor=None)
+            k, scale_k = self.qact_k(x=k, act_scaling_factor=None)
             attn, act_scaling_factor = self.matmul(
                 A=q,
                 pre_act_scaling_factor_A=scale_q,
@@ -319,6 +321,11 @@ class IAttention(nn.Module):
         attn = attn * self.scale
         if act_scaling_factor is not None:
             act_scaling_factor = act_scaling_factor * self.scale
+        if self.quant_matmul:
+            attn, act_scaling_factor = self.qact_qk_matmul_out(
+                x=attn,
+                act_scaling_factor=act_scaling_factor,
+            )
 
         # Quantize + softmax
         save_tensor_from_pathname(attn, self.block_name+"1_attn", observe_stat=self.observe_stat)
@@ -334,13 +341,16 @@ class IAttention(nn.Module):
         if self.quant_matmul:
             if act_scaling_factor is None:
                 attn, act_scaling_factor = self.qact_attn_matmul_bridge(x=attn, act_scaling_factor=None)
-            if act_scaling_factor_qkv is None:
-                v, act_scaling_factor_qkv = self.qact_v(x=v, act_scaling_factor=None)
+            v, scale_v = self.qact_v(x=v, act_scaling_factor=None)
             x, act_scaling_factor = self.matmul(
                 A=attn,
                 pre_act_scaling_factor_A=act_scaling_factor,
                 B=v,
-                pre_act_scaling_factor_B=act_scaling_factor_qkv,
+                pre_act_scaling_factor_B=scale_v,
+            )
+            x, act_scaling_factor = self.qact_av_matmul_out(
+                x=x,
+                act_scaling_factor=act_scaling_factor,
             )
         else:
             x = attn @ v
@@ -651,6 +661,7 @@ class IMSDeformAttn(nn.Module):
         n_heads=8,
         n_points=4,
         use_float_path=False,
+        value_per_channel=False,
         observe_stat=False,
         block_name="",
     ):
@@ -671,6 +682,7 @@ class IMSDeformAttn(nn.Module):
         self.n_heads  = n_heads
         self.n_points = n_points
         self.use_float_path = use_float_path
+        self.value_per_channel = value_per_channel
         self.observe_stat = observe_stat
         self.block_name = block_name
 
@@ -685,7 +697,7 @@ class IMSDeformAttn(nn.Module):
         # one per linear output — each produces its own scale
         self.qact_input            = IViTAct()   # quantize input_flatten
         self.qact_query            = IViTAct()   # quantize query
-        self.qact_value            = IViTAct()   # after value_proj
+        self.qact_value            = IViTAct(per_channel=value_per_channel)   # after value_proj
         self.qact_reference_points = IViTAct()   # quantize reference point coordinates
         self.qact_sampling_offsets = IViTAct()   # after sampling_offsets
         self.qact_sampling_locs    = IViTAct()   # quantize sampling locations
@@ -891,7 +903,8 @@ def quant_grid_sample_nearest(value, value_scale, sampling_grid):
 
     Args:
         value: Tensor of shape [B, C, H, W], already fake-quantized.
-        value_scale: Per-channel or scalar activation scale for `value`.
+        value_scale: Scalar, per-channel [C], or per-sample-channel [B, C]
+            activation scale for `value`.
         sampling_grid: Tensor of shape [B, Len_q, P, 2] in normalized [-1, 1].
 
     Returns:
@@ -901,7 +914,14 @@ def quant_grid_sample_nearest(value, value_scale, sampling_grid):
     B, C, H, W = value.shape
 
     if torch.is_tensor(value_scale) and value_scale.numel() > 1:
-        scale = value_scale.reshape(1, C, 1, 1)
+        if value_scale.numel() == C:
+            scale = value_scale.reshape(1, C, 1, 1)
+        elif value_scale.numel() == B * C:
+            scale = value_scale.reshape(B, C, 1, 1)
+        else:
+            raise RuntimeError(
+                f"value_scale with {value_scale.numel()} elements cannot broadcast to value shape {tuple(value.shape)}"
+            )
     elif torch.is_tensor(value_scale):
         scale = value_scale.to(device=value.device, dtype=value.dtype).reshape(1, 1, 1, 1)
     else:
