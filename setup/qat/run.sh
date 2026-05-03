@@ -5,6 +5,11 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../common.sh
 source "$script_dir/../common.sh"
 
+if [[ $# -eq 3 ]]; then
+  export MODEL_SIZE="$1"
+  shift
+fi
+
 if [[ $# -ne 2 ]]; then
   usage_common "setup/qat/run.sh"
   echo "Set SCENARIO to one of: vit_only, vit_projector, vit_projector_transformer_float_head, fully_quantized" >&2
@@ -37,6 +42,30 @@ act_observer="${ACT_OBSERVER:-ema_minmax}"
 act_percentile="${ACT_PERCENTILE:-99.9}"
 output_root="${OUTPUT_ROOT:-output}"
 output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_qat_${scenario_label}_${model_size}}"
+resume_optimizer="${RESUME_OPTIMIZER:-false}"
+decoder_cross_attn_float="${DECODER_CROSS_ATTN_FLOAT:-false}"
+decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-false}"
+decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
+
+resume_optimizer_args=()
+if [[ "$resume_optimizer" == "1" || "$resume_optimizer" == "true" || "$resume_optimizer" == "yes" ]]; then
+  resume_optimizer_args=(--resume_optimizer)
+fi
+
+decoder_cross_attn_float_args=()
+if [[ "$decoder_cross_attn_float" == "1" || "$decoder_cross_attn_float" == "true" || "$decoder_cross_attn_float" == "yes" ]]; then
+  decoder_cross_attn_float_args=(--decoder_cross_attn_float)
+fi
+
+decoder_cross_attn_value_per_channel_args=()
+if [[ "$decoder_cross_attn_value_per_channel" == "1" || "$decoder_cross_attn_value_per_channel" == "true" || "$decoder_cross_attn_value_per_channel" == "yes" ]]; then
+  decoder_cross_attn_value_per_channel_args=(--decoder_cross_attn_value_per_channel)
+fi
+
+decoder_norm_output_qact_args=()
+if [[ "$decoder_norm_output_qact" == "1" || "$decoder_norm_output_qact" == "true" || "$decoder_norm_output_qact" == "yes" ]]; then
+  decoder_norm_output_qact_args=(--decoder_norm_output_qact)
+fi
 
 pretrain_keys_modify_to_load=(
   transformer.enc_out_class_embed.0.weight
@@ -92,5 +121,10 @@ python -u -m torch.distributed.launch \
   --pretrain_weights "$pretrain_weights" \
   --resume "$resume" \
   --qat \
+  --find_unused_parameters \
+  "${resume_optimizer_args[@]}" \
+  "${decoder_cross_attn_float_args[@]}" \
+  "${decoder_cross_attn_value_per_channel_args[@]}" \
+  "${decoder_norm_output_qact_args[@]}" \
   --pretrain_keys_modify_to_load "${pretrain_keys_modify_to_load[@]}" \
   --output_dir "$output_dir"
