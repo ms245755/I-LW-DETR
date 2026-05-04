@@ -35,17 +35,33 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as F
 import tqdm
 
-import pycuda.driver as cuda
-import pycuda.autoinit
 import onnxruntime as nxrun
-import tensorrt as trt
+
+try:
+    import tensorrt as trt
+except ImportError:
+    trt = None
+
+try:
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+except ImportError:
+    cuda = None
 
 
 def parser_args():
     parser = argparse.ArgumentParser('performance benchmark tool for onnx/trt model')
     parser.add_argument('--path', type=str, help='engine file path')
     parser.add_argument('--coco_path', type=str, default="data/coco", help='coco dataset path')
+    parser.add_argument('--image_dir', type=str, default=None,
+                        help='COCO image directory. Defaults to coco_path/val2017 or coco_path/images/val2017')
     parser.add_argument('--device', default=0, type=int)
+    parser.add_argument('--img_size', default=640, type=int, help='square resize used by the exported ONNX model')
+    parser.add_argument('--max_images', default=None, type=int, help='limit COCO images for quick validation')
+    parser.add_argument('--providers', nargs='*', default=None,
+                        help='ONNX Runtime providers, e.g. CUDAExecutionProvider CPUExecutionProvider')
+    parser.add_argument('--disable_ort_optimizations', action='store_true',
+                        help='Disable ONNX Runtime graph optimizations for troubleshooting quantized models')
     parser.add_argument('--run_benchmark', action='store_true', help='repeat the inference to benchmark the latency')
     parser.add_argument('--disable_eval', action='store_true', help='disable evaluation')
     return parser.parse_args()
@@ -192,6 +208,15 @@ def get_image_list(ann_file):
     return data['images']
 
 
+def resolve_image_dir(coco_path, image_dir=None):
+    if image_dir is not None:
+        return image_dir
+    direct = osp.join(coco_path, 'val2017')
+    if osp.isdir(direct):
+        return direct
+    return osp.join(coco_path, 'images/val2017')
+
+
 def load_image(file_path):
     return Image.open(file_path).convert("RGB")
 
@@ -270,13 +295,13 @@ class SquareResize(object):
         return rescaled_img, target
 
 
-def infer_transforms():
+def infer_transforms(img_size=640):
     normalize = Compose([
         ToTensor(),
         Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     return Compose([
-        SquareResize([640]),
+        SquareResize([img_size]),
         normalize,
     ])
 
@@ -312,13 +337,13 @@ def post_process(outputs, target_sizes):
     return results
 
 
-def infer_onnx(sess, coco_evaluator, time_profile, prefix, img_list, device, repeats=1):
+def infer_onnx(sess, coco_evaluator, time_profile, prefix, img_list, device, repeats=1, img_size=640):
     time_list = []
     for img_dict in tqdm.tqdm(img_list):
         image = load_image(os.path.join(prefix, img_dict['file_name']))
         width, height = image.size
         orig_target_sizes = torch.Tensor([height, width])
-        image_tensor, _ = infer_transforms()(image, None)  # target is None
+        image_tensor, _ = infer_transforms(img_size)(image, None)  # target is None
 
         samples = image_tensor[None].numpy()
         
@@ -349,13 +374,13 @@ def infer_onnx(sess, coco_evaluator, time_profile, prefix, img_list, device, rep
         print(stats)
 
 
-def infer_engine(model, coco_evaluator, time_profile, prefix, img_list, device, repeats=1):
+def infer_engine(model, coco_evaluator, time_profile, prefix, img_list, device, repeats=1, img_size=640):
     time_list = []
     for img_dict in tqdm.tqdm(img_list):
         image = load_image(os.path.join(prefix, img_dict['file_name']))
         width, height = image.size
         orig_target_sizes = torch.Tensor([height, width])
-        image_tensor, _ = infer_transforms()(image, None)  # target is None
+        image_tensor, _ = infer_transforms(img_size)(image, None)  # target is None
 
         samples = image_tensor[None].to(device)
         _, _, h, w = samples.shape
@@ -390,6 +415,12 @@ class TRTInference(object):
     """TensorRT inference engine
     """
     def __init__(self, engine_path='dino.engine', device='cuda:0', sync_mode:bool=False, max_batch_size=32, verbose=False):
+        if trt is None:
+            raise ImportError("TensorRT is required for .engine benchmarking.")
+        if not sync_mode and cuda is None:
+            raise ImportError("PyCUDA is required only for async TensorRT benchmarking. Use sync_mode=True without PyCUDA.")
+        if torch.cuda.is_available():
+            torch.cuda.init()
         self.engine_path = engine_path
         self.device = device
         self.sync_mode = sync_mode
@@ -557,7 +588,9 @@ def main(args):
 
     coco_gt = osp.join(args.coco_path, 'annotations/instances_val2017.json')
     img_list = get_image_list(coco_gt)
-    prefix = osp.join(args.coco_path, 'val2017')
+    if args.max_images is not None:
+        img_list = img_list[:args.max_images]
+    prefix = resolve_image_dir(args.coco_path, args.image_dir)
     if args.run_benchmark:
         repeats = 10
         print('Inference for each image will be repeated 10 times to obtain '
@@ -571,13 +604,19 @@ def main(args):
         coco_evaluator = CocoEvaluator(coco_gt, ('bbox',))
     
     time_profile = TimeProfiler()
+    eval_device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
 
     if args.path.endswith(".onnx"):
-        sess = nxrun.InferenceSession(args.path)
-        infer_onnx(sess, coco_evaluator, time_profile, prefix, img_list, device=f'cuda:{args.device}', repeats=repeats)
+        sess_options = nxrun.SessionOptions()
+        if args.disable_ort_optimizations:
+            sess_options.graph_optimization_level = nxrun.GraphOptimizationLevel.ORT_DISABLE_ALL
+        sess = nxrun.InferenceSession(args.path, sess_options=sess_options, providers=args.providers)
+        infer_onnx(sess, coco_evaluator, time_profile, prefix, img_list, device=eval_device,
+                   repeats=repeats, img_size=args.img_size)
     elif args.path.endswith(".engine"):
         model = TRTInference(args.path, sync_mode=True, device=f'cuda:{args.device}')
-        infer_engine(model, coco_evaluator, time_profile, prefix, img_list, device=f'cuda:{args.device}', repeats=repeats)
+        infer_engine(model, coco_evaluator, time_profile, prefix, img_list, device=f'cuda:{args.device}',
+                     repeats=repeats, img_size=args.img_size)
     else:
         raise NotImplementedError('Only model file names ending with ".onnx" and ".engine" are supported.')
 

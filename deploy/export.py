@@ -73,7 +73,7 @@ def export_onnx(model, args, input_names, input_tensors, output_names, dynamic_a
         input_names=input_names,
         output_names=output_names,
         export_params=True,
-        keep_initializers_as_inputs=True,
+        keep_initializers_as_inputs=False,
         do_constant_folding=True,
         verbose=args.verbose,
         opset_version=args.opset_version,
