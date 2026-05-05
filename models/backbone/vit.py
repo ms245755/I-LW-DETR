@@ -48,13 +48,9 @@ class MyLayerNorm(nn.Module):
         #if x.dtype == torch.half:
         #    x = x / (x.max() + self.eps)
         u = x.mean(-1, keepdim=True)
-        save_tensor_from_pathname(u, self.block_name+"mean", observe_stat=self.observe_stat)
         s = (x - u).pow(2).mean(-1, keepdim=True)
-        save_tensor_from_pathname(s, self.block_name+"variance", observe_stat=self.observe_stat)
         std = torch.sqrt(s+self.eps)
-        save_tensor_from_pathname(std, self.block_name+"std", observe_stat=self.observe_stat)
         x = (x - u) / std
-        save_tensor_from_pathname(x, self.block_name+"normalized_x", observe_stat=self.observe_stat)
         x = self.weight[None, None, :] * x + self.bias[None, None, :]
         save_tensor_from_pathname(x, self.block_name+"output", observe_stat=self.observe_stat)
         return x

@@ -40,7 +40,7 @@ case "$quant_scope" in
   vit)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit}"
     quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
-    stats_components=(vit)
+    stats_components=(vit projector)
     ;;
   vit_projector)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"

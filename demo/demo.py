@@ -163,6 +163,12 @@ def get_args_parser():
     parser.add_argument('--bbox_reparam', action='store_true')
     parser.add_argument('--easy_quantize', action='store_true',
                         help='use quantization-friendly float components: learned ref pos encoding and nearest deformable sampling')
+    parser.add_argument('--decoder_cross_attn_float', default=False, action='store_true',
+                        help='keep quantized decoder deformable cross-attention in a float fallback path')
+    parser.add_argument('--decoder_cross_attn_value_per_channel', default=False, action='store_true',
+                        help='use per-channel activation scaling for quantized decoder deformable-attention value projection')
+    parser.add_argument('--decoder_norm_output_qact', default=False, action='store_true',
+                        help='add an activation quantizer after the final quantized decoder norm')
 
     # * Dataset infomation
     parser.add_argument('--dataset_file', default='coco')
@@ -239,16 +245,71 @@ def preprocess_image(image_path):
 
 def visualize_detections(image, boxes, labels, scores, conf_thresh, output_path):
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
+    image_w, image_h = image.size
+    line_width = max(2, min(image_w, image_h) // 180)
+    font_size = max(12, min(22, min(image_w, image_h) // 22))
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except OSError:
+        font = ImageFont.load_default()
+
+    def text_size(text):
+        if hasattr(draw, "textbbox"):
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            return right - left, bottom - top
+        return draw.textsize(text, font=font)
+
+    occupied_labels = []
 
     for box, label, score in zip(boxes, labels, scores):
         if score > conf_thresh:
             xmin, ymin, xmax, ymax = map(int, box)
+            xmin = max(0, min(xmin, image_w - 1))
+            ymin = max(0, min(ymin, image_h - 1))
+            xmax = max(0, min(xmax, image_w - 1))
+            ymax = max(0, min(ymax, image_h - 1))
+            if xmax <= xmin or ymax <= ymin:
+                continue
 
-            draw.rectangle([xmin, ymin, xmax, ymax], outline="green", width=2)
+            draw.rectangle([xmin, ymin, xmax, ymax], outline="green", width=line_width)
 
             text = f"{COCO_CLASSES[label]} {score:.2f}"
-            draw.text((xmin, ymin - 10), text, fill="green", font=font)
+            text_w, text_h = text_size(text)
+            pad_x = max(2, line_width)
+            pad_y = max(1, line_width // 2)
+            label_w = text_w + 2 * pad_x
+            label_h = text_h + 2 * pad_y
+
+            label_x = max(0, min(xmin, image_w - label_w))
+            label_y = ymin - label_h - line_width
+            if label_y < 0:
+                label_y = ymin + line_width
+            label_y = max(0, min(label_y, image_h - label_h))
+
+            label_box = [label_x, label_y, label_x + label_w, label_y + label_h]
+            for _ in range(8):
+                overlaps = any(
+                    label_box[0] < old[2]
+                    and label_box[2] > old[0]
+                    and label_box[1] < old[3]
+                    and label_box[3] > old[1]
+                    for old in occupied_labels
+                )
+                if not overlaps:
+                    break
+                next_y = label_box[3] + line_width
+                if next_y + label_h > image_h:
+                    break
+                label_box = [label_box[0], next_y, label_box[2], next_y + label_h]
+
+            draw.rectangle(label_box, fill="green")
+            draw.text(
+                (label_box[0] + pad_x, label_box[1] + pad_y),
+                text,
+                fill="white",
+                font=font,
+            )
+            occupied_labels.append(label_box)
 
     image.save(output_path)
 
