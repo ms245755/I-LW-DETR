@@ -115,7 +115,7 @@ class IFeedForward(nn.Module):
         self.quant_gelu = "gelu" in self.quant_components
         linear_cls = IViTLinear if self.quant_linear else nn.Linear
         self.fc1 = linear_cls(in_features=dim, out_features=hidden_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, hidden_dim)
-        self.act = ISegGELU(output_bit=16, n=gelu_n, lambda_scaler=gelu_lambda)
+        self.act = ISegGELU(output_bit=16, n=gelu_n, lambda_scaler=gelu_lambda, channel_len=hidden_dim)
         self.act_fp = nn.GELU()
         self.act_no_lambda = IViTGELU(output_bit=16)
         if out_dim is None:

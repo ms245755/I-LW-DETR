@@ -926,7 +926,7 @@ class ISegGELU(nn.Module):
     Class to quantize given GELU layer
     """
 
-    def __init__(self, output_bit=8, n=23, lambda_scaler=6, temp = 1.702):
+    def __init__(self, output_bit=8, n=23, lambda_scaler=6, temp = 1.702, channel_len=None):
         super(ISegGELU, self).__init__()
         self.output_bit = output_bit
 
@@ -935,7 +935,8 @@ class ISegGELU(nn.Module):
         self.m = 31
         # The minimum value for ensuring accuracy (varies depending on models)
 
-        self.register_buffer("act_scaling_factor", nn.Parameter(torch.zeros(1)))
+        scale_shape = channel_len if channel_len is not None else 1
+        self.register_buffer("act_scaling_factor", nn.Parameter(torch.zeros(scale_shape)))
         self.register_buffer(
             "sigmoid_scaling_factor",
             nn.Parameter(torch.Tensor([1 / 2.0 ** (self.output_bit - 1)])),
