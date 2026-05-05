@@ -106,6 +106,8 @@ class IFeedForward(nn.Module):
         gelu_choice="l_shiftgelu",
         num_bits = 8,
         quant_components=None,
+        observe_stat=False,
+        block_name="",
     ):
         super().__init__()
         self.quant_components = _component_set(quant_components)
@@ -114,7 +116,7 @@ class IFeedForward(nn.Module):
         linear_cls = IViTLinear if self.quant_linear else nn.Linear
         self.fc1 = linear_cls(in_features=dim, out_features=hidden_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, hidden_dim)
         self.act = ISegGELU(output_bit=16, n=gelu_n, lambda_scaler=gelu_lambda)
-        self.act_fp = IViTGELU(output_bit=num_bits)
+        self.act_fp = nn.GELU()
         self.act_no_lambda = IViTGELU(output_bit=16)
         if out_dim is None:
             out_dim = dim
@@ -124,15 +126,18 @@ class IFeedForward(nn.Module):
 
         # Quantization activations around GELU and dropout
         self.qact_fc1_input_bridge = IViTAct(activation_bit=num_bits)
-        self.qact_pre_gelu = IViTAct(activation_bit=num_bits)
+        self.qact_pre_gelu = IViTAct(activation_bit=num_bits, per_channel=True)
         self.qact_gelu_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_post_gelu = IViTAct(activation_bit=16)
         self.qact_fc2_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_drop2_stub = IViTAct(activation_bit=num_bits*2)
+        # self.qact_post_gelu1 = IViTAct(activation_bit=16)
 
         # Observation flags
         self.observe_gelu = observe_gelu
         self.record_rmse = record_rmse
+        self.observe_stat = observe_stat
+        self.block_name = block_name
         self.ivit_rmse = 0
         self.iseg_rmse = 0
 
@@ -147,6 +152,7 @@ class IFeedForward(nn.Module):
                 x, act_scaling_factor = self.qact_fc1_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.fc1(x=x, act_scaling_factor=act_scaling_factor)
             x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=act_scaling_factor)
+            save_tensor_from_pathname(x=x, component_path=self.block_name+"0_fc1", observe_stat=self.observe_stat)
         else:
             x = self.fc1(x)
             act_scaling_factor = None
@@ -189,7 +195,14 @@ class IFeedForward(nn.Module):
                 x, act_scaling_factor = self.act(x=x, act_scaling_factor=act_scaling_factor)
             elif self.gelu_choice == "shiftgelu":
                 x, act_scaling_factor = self.act_no_lambda(x=x, act_scaling_factor=act_scaling_factor)
-            x, act_scaling_factor = self.qact_post_gelu(x=x, act_scaling_factor=act_scaling_factor)
+            elif self.gelu_choice == "gelu":
+                x = self.act_fp(x)
+                act_scaling_factor = None
+            if self.quant_linear:
+                x, act_scaling_factor = self.qact_post_gelu(x=x, act_scaling_factor=act_scaling_factor)
+            else:
+                act_scaling_factor = None
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"1_gelu", observe_stat=self.observe_stat)
 
         # Second linear projection + quantized dropout
         if self.quant_linear:
@@ -200,6 +213,7 @@ class IFeedForward(nn.Module):
         else:
             x = self.fc2(x)
             act_scaling_factor = None
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"2_fc2", observe_stat=self.observe_stat)
 
         return x, act_scaling_factor
 
@@ -415,7 +429,7 @@ class IBlock(nn.Module):
         self.norm2 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"4_norm2/", observe_stat=observe_stat) if self.quant_layernorm else nn.LayerNorm(dim, eps=1e-6)
         self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits, observe_stat=observe_stat, block_name=block_name+"1_attn/", quant_components=self.quant_components)
         self.mlp = IFeedForward(
-            dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits, quant_components=self.quant_components
+            dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits, quant_components=self.quant_components, observe_stat=observe_stat, block_name=block_name+"5_mlp/"
         )
         self.window = window
 
@@ -460,21 +474,20 @@ class IBlock(nn.Module):
             if mask is not None:
                 mask = mask.reshape(B//16, 16*HW)
 
-        if self.use_cae:
-            gamma_1, scale_gamma1 = self.qact_gamma_1(self.gamma_1, act_scaling_factor=None)
-            gamma_2, scale_gamma2 = self.qact_gamma_2(self.gamma_2, act_scaling_factor=None)
-
-        
         # Attention branch
         x, act_scaling_factor = self.attn(x=x, act_scaling_factor=act_scaling_factor)
         save_tensor_from_pathname(x=x, component_path=self.block_name+"1_attn", observe_stat=self.observe_stat)
         
         # Cong: do i need to requantize after multiply?
         if self.use_cae:
-            x = x * gamma_1
-            act_scaling_factor = act_scaling_factor * scale_gamma1 if act_scaling_factor is not None else None
-            # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_1, scale_gamma1)
-            x, act_scaling_factor = self.qact_post_gamma_1(x, act_scaling_factor)
+            if act_scaling_factor is None:
+                x = x * self.gamma_1
+            else:
+                gamma_1, scale_gamma1 = self.qact_gamma_1(self.gamma_1, act_scaling_factor=None)
+                x = x * gamma_1
+                act_scaling_factor = act_scaling_factor * scale_gamma1
+                # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_1, scale_gamma1)
+                x, act_scaling_factor = self.qact_post_gamma_1(x, act_scaling_factor)
             save_tensor_from_pathname(x=x, component_path=self.block_name+"2_gamma1", observe_stat=self.observe_stat)
 
         if not self.window:
@@ -511,10 +524,14 @@ class IBlock(nn.Module):
         save_tensor_from_pathname(x=x, component_path=self.block_name+"5_mlp", observe_stat=self.observe_stat)
 
         if self.use_cae:
-            x = x * gamma_2
-            act_scaling_factor = act_scaling_factor * scale_gamma2 if act_scaling_factor is not None else None
-            # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_2, scale_gamma2)
-            x, act_scaling_factor = self.qact_post_gamma_2(x, act_scaling_factor)
+            if act_scaling_factor is None:
+                x = x * self.gamma_2
+            else:
+                gamma_2, scale_gamma2 = self.qact_gamma_2(self.gamma_2, act_scaling_factor=None)
+                x = x * gamma_2
+                act_scaling_factor = act_scaling_factor * scale_gamma2
+                # x, act_scaling_factor = multiply_tensor_scale(x, act_scaling_factor, gamma_2, scale_gamma2)
+                x, act_scaling_factor = self.qact_post_gamma_2(x, act_scaling_factor)
 
             save_tensor_from_pathname(x=x, component_path=self.block_name+"6_gamma2", observe_stat=self.observe_stat)
 

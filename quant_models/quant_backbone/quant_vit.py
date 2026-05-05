@@ -213,6 +213,11 @@ class IViT(nn.Module):
         self.observe_stat = observe_stat
         self.block_name = block_name
 
+    @staticmethod
+    def _block_needs_input_scale(block):
+        unwrapped = getattr(block, "unwrapped", block)
+        return bool(getattr(unwrapped, "quant_layernorm", False))
+
     def export(self):
         self._export = True
         self.pos_embed_export = get_abs_pos(
@@ -231,7 +236,7 @@ class IViT(nn.Module):
     def forward(self, x):
         save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", observe_stat=self.observe_stat)
         act_scaling_factor = None
-        if self.quant_stem:
+        if self.quant_stem and getattr(self.patch_embed, "quant_conv", False):
             x, act_scaling_factor = self.qact_input(x=x, act_scaling_factor=None)
 
         x, act_scaling_factor = self.patch_embed(x, act_scaling_factor)
@@ -244,10 +249,9 @@ class IViT(nn.Module):
                 x = x + x_pos
             else:
                 x_pos, pos_scale = self.qact_pos(x_pos, act_scaling_factor=None)
-                x = round_ste.apply(x / act_scaling_factor )
-                x_pos = round_ste.apply(x_pos / act_scaling_factor )
-                x = x + x_pos
-                x *= act_scaling_factor
+                x, act_scaling_factor = add_tensor_scale(
+                    x, act_scaling_factor, x_pos, pos_scale
+                )
         B, H, W, C = x.shape
         assert (H % 4 == 0) and (W % 4 == 0)
         h, w = H // 4, W // 4
@@ -257,7 +261,7 @@ class IViT(nn.Module):
         out = []
         for idx, blk in enumerate(self.blocks):
             if self.block_is_quant[idx]:
-                if act_scaling_factor is None:
+                if act_scaling_factor is None and self._block_needs_input_scale(blk):
                     x, act_scaling_factor = self.qact_block_bridge[idx](x=x, act_scaling_factor=None)
                 x, act_scaling_factor = blk(x, mask=None, act_scaling_factor=act_scaling_factor)
             else:

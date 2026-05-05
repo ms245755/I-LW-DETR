@@ -734,7 +734,7 @@ class IViTGELU(nn.Module):
         pre_x_int = x / act_scaling_factor
         act_scaling_factor_sig = act_scaling_factor * self.temp
 
-        x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
+        x_int_max = torch.clamp(pre_x_int, min=0)
         x_int = pre_x_int - x_int_max
 
         exp_int, _ = self.int_exp_shift(x_int, act_scaling_factor_sig)  # e^(x-x_max)
@@ -942,6 +942,21 @@ class ISegGELU(nn.Module):
         )
         self.temp = temp
 
+    # def set_calibration_params(self, n=None, lambda_scaler=None, temp=None, output_bit=None):
+    #     if output_bit is not None and output_bit != self.output_bit:
+    #         self.output_bit = output_bit
+    #         self.sigmoid_scaling_factor.data = torch.tensor(
+    #             [1 / 2.0 ** (self.output_bit - 1)],
+    #             device=self.sigmoid_scaling_factor.device,
+    #             dtype=self.sigmoid_scaling_factor.dtype,
+    #         )
+    #     if n is not None:
+    #         self.n = n
+    #     if lambda_scaler is not None:
+    #         self.lambda_scaler = lambda_scaler
+    #     if temp is not None:
+    #         self.temp = temp
+
     def fix(self):
         pass
 
@@ -974,7 +989,7 @@ class ISegGELU(nn.Module):
         pre_x_int = round_ste.apply(x / act_scaling_factor)
         scaling_factor_sig = act_scaling_factor * self.temp
 
-        x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
+        x_int_max = torch.clamp(pre_x_int, min=0)
         x_int = pre_x_int - x_int_max
 
         exp_int, _ = self.int_exp_shift(x_int, scaling_factor_sig)
