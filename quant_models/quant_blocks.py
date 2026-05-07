@@ -222,7 +222,7 @@ class IAttention(nn.Module):
     Quantized multi-head self-attention layer, CAE-compatible (q_bias/v_bias).
     """
 
-    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True, num_bits: int =8, observe_stat=False, block_name="", quant_components=None):
+    def __init__(self, dim, heads, dropout, use_cae=True, qkv_bias=True, num_bits: int =8, observe_stat=False, block_name="", quant_components=None, window=False):
         super().__init__()
         self.quant_components = _component_set(quant_components)
         self.quant_linear = "linear" in self.quant_components
@@ -233,6 +233,7 @@ class IAttention(nn.Module):
         head_dim = dim // heads
         self.scale = head_dim**-0.5
         self.attn = None
+        self.window = window
 
         self.use_cae = use_cae
 
@@ -344,8 +345,17 @@ class IAttention(nn.Module):
         # Quantize + softmax
         save_tensor_from_pathname(attn, self.block_name+"1_attn", observe_stat=self.observe_stat)
         if self.quant_softmax:
-            attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=act_scaling_factor)
-            attn, act_scaling_factor = self.softmax(x=attn, act_scaling_factor=act_scaling_factor)
+            if self.window:
+                attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=act_scaling_factor)
+                attn, act_scaling_factor = self.softmax(x=attn, act_scaling_factor=act_scaling_factor)
+            else:
+                if act_scaling_factor is None:
+                    attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=None)
+                attn, act_scaling_factor = self.softmax(
+                    x=attn,
+                    act_scaling_factor=act_scaling_factor,
+                    dynamic_input_scale=True,
+                )
         else:
             attn = F.softmax(attn, dim=-1)
             act_scaling_factor = None
@@ -427,7 +437,7 @@ class IBlock(nn.Module):
         self.quant_layernorm = "layernorm" in self.quant_components
         self.norm1 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"0_norm1/", observe_stat=observe_stat) if self.quant_layernorm else nn.LayerNorm(dim, eps=1e-6)
         self.norm2 = IViTLayerNorm(normalized_shape=dim, block_name=block_name+"4_norm2/", observe_stat=observe_stat) if self.quant_layernorm else nn.LayerNorm(dim, eps=1e-6)
-        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits, observe_stat=observe_stat, block_name=block_name+"1_attn/", quant_components=self.quant_components)
+        self.attn = IAttention(dim, heads, dropout, qkv_bias=qkv_bias,num_bits=num_bits, observe_stat=observe_stat, block_name=block_name+"1_attn/", quant_components=self.quant_components, window=window)
         self.mlp = IFeedForward(
             dim, mlp_dim, dropout, observe_gelu=observe_gelu, record_rmse=record_rmse, gelu_n=gelu_n, gelu_lambda=gelu_lambda, gelu_choice=gelu_choice, num_bits=num_bits, quant_components=self.quant_components, observe_stat=observe_stat, block_name=block_name+"5_mlp/"
         )
@@ -779,7 +789,7 @@ class IMSDeformAttn(nn.Module):
             attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
             save_tensor_from_pathname(sampling_offsets, self.block_name + "4_sampling_offsets", observe_stat=self.observe_stat)
             save_tensor_from_pathname(attn_weights, self.block_name + "5_attention_logits", observe_stat=self.observe_stat)
-            attn_weights = F.softmax(attn_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+            attn_weights = F.softmax(attn_weights, -1)
 
             if reference_points.shape[-1] == 2:
                 offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
@@ -843,7 +853,6 @@ class IMSDeformAttn(nn.Module):
         attn_weights = attn_weights.transpose(1, 2).reshape(N * self.n_heads, Len_q, self.n_levels * self.n_points)
         attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
         attn_weights = attn_weights.reshape(N, self.n_heads, Len_q, self.n_levels * self.n_points).transpose(1, 2)
-        attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
         save_tensor_from_pathname(attn_weights, self.block_name + "7_attention_weights", observe_stat=self.observe_stat)
 
         # ── sampling locations (float op — not quantizable) ────────────
