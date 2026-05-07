@@ -240,7 +240,8 @@ class IViTAct(nn.Module):
         # collect runnng stats
         with torch.no_grad():
             x_act = x if x_2 is None else x_2 + x
-            if self.running_stat:
+            collect_current_stat = self.running_stat or self.n_batches.item() == 0
+            if collect_current_stat:
                 if len(x_act.shape) == 4:
                     x_act = x_act.permute(0, 2, 3, 1)
                 v = x_act.reshape(-1, x_act.shape[-1])
@@ -274,7 +275,8 @@ class IViTAct(nn.Module):
                     self.max_val = self.max_val * self.act_range_momentum + cur_max * (
                         1 - self.act_range_momentum
                     )
-                self.n_batches += 1
+                if self.running_stat:
+                    self.n_batches += 1
 
             self.act_scaling_factor = symmetric_linear_quantization_params(
                 self.activation_bit, self.min_val, self.max_val
@@ -586,12 +588,22 @@ class IViTLayerNorm(nn.LayerNorm):
     Class to quantize given LayerNorm layer
     """
 
-    def __init__(self, normalized_shape, eps=1e-6, elementwise_affine=True, observe_stat=False, block_name=""):
+    def __init__(
+        self,
+        normalized_shape,
+        eps=1e-6,
+        elementwise_affine=True,
+        observe_stat=False,
+        block_name="",
+        dim=-1,
+    ):
         super(IViTLayerNorm, self).__init__(
             normalized_shape=normalized_shape, eps=eps, elementwise_affine=elementwise_affine
         )
-        self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(normalized_shape)))
-        self.register_buffer("bias_integer", nn.Parameter(torch.ones_like(self.bias)))
+        self.dim = dim
+        norm_scale_shape = (1, normalized_shape, 1, 1) if dim == 1 else (normalized_shape,)
+        self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(*norm_scale_shape)))
+        self.register_buffer("bias_integer", nn.Parameter(torch.ones(*norm_scale_shape)))
         self.register_buffer(
             "base_act_scaling_factor",
             nn.Parameter(torch.sqrt(torch.tensor(normalized_shape, dtype=torch.float)) / 2.0**30),
@@ -605,14 +617,38 @@ class IViTLayerNorm(nn.LayerNorm):
     def unfix(self):
         pass
 
+    def _normalized_dim(self, x):
+        dim = self.dim if self.dim >= 0 else x.dim() + self.dim
+        if dim < 0 or dim >= x.dim():
+            raise ValueError("invalid LayerNorm dim {} for input with {} dims".format(self.dim, x.dim()))
+        if x.shape[dim] != self.normalized_shape[0]:
+            raise ValueError(
+                "LayerNorm normalized_shape {} does not match input shape {} at dim {}".format(
+                    self.normalized_shape[0], tuple(x.shape), dim
+                )
+            )
+        return dim
+
+    def _view_affine(self, x, dim):
+        if dim == x.dim() - 1:
+            return self.weight, self.bias, self.base_act_scaling_factor * self.weight
+
+        view_shape = [1] * x.dim()
+        view_shape[dim] = self.normalized_shape[0]
+        weight = self.weight.view(view_shape)
+        bias = self.bias.view(view_shape)
+        act_scaling_factor = (self.base_act_scaling_factor * self.weight).view(view_shape)
+        return weight, bias, act_scaling_factor
+
     def forward(self, x, act_scaling_factor=None):
         # Normalization: computes mean and variance(std)
+        dim = self._normalized_dim(x)
         x_int = round_ste.apply(x / act_scaling_factor)
-        mean_int = floor_ste.apply(x_int.sum(dim=-1, keepdim=True) / x_int.shape[-1])
+        mean_int = round_ste.apply(x_int.sum(dim=dim, keepdim=True) / x_int.shape[dim])
 
         y_int = x_int - mean_int
         y_sq_int = y_int**2
-        var_int = torch.sum(y_sq_int, axis=-1, keepdim=True)
+        var_int = torch.sum(y_sq_int, axis=dim, keepdim=True)
 
         # Integer Iteration
         k = 2.0**16
@@ -625,13 +661,13 @@ class IViTLayerNorm(nn.LayerNorm):
         factor = exp
         y_int = floor_ste.apply(y_int * factor / 2)
         # scaling and shifting
-        bias = self.bias / self.weight
+        weight, bias, act_scaling_factor = self._view_affine(x, dim)
+        bias = bias / weight
         bias_int = floor_ste.apply(bias / self.base_act_scaling_factor)
 
         self.bias_integer = bias_int
 
         y_int = y_int + bias_int
-        act_scaling_factor = self.base_act_scaling_factor * self.weight
         x = y_int * act_scaling_factor
         self.norm_scaling_factor = act_scaling_factor
 
@@ -639,54 +675,14 @@ class IViTLayerNorm(nn.LayerNorm):
         return x, act_scaling_factor
     
 @track_init_args
-class IViTLayerNormChannelFirst(nn.LayerNorm):
+class IViTLayerNormChannelFirst(IViTLayerNorm):
     def __init__(self, normalized_shape, eps=1e-6, elementwise_affine=True):
         super(IViTLayerNormChannelFirst, self).__init__(
-            normalized_shape=normalized_shape, eps=eps, elementwise_affine=elementwise_affine
+            normalized_shape=normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            dim=1,
         )
-        self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(normalized_shape, 1, 1)))
-        self.register_buffer("bias_integer", nn.Parameter(torch.ones_like(self.bias)))
-        self.register_buffer(
-            "base_act_scaling_factor",
-            nn.Parameter(torch.sqrt(torch.tensor(normalized_shape, dtype=torch.float)) / 2.0**30),
-        )
-    def fix(self):
-        pass
-
-    def unfix(self):
-        pass
-    
-    def forward(self, x, act_scaling_factor=None):
-        # Normalization: computes mean and variance(std)
-        x_int = round_ste.apply(x / act_scaling_factor)
-        mean_int = floor_ste.apply(x_int.sum(dim=1, keepdim=True) / x_int.shape[1])
-        y_int = x_int - mean_int
-        y_sq_int = y_int**2
-        var_int = torch.sum(y_sq_int, axis=1, keepdim=True)
-
-        # Integer Iteration
-        k = 2.0**16
-        for _ in range(10):
-            k_1 = floor_ste.apply((k + floor_ste.apply(var_int / k)) / 2)
-            k = k_1
-        std_int = k
-
-        exp = floor_ste.apply((2.0**31 - 1) / std_int)
-        factor = exp
-        y_int = floor_ste.apply(y_int * factor / 2)
-
-        # scaling and shifting
-        bias = self.bias / self.weight
-        bias_int = floor_ste.apply(bias / self.base_act_scaling_factor)
-
-        self.bias_integer = bias_int
-
-        y_int = y_int + bias_int[:, None, None]
-        act_scaling_factor = self.base_act_scaling_factor * self.weight[:, None, None]
-        x = y_int * act_scaling_factor
-        self.norm_scaling_factor = act_scaling_factor
-
-        return x, act_scaling_factor
     
 class IViTGELU(nn.Module):
     """
@@ -845,12 +841,30 @@ class IViTSiLU(nn.Module):
     Uses the same exp-shift trick + max-subtraction for a stable integer sigmoid.
     """
 
-    def __init__(self, output_bit=8):
+    def __init__(self, output_bit=8, n=23, lambda_scaler=1):
         super().__init__()
         self.output_bit = output_bit
 
-        self.n = 23  # sufficiently large integer
+        self.n = n  # sufficiently large integer
+        self.lambda_scaler = lambda_scaler
         self.register_buffer("act_scaling_factor", torch.zeros(1))
+        self.register_buffer(
+            "sigmoid_scaling_factor",
+            torch.Tensor([1 / 2.0 ** (self.output_bit - 1)]),
+        )
+
+    def set_calibration_params(self, n=None, lambda_scaler=None, output_bit=None):
+        if output_bit is not None and output_bit != self.output_bit:
+            self.output_bit = output_bit
+            self.sigmoid_scaling_factor.data = torch.tensor(
+                [1 / 2.0 ** (self.output_bit - 1)],
+                device=self.sigmoid_scaling_factor.device,
+                dtype=self.sigmoid_scaling_factor.dtype,
+            )
+        if n is not None:
+            self.n = n
+        if lambda_scaler is not None:
+            self.lambda_scaler = lambda_scaler
 
     def fix(self):
         pass
@@ -865,7 +879,7 @@ class IViTSiLU(nn.Module):
         with torch.no_grad():
             x0_int = torch.floor(-1.0 / scaling_factor)
 
-        x_int = torch.max(x_int, self.n * x0_int)
+        x_int = torch.max(x_int, self.n * self.lambda_scaler * x0_int)
 
         q = floor_ste.apply(x_int / x0_int)
         r = x_int - x0_int * q
@@ -902,13 +916,9 @@ class IViTSiLU(nn.Module):
         sigmoid_int = floor_ste.apply(
             exp_int * factor / 2.0 ** (31 - self.output_bit + 1)
         )
-        sigmoid_act_scaling_factor = torch.tensor(
-            [1 / 2.0 ** (self.output_bit - 1)], device=x.device
-        )
-
         # SiLU: x_int * sigmoid_int (done in "integer-ish" domain)
         y_int = pre_x_int * sigmoid_int
-        y_scaling = act_scaling_factor * sigmoid_act_scaling_factor
+        y_scaling = act_scaling_factor * self.sigmoid_scaling_factor.to(x.device)
 
         self.act_scaling_factor = y_scaling
         return y_int * y_scaling, y_scaling
@@ -1016,11 +1026,13 @@ class IViTSoftmax(nn.Module):
     Class to quantize given Softmax layer
     """
 
-    def __init__(self, output_bit=8, **kwargs):
+    def __init__(self, output_bit=8, n=15, lambda_scaler=1, input_bit=8, **kwargs):
         super(IViTSoftmax, self).__init__()
         self.output_bit = output_bit
+        self.input_bit = input_bit
 
-        self.n = 15  # sufficiently large integer
+        self.n = n  # sufficiently large integer
+        self.lambda_scaler = lambda_scaler
         self.m = 31
         # The minimum value for ensuring accuracy (varies depending on models)
 
@@ -1043,7 +1055,7 @@ class IViTSoftmax(nn.Module):
         with torch.no_grad():
             x0_int = torch.ceil(1.0 / scaling_factor)
 
-        min_x_int = torch.clamp(self.n * (-x0_int), min=-(2.0**self.m))
+        min_x_int = torch.clamp(self.n * self.lambda_scaler * (-x0_int), min=-(2.0**self.m))
         x_int = torch.maximum(x_int, min_x_int)
 
         q = floor_ste.apply(x_int / (-x0_int))
@@ -1057,7 +1069,26 @@ class IViTSoftmax(nn.Module):
 
         return exp_int
 
-    def forward(self, x, act_scaling_factor):
+    def _rowwise_power2_input_quant(self, x, act_scaling_factor):
+        x_int = round_ste.apply(x / act_scaling_factor)
+        with torch.no_grad():
+            target = 2.0 ** (self.input_bit - 1) - 1
+            row_abs_max = x_int.detach().abs().amax(dim=-1, keepdim=True)
+            shift_factor = torch.ones_like(row_abs_max)
+            for _ in range(self.m):
+                needs_shift = row_abs_max > target * shift_factor
+                shift_factor = torch.where(needs_shift, shift_factor * 2, shift_factor)
+        act_scaling_factor = act_scaling_factor * shift_factor
+        return x_int, act_scaling_factor
+
+    def _rowwise_input_quant(self, x):
+        with torch.no_grad():
+            target = 2.0 ** (self.input_bit - 1) - 1
+            max_abs = x.detach().abs().amax(dim=-1, keepdim=True)
+            scale = torch.clamp(max_abs / target, min=torch.finfo(x.dtype).eps)
+        return x, scale
+
+    def forward(self, x, act_scaling_factor, dynamic_input_scale=False):
         if torch.is_tensor(act_scaling_factor) and act_scaling_factor.numel() > 1:
             scale = act_scaling_factor.reshape(-1)
             if scale.numel() == x.shape[-1]:
@@ -1070,6 +1101,10 @@ class IViTSoftmax(nn.Module):
                 act_scaling_factor = scale.max(dim=-1, keepdim=True).values
             else:
                 act_scaling_factor = scale.max()
+
+        if dynamic_input_scale:
+            # x, act_scaling_factor = self._rowwise_power2_input_quant(x, act_scaling_factor)
+            x, act_scaling_factor = self._rowwise_input_quant(x)
 
         x_int = round_ste.apply(x / act_scaling_factor)
         x_int_max, _ = x_int.max(dim=-1, keepdim=True)

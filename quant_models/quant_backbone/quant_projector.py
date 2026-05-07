@@ -55,11 +55,11 @@ def _is_quant_conv(layer):
 
 
 def _is_norm(layer):
-    return isinstance(layer, (FloatLayerNorm, IViTLayerNormChannelFirst))
+    return isinstance(layer, (FloatLayerNorm, IViTLayerNorm))
 
 
 def _is_quant_norm(layer):
-    return isinstance(layer, IViTLayerNormChannelFirst)
+    return isinstance(layer, IViTLayerNorm)
 
 
 def _is_quant_activation(layer):
@@ -114,7 +114,7 @@ def _make_conv2d(quant_components, *args, transpose=False, **kwargs):
 
 def _make_norm(channels, quant_components):
     if "layernorm" in _component_set(quant_components):
-        return IViTLayerNormChannelFirst(channels)
+        return IViTLayerNorm(channels, dim=1)
     return FloatLayerNorm(channels)
 
 
