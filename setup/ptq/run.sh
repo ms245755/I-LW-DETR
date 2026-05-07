@@ -39,6 +39,7 @@ ptq_output_distill_temperature="${PTQ_OUTPUT_DISTILL_TEMPERATURE:-2.0}"
 decoder_cross_attn_float="${DECODER_CROSS_ATTN_FLOAT:-false}"
 decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-false}"
 decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
+decoder_refpoint_head_float="${DECODER_REFPOINT_HEAD_FLOAT:-false}"
 
 has_quant_components=false
 if [[ " $quant_model_components " == *" backbone "* ]]; then
@@ -98,6 +99,11 @@ if [[ "$decoder_norm_output_qact" == "1" || "$decoder_norm_output_qact" == "true
   decoder_norm_output_qact_args=(--decoder_norm_output_qact)
 fi
 
+decoder_refpoint_head_float_args=()
+if [[ "$decoder_refpoint_head_float" == "1" || "$decoder_refpoint_head_float" == "true" || "$decoder_refpoint_head_float" == "yes" ]]; then
+  decoder_refpoint_head_float_args=(--decoder_refpoint_head_float)
+fi
+
 cd "$repo_root"
 
 if [[ "$has_quant_components" == "false" ]]; then
@@ -126,5 +132,6 @@ python -u -m torch.distributed.launch \
   "${decoder_cross_attn_float_args[@]}" \
   "${decoder_cross_attn_value_per_channel_args[@]}" \
   "${decoder_norm_output_qact_args[@]}" \
+  "${decoder_refpoint_head_float_args[@]}" \
   --resume "$checkpoint" \
   --output_dir "$output_dir"

@@ -210,6 +210,8 @@ def get_args_parser():
                         help='use per-channel activation scaling for quantized decoder deformable-attention value projection')
     parser.add_argument('--decoder_norm_output_qact', default=False, action='store_true',
                         help='add an activation quantizer after the final quantized decoder norm')
+    parser.add_argument('--decoder_refpoint_head_float', default=False, action='store_true',
+                        help='keep decoder reference-point MLP heads in float even when transformer linear quantization is enabled')
 
     # * Matcher
     parser.add_argument('--set_cost_class', default=2, type=float,

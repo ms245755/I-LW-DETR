@@ -47,6 +47,18 @@ def _concat_optional_tensor_scale(tensor_list, dim=0):
     return concat_list_tensor_scale(tensor_list, dim=dim)
 
 
+def _multiply_tensor_scale(x, scale_x, y, scale_y):
+    if scale_x is None or scale_y is None:
+        return x * y, None
+    return multiply_tensor_scale(x, scale_x, y, scale_y)
+
+
+def _exp_tensor_scale(exp_module, x, scale):
+    if scale is None:
+        return x.exp(), None
+    return exp_module(x, scale)
+
+
 class ScaleLinear(nn.Linear):
     def forward(self, x, act_scaling_factor=None):
         return super().forward(x), None
@@ -114,7 +126,8 @@ class IMLP(nn.Module):
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
         self.quant_components = _component_set(quant_components)
-        linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
+        self.quant_linear = "linear" in self.quant_components
+        linear_cls = IViTLinear if self.quant_linear else ScaleLinear
         self.layers = nn.ModuleList(
             linear_cls(n, k, bias_bit=bias_bit) if linear_cls is IViTLinear else linear_cls(n, k)
             for n, k in zip([input_dim] + h, h + [output_dim])
@@ -133,6 +146,13 @@ class IMLP(nn.Module):
         return x.reshape(original_shape), act_scaling_factor
 
     def forward(self, x, act_scaling_factor = None):
+        if not self.quant_linear:
+            for i, layer in enumerate(self.layers):
+                x, _ = layer(x, None)
+                if i < self.num_layers - 1:
+                    x = F.relu(x)
+            return x, None
+
         for i, layer in enumerate(self.layers):
             if i == 0 and (act_scaling_factor is None or act_scaling_factor.numel() != 1):
                 x, act_scaling_factor = self._qact_channel_last(self.qact_input_bridge, x, None)
@@ -249,6 +269,7 @@ class Transformer(nn.Module):
                  decoder_cross_attn_float=False,
                  decoder_cross_attn_value_per_channel=False,
                  decoder_norm_output_qact=False,
+                 decoder_refpoint_head_float=False,
                  transformer_quant_components=None,
                  observe_stat=False,
                  block_name="observed_tensor/quant/transformer/"):
@@ -283,6 +304,7 @@ class Transformer(nn.Module):
                                           easy_quantize=easy_quantize,
                                           bbox_reparam=bbox_reparam,
                                           norm_output_qact=decoder_norm_output_qact,
+                                          refpoint_head_float=decoder_refpoint_head_float,
                                           quant_components=self.quant_components,
                                           observe_stat=observe_stat,
                                           block_name=block_name + "2_decoder/")
@@ -401,14 +423,22 @@ class Transformer(nn.Module):
                     enc_outputs_coord_delta_gidx, enc_outputs_coord_delta_gidx_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                     enc_outputs_coord_cxcy_gidx = enc_outputs_coord_delta_gidx[...,
                         :2] * output_proposals[..., 2:] + output_proposals[..., :2]
-                    enc_outputs_coord_cxcy_gidx_scale = enc_outputs_coord_delta_gidx_scale * output_proposals_scale
+                    enc_outputs_coord_cxcy_gidx_scale = (
+                        None
+                        if enc_outputs_coord_delta_gidx_scale is None or output_proposals_scale is None
+                        else enc_outputs_coord_delta_gidx_scale * output_proposals_scale
+                    )
 
                     # Cong: careful about this exp function, we can also approximate by bit shift (convert to 2^(log e * value))
-                    tmp, tmp_scale = self.int_exp(enc_outputs_coord_delta_gidx[..., 2:], enc_outputs_coord_delta_gidx_scale)
-                    enc_outputs_coord_wh_gidx, enc_outputs_coord_wh_gidx_scale = multiply_tensor_scale(tmp, tmp_scale, output_proposals[..., 2:], output_proposals_scale)
+                    tmp, tmp_scale = _exp_tensor_scale(
+                        self.int_exp,
+                        enc_outputs_coord_delta_gidx[..., 2:],
+                        enc_outputs_coord_delta_gidx_scale,
+                    )
+                    enc_outputs_coord_wh_gidx, enc_outputs_coord_wh_gidx_scale = _multiply_tensor_scale(tmp, tmp_scale, output_proposals[..., 2:], output_proposals_scale)
 
                     concat_list = [(enc_outputs_coord_cxcy_gidx, enc_outputs_coord_cxcy_gidx_scale), (enc_outputs_coord_wh_gidx, enc_outputs_coord_wh_gidx_scale)]
-                    enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = concat_list_tensor_scale(concat_list, dim=-1)
+                    enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = _concat_optional_tensor_scale(concat_list, dim=-1)
 
                 else:
                     tmp, tmp_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
@@ -434,10 +464,10 @@ class Transformer(nn.Module):
                 boxes_ts.append((refpoint_embed_gidx_undetach, refpoint_embed_gidx_scale))
             
             # concat on dim=1, the nq dimension, (bs, nq, d) --> (bs, nq, d)
-            refpoint_embed_ts, refpoint_embed_ts_scale = concat_list_tensor_scale(refpoint_embed_ts, dim=1)
+            refpoint_embed_ts, refpoint_embed_ts_scale = _concat_optional_tensor_scale(refpoint_embed_ts, dim=1)
             # (bs, nq, d)
-            memory_ts, memory_ts_scale = concat_list_tensor_scale(memory_ts, dim=1)#.transpose(0, 1)
-            boxes_ts, boxes_ts_scale = concat_list_tensor_scale(boxes_ts, dim=1)#.transpose(0, 1)
+            memory_ts, memory_ts_scale = _concat_optional_tensor_scale(memory_ts, dim=1)#.transpose(0, 1)
+            boxes_ts, boxes_ts_scale = _concat_optional_tensor_scale(boxes_ts, dim=1)#.transpose(0, 1)
             save_tensor_from_pathname(memory_ts, self.block_name + "1_two_stage/3_memory_topk", observe_stat=self.observe_stat)
             save_tensor_from_pathname(boxes_ts, self.block_name + "1_two_stage/4_boxes_topk", observe_stat=self.observe_stat)
         
@@ -446,12 +476,12 @@ class Transformer(nn.Module):
         if self.two_stage:
             if self.bbox_reparam:
                 # Cong: dont use this function
-                tmp, tmp_scale = multiply_tensor_scale(refpoint_embed[..., :2], refpoint_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
+                tmp, tmp_scale = _multiply_tensor_scale(refpoint_embed[..., :2], refpoint_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
                 refpoint_embed_cxcy, refpoint_embed_cxcy_scale = _add_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., :2], refpoint_embed_ts_scale)
 
-                tmp, tmp_scale = self.int_exp(refpoint_embed[..., 2:], refpoint_scale)
-                refpoint_embed_wh, refpoint_embed_wh_scale = multiply_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
-                refpoint_embed, refpoint_scale = concat_list_tensor_scale([(refpoint_embed_cxcy, refpoint_embed_cxcy_scale), (refpoint_embed_wh, refpoint_embed_wh_scale)], dim=-1)
+                tmp, tmp_scale = _exp_tensor_scale(self.int_exp, refpoint_embed[..., 2:], refpoint_scale)
+                refpoint_embed_wh, refpoint_embed_wh_scale = _multiply_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
+                refpoint_embed, refpoint_scale = _concat_optional_tensor_scale([(refpoint_embed_cxcy, refpoint_embed_cxcy_scale), (refpoint_embed_wh, refpoint_embed_wh_scale)], dim=-1)
             else:
                 refpoint_embed, refpoint_scale = _add_tensor_scale(refpoint_embed, refpoint_scale, refpoint_embed_ts, refpoint_embed_ts_scale)
 
@@ -482,6 +512,7 @@ class TransformerDecoder(nn.Module):
                  easy_quantize=False,
                  bbox_reparam=False,
                  norm_output_qact=False,
+                 refpoint_head_float=False,
                  quant_components=None,
                  observe_stat=False,
                  block_name=""):
@@ -496,13 +527,17 @@ class TransformerDecoder(nn.Module):
         self.easy_quantize = easy_quantize
         self.bbox_reparam = bbox_reparam
         self.norm_output_qact = norm_output_qact
+        self.refpoint_head_float = refpoint_head_float
         self.observe_stat = observe_stat
         self.block_name = block_name
 
         # Keep the original ref_point_head width so pretrained weights remain reusable,
         # and learn a quantization-friendly coordinate expansion in front of it.
-        self.ref_point_head = IMLP(2 * d_model, d_model, d_model, 2, quant_components=self.quant_components)
-        self.ref_point_coord_proj = IMLP(4, d_model, 2 * d_model, 2, quant_components=self.quant_components) if easy_quantize else None
+        refpoint_quant_components = set(self.quant_components)
+        if self.refpoint_head_float:
+            refpoint_quant_components.discard("linear")
+        self.ref_point_head = IMLP(2 * d_model, d_model, d_model, 2, quant_components=refpoint_quant_components)
+        self.ref_point_coord_proj = IMLP(4, d_model, 2 * d_model, 2, quant_components=refpoint_quant_components) if easy_quantize else None
         self.qact_sine_embed = IViTAct()
         self.qact_norm_input = IViTAct()
         self.qact_norm_output = IViTAct()
@@ -526,7 +561,7 @@ class TransformerDecoder(nn.Module):
 
     def refpoints_refine(self, refpoints_unsigmoid, refpoints_scale, new_refpoints_delta, new_refpoints_delta_scale):
         if self.bbox_reparam:
-            tmp, tmp_scale = multiply_tensor_scale(
+            tmp, tmp_scale = _multiply_tensor_scale(
                 new_refpoints_delta[..., :2],
                 new_refpoints_delta_scale,
                 refpoints_unsigmoid[..., 2:],
@@ -539,8 +574,12 @@ class TransformerDecoder(nn.Module):
                 refpoints_scale,
             )
             new_refpoints_wh = new_refpoints_delta[..., 2:].exp() * refpoints_unsigmoid[..., 2:]
-            new_refpoints_wh_scale = new_refpoints_delta_scale * refpoints_scale
-            new_refpoints_unsigmoid, new_refpoints_scale = concat_list_tensor_scale(
+            new_refpoints_wh_scale = (
+                None
+                if new_refpoints_delta_scale is None or refpoints_scale is None
+                else new_refpoints_delta_scale * refpoints_scale
+            )
+            new_refpoints_unsigmoid, new_refpoints_scale = _concat_optional_tensor_scale(
                 [(new_refpoints_cxcy, new_refpoints_cxcy_scale), (new_refpoints_wh, new_refpoints_wh_scale)],
                 dim=-1,
             )
@@ -595,7 +634,10 @@ class TransformerDecoder(nn.Module):
                                             * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # bs, nq, nlevel, 4
                     query_sine_embed = gen_sineembed_for_position(
                         refpoints_input[:, :, 0, :], self.d_model // 2)
-                query_sine_embed, query_sine_embed_scale = self.qact_sine_embed(query_sine_embed, None)
+                if self.refpoint_head_float:
+                    query_sine_embed_scale = None
+                else:
+                    query_sine_embed, query_sine_embed_scale = self.qact_sine_embed(query_sine_embed, None)
                 query_pos, query_pos_scale = self.ref_point_head(query_sine_embed, query_sine_embed_scale)
             return obj_center, refpoints_input, query_pos, query_pos_scale, query_sine_embed
         
@@ -955,6 +997,7 @@ def build_transformer(args):
         decoder_cross_attn_float=getattr(args, "decoder_cross_attn_float", False),
         decoder_cross_attn_value_per_channel=getattr(args, "decoder_cross_attn_value_per_channel", False),
         decoder_norm_output_qact=getattr(args, "decoder_norm_output_qact", False),
+        decoder_refpoint_head_float=getattr(args, "decoder_refpoint_head_float", False),
         transformer_quant_components=getattr(args, "transformer_quant_components", None),
         observe_stat=getattr(args, "observe_stat", False),
     )
