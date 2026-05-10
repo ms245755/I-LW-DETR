@@ -43,6 +43,7 @@ esac
 
 decoder_cross_attn_float="${DECODER_CROSS_ATTN_FLOAT:-false}"
 decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-false}"
+decoder_two_stage_float="${DECODER_TWO_STAGE_FLOAT:-false}"
 decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
 
 decoder_cross_attn_float_args=()
@@ -53,6 +54,11 @@ fi
 decoder_cross_attn_value_per_channel_args=()
 if [[ "$decoder_cross_attn_value_per_channel" == "1" || "$decoder_cross_attn_value_per_channel" == "true" || "$decoder_cross_attn_value_per_channel" == "yes" ]]; then
   decoder_cross_attn_value_per_channel_args=(--decoder_cross_attn_value_per_channel)
+fi
+
+decoder_two_stage_float_args=()
+if [[ "$decoder_two_stage_float" == "1" || "$decoder_two_stage_float" == "true" || "$decoder_two_stage_float" == "yes" ]]; then
+  decoder_two_stage_float_args=(--decoder_two_stage_float)
 fi
 
 decoder_norm_output_qact_args=()
@@ -81,6 +87,7 @@ common_args=(
   --easy_quantize
   "${decoder_cross_attn_float_args[@]}"
   "${decoder_cross_attn_value_per_channel_args[@]}"
+  "${decoder_two_stage_float_args[@]}"
   "${decoder_norm_output_qact_args[@]}"
   --input "$image_path"
   --confidence_threshold "${CONFIDENCE_THRESHOLD:-0.5}"

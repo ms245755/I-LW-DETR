@@ -108,6 +108,11 @@ for component in "${quant_model_component_args[@]}"; do
   fi
 done
 
+decoder_two_stage_float_args=()
+if [[ "${DECODER_TWO_STAGE_FLOAT:-false}" == "1" || "${DECODER_TWO_STAGE_FLOAT:-false}" == "true" || "${DECODER_TWO_STAGE_FLOAT:-false}" == "yes" ]]; then
+  decoder_two_stage_float_args=(--decoder_two_stage_float)
+fi
+
 quant_block_args=()
 if [[ "${ENCODER_QUANT_BLOCKS:-all}" != "all" ]]; then
   read -r -a encoder_quant_block_args <<< "${ENCODER_QUANT_BLOCKS}"
@@ -136,6 +141,7 @@ common_args=(
   --device "${DEVICE:-cuda}"
   --observe_stat
   "${easy_quantize_args[@]}"
+  "${decoder_two_stage_float_args[@]}"
 )
 
 mkdir -p "$output_root"

@@ -54,6 +54,11 @@ for component in "${quant_model_component_args[@]}"; do
   fi
 done
 
+decoder_two_stage_float_args=()
+if [[ "${DECODER_TWO_STAGE_FLOAT:-false}" == "1" || "${DECODER_TWO_STAGE_FLOAT:-false}" == "true" || "${DECODER_TWO_STAGE_FLOAT:-false}" == "yes" ]]; then
+  decoder_two_stage_float_args=(--decoder_two_stage_float)
+fi
+
 export OBSERVED_TENSOR_ROOT="$observed_root"
 
 python demo/demo.py \
@@ -78,6 +83,7 @@ python demo/demo.py \
   --output_dir "$output_dir" \
   --observe_stat \
   "${easy_quantize_args[@]}" \
+  "${decoder_two_stage_float_args[@]}" \
   --mode quant \
   --quant_model_components "${quant_model_component_args[@]}" \
   --backbone_quant_components "${backbone_quant_component_args[@]}" \

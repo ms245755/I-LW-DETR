@@ -167,8 +167,12 @@ def get_args_parser():
                         help='keep quantized decoder deformable cross-attention in a float fallback path')
     parser.add_argument('--decoder_cross_attn_value_per_channel', default=False, action='store_true',
                         help='use per-channel activation scaling for quantized decoder deformable-attention value projection')
+    parser.add_argument('--decoder_two_stage_float', default=False, action='store_true',
+                        help='keep two-stage proposal heads and top-k selection in float before requantizing selected decoder inputs')
     parser.add_argument('--decoder_norm_output_qact', default=False, action='store_true',
                         help='add an activation quantizer after the final quantized decoder norm')
+    parser.add_argument('--decoder_refpoint_head_float', default=False, action='store_true',
+                        help='keep decoder reference-point MLP heads in float even when transformer linear quantization is enabled')
 
     # * Dataset infomation
     parser.add_argument('--dataset_file', default='coco')

@@ -38,6 +38,7 @@ ptq_output_distill_box_weight="${PTQ_OUTPUT_DISTILL_BOX_WEIGHT:-5.0}"
 ptq_output_distill_temperature="${PTQ_OUTPUT_DISTILL_TEMPERATURE:-2.0}"
 decoder_cross_attn_float="${DECODER_CROSS_ATTN_FLOAT:-false}"
 decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-false}"
+decoder_two_stage_float="${DECODER_TWO_STAGE_FLOAT:-false}"
 decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
 decoder_refpoint_head_float="${DECODER_REFPOINT_HEAD_FLOAT:-false}"
 
@@ -94,6 +95,11 @@ if [[ "$decoder_cross_attn_value_per_channel" == "1" || "$decoder_cross_attn_val
   decoder_cross_attn_value_per_channel_args=(--decoder_cross_attn_value_per_channel)
 fi
 
+decoder_two_stage_float_args=()
+if [[ "$decoder_two_stage_float" == "1" || "$decoder_two_stage_float" == "true" || "$decoder_two_stage_float" == "yes" ]]; then
+  decoder_two_stage_float_args=(--decoder_two_stage_float)
+fi
+
 decoder_norm_output_qact_args=()
 if [[ "$decoder_norm_output_qact" == "1" || "$decoder_norm_output_qact" == "true" || "$decoder_norm_output_qact" == "yes" ]]; then
   decoder_norm_output_qact_args=(--decoder_norm_output_qact)
@@ -131,6 +137,7 @@ python -u -m torch.distributed.launch \
   "${ptq_reconstruct_args[@]}" \
   "${decoder_cross_attn_float_args[@]}" \
   "${decoder_cross_attn_value_per_channel_args[@]}" \
+  "${decoder_two_stage_float_args[@]}" \
   "${decoder_norm_output_qact_args[@]}" \
   "${decoder_refpoint_head_float_args[@]}" \
   --resume "$checkpoint" \

@@ -16,6 +16,7 @@ Optional environment variables:
   PROJECTOR_QUANT_COMPONENTS    Ops quantized inside the projector
   TRANSFORMER_QUANT_COMPONENTS  Ops quantized inside the transformer
   LWDETR_QUANT_COMPONENTS       Ops quantized inside prediction heads
+  DECODER_TWO_STAGE_FLOAT       Keep two-stage proposal/top-k path float
 EOF
 }
 

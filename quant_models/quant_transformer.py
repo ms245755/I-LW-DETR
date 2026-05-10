@@ -86,6 +86,22 @@ class ScaleSoftmax(nn.Module):
         return F.softmax(x, dim=self.dim), None
 
 
+def _linear_float(layer, x):
+    return F.linear(x, layer.weight, layer.bias)
+
+
+def _layer_norm_float(norm, x):
+    return F.layer_norm(x, norm.normalized_shape, norm.weight, norm.bias, norm.eps)
+
+
+def _mlp_float(mlp, x):
+    for i, layer in enumerate(mlp.layers):
+        x = _linear_float(layer, x)
+        if i < mlp.num_layers - 1:
+            x = F.relu(x)
+    return x
+
+
 class ScaleMSDeformAttn(MSDeformAttn):
     def __init__(self, *args, use_float_path=False, value_per_channel=False, observe_stat=False, block_name="", **kwargs):
         super().__init__(*args, **kwargs)
@@ -268,6 +284,7 @@ class Transformer(nn.Module):
                  bbox_reparam=False,
                  decoder_cross_attn_float=False,
                  decoder_cross_attn_value_per_channel=False,
+                 decoder_two_stage_float=False,
                  decoder_norm_output_qact=False,
                  decoder_refpoint_head_float=False,
                  transformer_quant_components=None,
@@ -278,6 +295,7 @@ class Transformer(nn.Module):
         self.quant_components = _component_set(transformer_quant_components)
         self.observe_stat = observe_stat
         self.block_name = block_name
+        self.decoder_two_stage_float = decoder_two_stage_float
 
         decoder_layer = TransformerDecoderLayer(d_model, sa_nhead, ca_nhead, dim_feedforward,
                                                 dropout, activation, normalize_before, 
@@ -313,6 +331,9 @@ class Transformer(nn.Module):
         self.qact_output_proposal = IViTAct()
         self.qact_memory_cat = IViTAct()
         self.qact_src_input_bridge = IViTAct()
+        self.qact_two_stage_memory = IViTAct()
+        self.qact_two_stage_refpoints = IViTAct()
+        self.qact_two_stage_boxes = IViTAct()
 
         self.two_stage = two_stage
         if two_stage:
@@ -394,33 +415,53 @@ class Transformer(nn.Module):
             save_tensor_from_pathname(output_memory, self.block_name + "1_two_stage/0_output_memory", observe_stat=self.observe_stat)
             save_tensor_from_pathname(output_proposals, self.block_name + "1_two_stage/1_output_proposals", observe_stat=self.observe_stat)
             
-            output_proposals, output_proposals_scale = self.qact_output_proposal(output_proposals, None)
+            if self.decoder_two_stage_float:
+                output_proposals_scale = None
+            else:
+                output_proposals, output_proposals_scale = self.qact_output_proposal(output_proposals, None)
             # group detr for first stage
             refpoint_embed_ts, memory_ts, boxes_ts = [], [], []
             group_detr = self.group_detr if self.training else 1
             for g_idx in range(group_detr):
-                # output_memory_gidx = self.enc_output_norm[g_idx](self.enc_output[g_idx](output_memory, memory_scale))
-                output_memory_gidx, output_memory_gidx_scale = self.enc_output[g_idx](output_memory, memory_scale)
-                output_memory_gidx, output_memory_gidx_scale = self.qact_post_linear_output[g_idx](
-                    output_memory_gidx, output_memory_gidx_scale)
-                output_memory_gidx, output_memory_gidx_scale = self.enc_output_norm[g_idx](
-                    output_memory_gidx, output_memory_gidx_scale)
-                output_memory_gidx, output_memory_gidx_scale = self.qact_post_norm_output[g_idx](
-                    output_memory_gidx, output_memory_gidx_scale)
+                if self.decoder_two_stage_float:
+                    output_memory_gidx = _linear_float(self.enc_output[g_idx], output_memory)
+                    output_memory_gidx = _layer_norm_float(self.enc_output_norm[g_idx], output_memory_gidx)
+                    output_memory_gidx_scale = None
+                else:
+                    # output_memory_gidx = self.enc_output_norm[g_idx](self.enc_output[g_idx](output_memory, memory_scale))
+                    output_memory_gidx, output_memory_gidx_scale = self.enc_output[g_idx](output_memory, memory_scale)
+                    output_memory_gidx, output_memory_gidx_scale = self.qact_post_linear_output[g_idx](
+                        output_memory_gidx, output_memory_gidx_scale)
+                    output_memory_gidx, output_memory_gidx_scale = self.enc_output_norm[g_idx](
+                        output_memory_gidx, output_memory_gidx_scale)
+                    output_memory_gidx, output_memory_gidx_scale = self.qact_post_norm_output[g_idx](
+                        output_memory_gidx, output_memory_gidx_scale)
                 save_tensor_from_pathname(
                     output_memory_gidx,
                     self.block_name + f"1_two_stage/2_group{g_idx}/0_output_memory",
                     observe_stat=self.observe_stat,
                 )
     
-                enc_outputs_class_unselected_gidx, enc_outputs_class_unselected_gidx_scale  = self.enc_out_class_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
+                if self.decoder_two_stage_float:
+                    enc_outputs_class_unselected_gidx = _linear_float(
+                        self.enc_out_class_embed[g_idx], output_memory_gidx
+                    )
+                    enc_outputs_class_unselected_gidx_scale = None
+                else:
+                    enc_outputs_class_unselected_gidx, enc_outputs_class_unselected_gidx_scale  = self.enc_out_class_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                 save_tensor_from_pathname(
                     enc_outputs_class_unselected_gidx,
                     self.block_name + f"1_two_stage/2_group{g_idx}/1_class_logits",
                     observe_stat=self.observe_stat,
                 )
                 if self.bbox_reparam:
-                    enc_outputs_coord_delta_gidx, enc_outputs_coord_delta_gidx_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
+                    if self.decoder_two_stage_float:
+                        enc_outputs_coord_delta_gidx = _mlp_float(
+                            self.enc_out_bbox_embed[g_idx], output_memory_gidx
+                        )
+                        enc_outputs_coord_delta_gidx_scale = None
+                    else:
+                        enc_outputs_coord_delta_gidx, enc_outputs_coord_delta_gidx_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                     enc_outputs_coord_cxcy_gidx = enc_outputs_coord_delta_gidx[...,
                         :2] * output_proposals[..., 2:] + output_proposals[..., :2]
                     enc_outputs_coord_cxcy_gidx_scale = (
@@ -441,7 +482,11 @@ class Transformer(nn.Module):
                     enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = _concat_optional_tensor_scale(concat_list, dim=-1)
 
                 else:
-                    tmp, tmp_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
+                    if self.decoder_two_stage_float:
+                        tmp = _mlp_float(self.enc_out_bbox_embed[g_idx], output_memory_gidx)
+                        tmp_scale = None
+                    else:
+                        tmp, tmp_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                     enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = _add_tensor_scale(tmp, tmp_scale, output_proposals, output_proposals_scale)
 
                 topk = self.num_queries
@@ -468,6 +513,10 @@ class Transformer(nn.Module):
             # (bs, nq, d)
             memory_ts, memory_ts_scale = _concat_optional_tensor_scale(memory_ts, dim=1)#.transpose(0, 1)
             boxes_ts, boxes_ts_scale = _concat_optional_tensor_scale(boxes_ts, dim=1)#.transpose(0, 1)
+            if self.decoder_two_stage_float:
+                refpoint_embed_ts, refpoint_embed_ts_scale = self.qact_two_stage_refpoints(refpoint_embed_ts, None)
+                boxes_ts, boxes_ts_scale = self.qact_two_stage_boxes(boxes_ts, None)
+                memory_ts, memory_ts_scale = self.qact_two_stage_memory(memory_ts, None)
             save_tensor_from_pathname(memory_ts, self.block_name + "1_two_stage/3_memory_topk", observe_stat=self.observe_stat)
             save_tensor_from_pathname(boxes_ts, self.block_name + "1_two_stage/4_boxes_topk", observe_stat=self.observe_stat)
         
@@ -996,6 +1045,7 @@ def build_transformer(args):
         bbox_reparam=args.bbox_reparam,
         decoder_cross_attn_float=getattr(args, "decoder_cross_attn_float", False),
         decoder_cross_attn_value_per_channel=getattr(args, "decoder_cross_attn_value_per_channel", False),
+        decoder_two_stage_float=getattr(args, "decoder_two_stage_float", False),
         decoder_norm_output_qact=getattr(args, "decoder_norm_output_qact", False),
         decoder_refpoint_head_float=getattr(args, "decoder_refpoint_head_float", False),
         transformer_quant_components=getattr(args, "transformer_quant_components", None),
