@@ -46,6 +46,13 @@ from util.utils import ModelEma, BestMetricHolder, clean_state_dict
 from util.benchmark import benchmark
 
 
+def sync_model_state_from_main(model):
+    if not utils.is_dist_avail_and_initialized():
+        return
+    for tensor in model.state_dict().values():
+        torch.distributed.broadcast(tensor, src=0)
+
+
 def adapt_checkpoint_keys_for_model(state_dict, model):
     """Load float self-attention weights into quant q/k/v projections."""
     model_keys = set(model.state_dict().keys())
@@ -256,6 +263,13 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--use_ema', action='store_true')
     parser.add_argument('--calib', action='store_true')
+    parser.add_argument('--calib_batches', default=500, type=int,
+                        help='Number of images/batches used for activation calibration.')
+    parser.add_argument('--no_calib_eval', dest='calib_eval', action='store_false',
+                        help='Skip evaluation after calibration.')
+    parser.add_argument('--no_calib_save', dest='calib_save', action='store_false',
+                        help='Skip saving the calibrated checkpoint.')
+    parser.set_defaults(calib_eval=True, calib_save=True)
     parser.add_argument('--qat', action='store_true')
     parser.add_argument('--ptq_reconstruct', action='store_true',
                         help='After PTQ calibration, run unlabeled block-wise reconstruction against a float teacher.')
@@ -463,7 +477,7 @@ def main(args):
     
     if args.calib:
         # 1) calibrate using val set (or train set). val is usually fine.
-        num_calib_batch = 200
+        num_calib_batch = args.calib_batches
         calib_loader = make_random_calib_loader(
             dataset_val,
             batch_size=1,
@@ -504,7 +518,7 @@ def main(args):
                 num_workers=0
             )
             reconstruct_ptq(
-                model,
+                model_without_ddp,
                 teacher_model,
                 recon_loader,
                 device,
@@ -525,7 +539,7 @@ def main(args):
                     num_workers=0
                 )
                 reconstruct_output_distill(
-                    model,
+                    model_without_ddp,
                     teacher_model,
                     output_distill_loader,
                     device,
@@ -537,6 +551,7 @@ def main(args):
                     box_weight=args.ptq_output_distill_box_weight,
                     temperature=args.ptq_output_distill_temperature,
                 )
+            sync_model_state_from_main(model_without_ddp)
             del teacher_model
 
         # 2) (optional) save calibrated quant checkpoint

@@ -23,6 +23,8 @@ build_common_model_args
 checkpoint="${RESUME:-$(resolve_path "$checkpoint_root" "$resume_name" "resume checkpoint")}"
 act_observer="${ACT_OBSERVER:-mean}"
 act_percentile="${ACT_PERCENTILE:-99}"
+calib_batches="${CALIB_BATCHES:-500}"
+calib_eval="${CALIB_EVAL:-true}"
 output_root="${OUTPUT_ROOT:-output}"
 output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_ptq_${scenario_label}_${model_size}}"
 ptq_reconstruct="${PTQ_RECONSTRUCT:-false}"
@@ -110,6 +112,11 @@ if [[ "$decoder_refpoint_head_float" == "1" || "$decoder_refpoint_head_float" ==
   decoder_refpoint_head_float_args=(--decoder_refpoint_head_float)
 fi
 
+calib_eval_args=()
+if [[ "$calib_eval" == "0" || "$calib_eval" == "false" || "$calib_eval" == "no" ]]; then
+  calib_eval_args=(--no_calib_eval)
+fi
+
 cd "$repo_root"
 
 if [[ "$has_quant_components" == "false" ]]; then
@@ -133,7 +140,9 @@ python -u -m torch.distributed.launch \
   "${common_model_args[@]}" \
   --act_observer "$act_observer" \
   --act_percentile "$act_percentile" \
+  --calib_batches "$calib_batches" \
   --calib \
+  "${calib_eval_args[@]}" \
   "${ptq_reconstruct_args[@]}" \
   "${decoder_cross_attn_float_args[@]}" \
   "${decoder_cross_attn_value_per_channel_args[@]}" \
