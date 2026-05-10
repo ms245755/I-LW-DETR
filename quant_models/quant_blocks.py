@@ -254,7 +254,10 @@ class IAttention(nn.Module):
 
         # Quantized matmul + softmax
         self.matmul = IViTMatMul()
-        self.softmax = IViTSoftmax(output_bit=16, dim=-1)
+        if window:
+            self.softmax = IViTSoftmax(output_bit=16, dim=-1)
+        else:
+            self.softmax = IViTSoftmax(output_bit=16, dim=-1, m=31)
 
         # Quantized activations
         self.qact_qkv = IViTAct(activation_bit=num_bits)
@@ -354,7 +357,7 @@ class IAttention(nn.Module):
                 attn, act_scaling_factor = self.softmax(
                     x=attn,
                     act_scaling_factor=act_scaling_factor,
-                    dynamic_input_scale=True,
+                    # dynamic_input_scale=True,
                 )
         else:
             attn = F.softmax(attn, dim=-1)
@@ -729,7 +732,7 @@ class IMSDeformAttn(nn.Module):
         self.qact_sampling_offsets = IViTAct()   # after sampling_offsets
         self.qact_sampling_locs    = IViTAct()   # quantize sampling locations
         self.qact_attn_weights     = IViTAct()   # after attention_weights + softmax
-        self.qact_sampled_values   = IViTAct()   # after grid sampling
+        self.qact_sampled_values   = IViTAct(per_channel=True)   # after grid sampling
         self.qact_output           = IViTAct()   # after ms_deform_attn_core
 
         self._reset_parameters()
@@ -849,9 +852,9 @@ class IMSDeformAttn(nn.Module):
         attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
         save_tensor_from_pathname(attn_weights, self.block_name + "5_attention_logits", observe_stat=self.observe_stat)
         attn_scale = attn_scale.view(self.n_heads, self.n_levels * self.n_points)
-        attn_weights, attn_scale = self.softmax(attn_weights, attn_scale)
+        attn_weights, attn_scale = self.softmax(attn_weights, attn_scale, dynamic_input_scale=True)
         attn_weights = attn_weights.transpose(1, 2).reshape(N * self.n_heads, Len_q, self.n_levels * self.n_points)
-        attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
+        # attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
         attn_weights = attn_weights.reshape(N, self.n_heads, Len_q, self.n_levels * self.n_points).transpose(1, 2)
         save_tensor_from_pathname(attn_weights, self.block_name + "7_attention_weights", observe_stat=self.observe_stat)
 
@@ -996,6 +999,27 @@ def quantized_ms_deform_attn_core_pytorch(
     """
     B, n_heads, head_dim, _ = value.shape
     _, Len_q, n_heads, L, P, _ = sampling_locations.shape
+
+    def _sampled_scale_view(scale):
+        if not torch.is_tensor(scale) or scale.numel() == 1:
+            return scale
+        if scale.numel() == head_dim:
+            return scale.view(1, head_dim, 1, 1)
+        if scale.numel() == B * n_heads * head_dim:
+            return scale.view(B * n_heads, head_dim, 1, 1)
+        if scale.numel() == n_heads * head_dim:
+            return scale.view(1, n_heads, head_dim, 1, 1).expand(B, -1, -1, -1, -1).reshape(B * n_heads, head_dim, 1, 1)
+        return scale
+
+    def _attention_scale_view(scale):
+        if not torch.is_tensor(scale) or scale.numel() == 1:
+            return scale
+        if scale.numel() == L * P:
+            return scale.view(1, 1, 1, L * P)
+        if scale.numel() == n_heads * L * P:
+            return scale.view(1, n_heads, 1, L * P).expand(B, -1, -1, -1).reshape(B * n_heads, 1, 1, L * P)
+        return scale
+
     value_list = value.split([H * W for H, W in value_spatial_shapes], dim=3)
     sampling_grids = 2 * sampling_locations - 1
     sampling_value_list = []
@@ -1017,9 +1041,11 @@ def quantized_ms_deform_attn_core_pytorch(
         sampled_scale = value_scale
 
     attention_weights = attention_weights.transpose(1, 2).reshape(B * n_heads, 1, Len_q, L * P)
+    sampled_scale = _sampled_scale_view(sampled_scale)
+    attention_weights_scale = _attention_scale_view(attention_weights_scale)
     prod, prod_scale = multiply_tensor_scale(
         sampling_value_list, sampled_scale, attention_weights, attention_weights_scale
     )
     prod_int = round_ste.apply(prod / prod_scale)
-    output = prod_int.sum(-1).view(B, n_heads * head_dim, Len_q) * prod_scale
+    output = (prod_int * prod_scale).sum(-1).view(B, n_heads * head_dim, Len_q)
     return output.transpose(1, 2).contiguous()

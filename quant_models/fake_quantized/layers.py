@@ -1026,14 +1026,14 @@ class IViTSoftmax(nn.Module):
     Class to quantize given Softmax layer
     """
 
-    def __init__(self, output_bit=8, n=15, lambda_scaler=1, input_bit=8, **kwargs):
+    def __init__(self, output_bit=8, n=15, lambda_scaler=1, input_bit=8, m=31, **kwargs):
         super(IViTSoftmax, self).__init__()
         self.output_bit = output_bit
         self.input_bit = input_bit
 
         self.n = n  # sufficiently large integer
         self.lambda_scaler = lambda_scaler
-        self.m = 31
+        self.m = m
         # The minimum value for ensuring accuracy (varies depending on models)
 
         self.register_buffer(
@@ -1079,7 +1079,7 @@ class IViTSoftmax(nn.Module):
                 needs_shift = row_abs_max > target * shift_factor
                 shift_factor = torch.where(needs_shift, shift_factor * 2, shift_factor)
         act_scaling_factor = act_scaling_factor * shift_factor
-        return x_int, act_scaling_factor
+        return x, act_scaling_factor
 
     def _rowwise_input_quant(self, x):
         with torch.no_grad():
