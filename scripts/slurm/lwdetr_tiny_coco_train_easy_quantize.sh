@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # Specify resource requirements
-#SBATCH --time=40:00:00               # Job time limit (2 hours, change as necessary)
-#SBATCH --partition=gpu40G           # Partition for GPU (adjust based on your cluster's partition)
+#SBATCH --time=100:00:00               # Job time limit (2 hours, change as necessary)
+#SBATCH --partition=prismgpup           # Partition for GPU (adjust based on your cluster's partition)
 #SBATCH --nodes=1                     # Number of nodes
 #SBATCH --ntasks-per-node=1           # Number of tasks per node
 #SBATCH --cpus-per-task=8             # Number of CPU cores per task

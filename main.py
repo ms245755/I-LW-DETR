@@ -20,6 +20,7 @@ import random
 import time
 import ast
 import copy
+import fnmatch
 from pathlib import Path
 
 import numpy as np
@@ -341,14 +342,13 @@ def main(args):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank() + 2
+    seed = args.seed + utils.get_rank() + 20
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
     if args.calib or args.qat:
         model, criterion, postprocessors = build_model_quant(args)
-
     else:
         model, criterion, postprocessors = build_model(args)
     model.to(device)
@@ -407,8 +407,19 @@ def main(args):
         # e.g., when load object365 pretrain, do not load `class_embed.[weight, bias]`
         if args.pretrain_exclude_keys is not None:
             assert isinstance(args.pretrain_exclude_keys, list)
-            for exclude_key in args.pretrain_exclude_keys:
-                checkpoint['model'].pop(exclude_key)
+            excluded_keys = []
+            for exclude_pattern in args.pretrain_exclude_keys:
+                matched_keys = [
+                    key for key in list(checkpoint['model'].keys())
+                    if fnmatch.fnmatch(key, exclude_pattern)
+                ]
+                for matched_key in matched_keys:
+                    checkpoint['model'].pop(matched_key)
+                excluded_keys.extend(matched_keys)
+            if excluded_keys:
+                print(f"Excluded {len(excluded_keys)} pretrain keys:")
+                for excluded_key in excluded_keys:
+                    print(f"  {excluded_key}")
         if args.pretrain_keys_modify_to_load is not None:
             from util.obj365_to_coco_model import get_coco_pretrain_from_obj365
             assert isinstance(args.pretrain_keys_modify_to_load, list)
@@ -597,8 +608,8 @@ def main(args):
     
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
-    for epoch in range(0, args.epochs):
-        if epoch < 3 and args.qat:
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.qat:
             unfreeze_model(model)
         epoch_start_time = time.time()
         if args.distributed:
@@ -610,7 +621,7 @@ def main(args):
             vit_encoder_num_layers=args.vit_encoder_num_layers, args=args)
         train_epoch_time = time.time() - epoch_start_time
         train_epoch_time_str = str(datetime.timedelta(seconds=int(train_epoch_time)))
-        if epoch < 3 and args.qat:
+        if args.qat:
             freeze_model(model)
         lr_scheduler.step()
         if args.output_dir:

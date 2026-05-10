@@ -156,7 +156,7 @@ configure_scenario() {
 
   encoder_quant_blocks="${ENCODER_QUANT_BLOCKS:-all}"
   encoder_quant_components="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
-  projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu layernorm}"
+  projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu silu layernorm}"
 }
 
 split_args() {
