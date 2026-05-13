@@ -893,7 +893,8 @@ class IMSDeformAttn(nn.Module):
         )
         if self.quant_sampling_offsets:
             sampling_offsets, sampling_scale = self.qact_sampling_offsets(sampling_offsets, sampling_scale)
-        # dequant for view + normalizer division (non-quantizable ops)
+
+        # Reshape offsets into per-head/per-level sample coordinates.
         sampling_offsets = sampling_offsets.view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
         save_tensor_from_pathname(sampling_offsets, self.block_name + "4_sampling_offsets", observe_stat=self.observe_stat)
 
@@ -922,42 +923,47 @@ class IMSDeformAttn(nn.Module):
         attn_weights = attn_weights.reshape(N, self.n_heads, Len_q, self.n_levels * self.n_points).transpose(1, 2)
         save_tensor_from_pathname(attn_weights, self.block_name + "7_attention_weights", observe_stat=self.observe_stat)
 
-        # ── sampling locations (float op — not quantizable) ────────────
-        if reference_points.shape[-1] == 2:
-            offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
-            sampling_locations = (
-                reference_points[:, :, None, :, None, :]
-                + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
-            )
-        elif reference_points.shape[-1] == 4:
-            sampling_locations = (
-                reference_points[:, :, None, :, None, :2]
-                + sampling_offsets / self.n_points * reference_points[:, :, None, :, None, 2:] * 0.5
-            )
-        else:
-            raise ValueError(
-                "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
-            )
-        # print(sampling_locations)
-        # sampling_locations, sampling_locations_scale = self.qact_sampling_locs(sampling_locations, None)
-        save_tensor_from_pathname(sampling_locations, self.block_name + "6_sampling_locations", observe_stat=self.observe_stat)
-
         # ── deformable attention core ──────────────────────────────────
         value_float = value.transpose(1, 2).contiguous().view(
             N, self.n_heads, self.d_model // self.n_heads, Len_in
         )
         if self.quant_core:
+            ref_shape = reference_points.shape
+            reference_points, reference_scale = self.qact_reference_points(
+                reference_points.reshape(ref_shape[0], -1, ref_shape[-1]),
+                None,
+            )
+            reference_points = reference_points.reshape(ref_shape)
             output = quantized_ms_deform_attn_core_pytorch(
                 value_float,
                 value_scale,
                 input_spatial_shapes,
-                sampling_locations,
-                None,
+                reference_points,
+                reference_scale,
+                sampling_offsets,
+                sampling_scale,
                 attn_weights,
                 attn_scale,
                 qact_sampled_values=self.qact_sampled_values,
             )
         else:
+            # Float fallback keeps the original bilinear deformable-attention geometry.
+            if reference_points.shape[-1] == 2:
+                offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+                sampling_locations = (
+                    reference_points[:, :, None, :, None, :]
+                    + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+                )
+            elif reference_points.shape[-1] == 4:
+                sampling_locations = (
+                    reference_points[:, :, None, :, None, :2]
+                    + sampling_offsets / self.n_points * reference_points[:, :, None, :, None, 2:] * 0.5
+                )
+            else:
+                raise ValueError(
+                    "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
+                )
+            save_tensor_from_pathname(sampling_locations, self.block_name + "6_sampling_locations", observe_stat=self.observe_stat)
             output = ms_deform_attn_core_pytorch(value_float, input_spatial_shapes, sampling_locations, attn_weights)
             value_scale = None
         save_tensor_from_pathname(output, self.block_name + "8_core_output", observe_stat=self.observe_stat)
@@ -1003,6 +1009,38 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
     return output.transpose(1, 2).contiguous()
 
 
+def _value_scale_view(value, value_scale):
+    B, C, _, _ = value.shape
+    if torch.is_tensor(value_scale) and value_scale.numel() > 1:
+        if value_scale.numel() == C:
+            return value_scale.reshape(1, C, 1, 1)
+        if value_scale.numel() == B * C:
+            return value_scale.reshape(B, C, 1, 1)
+        raise RuntimeError(
+            f"value_scale with {value_scale.numel()} elements cannot broadcast to value shape {tuple(value.shape)}"
+        )
+    if torch.is_tensor(value_scale):
+        return value_scale.to(device=value.device, dtype=value.dtype).reshape(1, 1, 1, 1)
+    return value.new_tensor(value_scale).view(1, 1, 1, 1)
+
+
+def quant_gather_nearest(value, value_scale, x_idx, y_idx, valid):
+    """Gather quantized values at precomputed integer sampling indexes."""
+    B, C, H, W = value.shape
+    scale = _value_scale_view(value, value_scale)
+    value_int = round_ste.apply(value / scale)
+
+    x_idx = x_idx.clamp(0, W - 1).long()
+    y_idx = y_idx.clamp(0, H - 1).long()
+
+    linear_idx = (y_idx * W + x_idx).reshape(B, 1, -1).expand(-1, C, -1)
+    value_flat = value_int.reshape(B, C, H * W)
+    sampled_int = torch.gather(value_flat, dim=2, index=linear_idx).reshape(B, C, x_idx.shape[1], x_idx.shape[2])
+    sampled_int = sampled_int * valid.unsqueeze(1).to(sampled_int.dtype)
+
+    return sampled_int * scale
+
+
 def quant_grid_sample_nearest(value, value_scale, sampling_grid):
     """Quantization-friendly nearest-neighbor sampler.
 
@@ -1016,24 +1054,7 @@ def quant_grid_sample_nearest(value, value_scale, sampling_grid):
         Sampled tensor of shape [B, C, Len_q, P] gathered with integer-like
         nearest-neighbor indexing using the align_corners=False convention.
     """
-    B, C, H, W = value.shape
-
-    if torch.is_tensor(value_scale) and value_scale.numel() > 1:
-        if value_scale.numel() == C:
-            scale = value_scale.reshape(1, C, 1, 1)
-        elif value_scale.numel() == B * C:
-            scale = value_scale.reshape(B, C, 1, 1)
-        else:
-            raise RuntimeError(
-                f"value_scale with {value_scale.numel()} elements cannot broadcast to value shape {tuple(value.shape)}"
-            )
-    elif torch.is_tensor(value_scale):
-        scale = value_scale.to(device=value.device, dtype=value.dtype).reshape(1, 1, 1, 1)
-    else:
-        scale = value.new_tensor(value_scale).view(1, 1, 1, 1)
-
-    value_int = round_ste.apply(value / scale)
-
+    _, _, H, W = value.shape
     x_norm = sampling_grid[..., 0]
     y_norm = sampling_grid[..., 1]
 
@@ -1046,35 +1067,77 @@ def quant_grid_sample_nearest(value, value_scale, sampling_grid):
 
     valid = (x_idx >= 0) & (x_idx <= (W - 1)) & (y_idx >= 0) & (y_idx <= (H - 1))
 
-    x_idx = x_idx.clamp(0, W - 1).long()
-    y_idx = y_idx.clamp(0, H - 1).long()
+    return quant_gather_nearest(value, value_scale, x_idx, y_idx, valid)
 
-    linear_idx = (y_idx * W + x_idx).reshape(B, 1, -1).expand(-1, C, -1)
-    value_flat = value_int.reshape(B, C, H * W)
-    sampled_int = torch.gather(value_flat, dim=2, index=linear_idx).reshape(B, C, sampling_grid.shape[1], sampling_grid.shape[2])
-    sampled_int = sampled_int * valid.unsqueeze(1).to(sampled_int.dtype)
 
-    return sampled_int * scale
+def quantized_nearest_indices(reference_points, sampling_offsets, value_spatial_shapes, n_points, coord_bits=16):
+    """Compute nearest-neighbor sample indexes with fixed-point coordinate math.
+
+    Returns one (x_idx, y_idx, valid) tuple per feature level. The index tensors
+    are shaped [B * n_heads, Len_q, n_points].
+    """
+    if reference_points.shape[-1] not in (2, 4):
+        raise ValueError(
+            "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
+        )
+
+    B, Len_q, n_heads, n_levels, _, _ = sampling_offsets.shape
+    coord_scale = reference_points.new_tensor(float(2**coord_bits))
+    half = coord_scale / 2
+    ref_int = round_ste.apply(reference_points * coord_scale)
+    offset_int = round_ste.apply(sampling_offsets * coord_scale)
+    level_indexes = []
+
+    for lid_, (H, W) in enumerate(value_spatial_shapes):
+        H = int(H.item()) if torch.is_tensor(H) else int(H)
+        W = int(W.item()) if torch.is_tensor(W) else int(W)
+        ref_l = ref_int[:, :, lid_]
+        offset_l = offset_int[:, :, :, lid_]
+
+        if reference_points.shape[-1] == 2:
+            x_num = ref_l[:, :, None, None, 0] * W + offset_l[..., 0] - half
+            y_num = ref_l[:, :, None, None, 1] * H + offset_l[..., 1] - half
+        else:
+            ref_xy = ref_l[..., :2]
+            ref_wh = ref_l[..., 2:]
+            x_delta = round_ste.apply(offset_l[..., 0] * ref_wh[:, :, None, None, 0] * W / (coord_scale * 2 * n_points))
+            y_delta = round_ste.apply(offset_l[..., 1] * ref_wh[:, :, None, None, 1] * H / (coord_scale * 2 * n_points))
+            x_num = ref_xy[:, :, None, None, 0] * W + x_delta - half
+            y_num = ref_xy[:, :, None, None, 1] * H + y_delta - half
+
+        x_idx = round_ste.apply(x_num / coord_scale)
+        y_idx = round_ste.apply(y_num / coord_scale)
+        valid = (x_idx >= 0) & (x_idx <= (W - 1)) & (y_idx >= 0) & (y_idx <= (H - 1))
+
+        x_idx = x_idx.permute(0, 2, 1, 3).reshape(B * n_heads, Len_q, n_points)
+        y_idx = y_idx.permute(0, 2, 1, 3).reshape(B * n_heads, Len_q, n_points)
+        valid = valid.permute(0, 2, 1, 3).reshape(B * n_heads, Len_q, n_points)
+        level_indexes.append((x_idx, y_idx, valid))
+
+    return level_indexes
 
 
 def quantized_ms_deform_attn_core_pytorch(
     value,
     value_scale,
     value_spatial_shapes,
-    sampling_locations,
-    sampling_locations_scale,
+    reference_points,
+    reference_points_scale,
+    sampling_offsets,
+    sampling_offsets_scale,
     attention_weights,
     attention_weights_scale,
     qact_sampled_values=None,
 ):
     """Fake-quantized deformable attention core.
 
-    The geometric sampler still uses float `grid_sample`, but sampled features
-    and attention weights are requantized before the weighted accumulation so
-    the MAC path is executed in an INT8-emulated form.
+    The geometric sampler uses fixed-point nearest-neighbor indexes and gather
+    instead of float `grid_sample`. Sampled features and attention weights are
+    requantized before the weighted accumulation so the MAC path is executed in
+    an INT8-emulated form.
     """
     B, n_heads, head_dim, _ = value.shape
-    _, Len_q, n_heads, L, P, _ = sampling_locations.shape
+    _, Len_q, n_heads, L, P, _ = sampling_offsets.shape
 
     def _sampled_scale_view(scale):
         if not torch.is_tensor(scale) or scale.numel() == 1:
@@ -1097,17 +1160,17 @@ def quantized_ms_deform_attn_core_pytorch(
         return scale
 
     value_list = value.split([H * W for H, W in value_spatial_shapes], dim=3)
-    sampling_grids = 2 * sampling_locations - 1
+    level_indexes = quantized_nearest_indices(reference_points, sampling_offsets, value_spatial_shapes, P)
     sampling_value_list = []
 
     for lid_, (H, W) in enumerate(value_spatial_shapes):
         value_l_ = value_list[lid_].view(B * n_heads, head_dim, H, W)
-        sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
+        x_idx, y_idx, valid = level_indexes[lid_]
         if torch.is_tensor(value_scale) and value_scale.numel() > 1:
             value_scale_l_ = value_scale.view(n_heads, head_dim)[None].expand(B, -1, -1).reshape(B * n_heads, head_dim)
         else:
             value_scale_l_ = value_scale
-        sampling_value_l_ = quant_grid_sample_nearest(value_l_, value_scale_l_, sampling_grid_l_)
+        sampling_value_l_ = quant_gather_nearest(value_l_, value_scale_l_, x_idx, y_idx, valid)
         sampling_value_list.append(sampling_value_l_)
 
     sampling_value_list = torch.stack(sampling_value_list, dim=-2).flatten(-2)
