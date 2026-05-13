@@ -692,6 +692,7 @@ class IMSDeformAttn(nn.Module):
         n_points=4,
         use_float_path=False,
         value_per_channel=False,
+        quant_components=None,
         observe_stat=False,
         block_name="",
     ):
@@ -713,6 +714,13 @@ class IMSDeformAttn(nn.Module):
         self.n_points = n_points
         self.use_float_path = use_float_path
         self.value_per_channel = value_per_channel
+        self.quant_components = self._cross_attn_component_set(quant_components)
+        self.quant_value_proj = "value_proj" in self.quant_components
+        self.quant_sampling_offsets = "sampling_offsets" in self.quant_components
+        self.quant_attention_weights = "attention_weights" in self.quant_components
+        self.quant_softmax = "softmax" in self.quant_components
+        self.quant_core = bool({"grid_sample_core", "weighted_sum"} & self.quant_components)
+        self.quant_output_proj = "output_proj" in self.quant_components
         self.observe_stat = observe_stat
         self.block_name = block_name
 
@@ -737,6 +745,41 @@ class IMSDeformAttn(nn.Module):
 
         self._reset_parameters()
         self._export = False
+
+    def _cross_attn_component_set(self, components):
+        if components is None:
+            return {
+                "value_proj",
+                "sampling_offsets",
+                "attention_weights",
+                "softmax",
+                "grid_sample_core",
+                "weighted_sum",
+                "output_proj",
+            }
+        components = {component for component in components if component != "none"}
+        if "all" in components:
+            components.update(
+                {
+                    "value_proj",
+                    "sampling_offsets",
+                    "attention_weights",
+                    "softmax",
+                    "grid_sample_core",
+                    "weighted_sum",
+                    "output_proj",
+                }
+            )
+        if "core" in components:
+            components.update({"grid_sample_core", "weighted_sum"})
+        return components
+
+    def _linear_maybe_quant(self, layer, x, scale, quant_enabled, qact_input=None):
+        if quant_enabled:
+            if scale is None and qact_input is not None:
+                x, scale = qact_input(x, None)
+            return layer(x, scale)
+        return F.linear(x, layer.weight, layer.bias), None
 
     def export(self):
         self._export = True
@@ -821,19 +864,19 @@ class IMSDeformAttn(nn.Module):
             save_tensor_from_pathname(output, self.block_name + "9_output_proj", observe_stat=self.observe_stat)
             return self.qact_output(output, None)
 
-        if query_scaling_factor is None:
-            query_int, query_scale = self.qact_query(query)
-        else:
-            query_int, query_scale = query, query_scaling_factor   # already quantized
-
-        if input_scaling_factor is None:
-            flatten_int, flatten_scale = self.qact_input(input_flatten)
-        else:
-            flatten_int, flatten_scale = input_flatten, input_scaling_factor  # already quantized
+        query_int, query_scale = query, query_scaling_factor
+        flatten_int, flatten_scale = input_flatten, input_scaling_factor
 
         # ── value projection ───────────────────────────────────────────
-        value, value_scale = self.value_proj(flatten_int, flatten_scale)
-        value, value_scale = self.qact_value(value, value_scale)
+        value, value_scale = self._linear_maybe_quant(
+            self.value_proj,
+            flatten_int,
+            flatten_scale,
+            self.quant_value_proj,
+            self.qact_input,
+        )
+        if self.quant_value_proj or self.quant_core:
+            value, value_scale = self.qact_value(value, value_scale)
         # value: (N, Len_in, d_model)
 
         if input_padding_mask is not None:
@@ -841,20 +884,41 @@ class IMSDeformAttn(nn.Module):
         save_tensor_from_pathname(value, self.block_name + "3_value_proj", observe_stat=self.observe_stat)
 
         # ── sampling offsets ───────────────────────────────────────────
-        sampling_offsets, sampling_scale = self.sampling_offsets(query_int, query_scale)
-        sampling_offsets, sampling_scale = self.qact_sampling_offsets(sampling_offsets, sampling_scale)
+        sampling_offsets, sampling_scale = self._linear_maybe_quant(
+            self.sampling_offsets,
+            query_int,
+            query_scale,
+            self.quant_sampling_offsets,
+            self.qact_query,
+        )
+        if self.quant_sampling_offsets:
+            sampling_offsets, sampling_scale = self.qact_sampling_offsets(sampling_offsets, sampling_scale)
         # dequant for view + normalizer division (non-quantizable ops)
         sampling_offsets = sampling_offsets.view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
         save_tensor_from_pathname(sampling_offsets, self.block_name + "4_sampling_offsets", observe_stat=self.observe_stat)
 
         # ── attention weights ──────────────────────────────────────────
-        attn_weights, attn_scale = self.attention_weights(query_int, query_scale)
+        attn_weights, attn_scale = self._linear_maybe_quant(
+            self.attention_weights,
+            query_int,
+            query_scale,
+            self.quant_attention_weights,
+            self.qact_query,
+        )
         attn_weights = attn_weights.view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
         save_tensor_from_pathname(attn_weights, self.block_name + "5_attention_logits", observe_stat=self.observe_stat)
-        attn_scale = attn_scale.view(self.n_heads, self.n_levels * self.n_points)
-        attn_weights, attn_scale = self.softmax(attn_weights, attn_scale, dynamic_input_scale=True)
+        if self.quant_softmax:
+            if attn_scale is None:
+                attn_weights, attn_scale = self.qact_attn_weights(attn_weights, None)
+            if torch.is_tensor(attn_scale) and attn_scale.numel() == self.n_heads * self.n_levels * self.n_points:
+                attn_scale = attn_scale.view(self.n_heads, self.n_levels * self.n_points)
+            attn_weights, attn_scale = self.softmax(attn_weights, attn_scale, dynamic_input_scale=True)
+        else:
+            attn_weights = F.softmax(attn_weights, -1)
+            attn_scale = None
         attn_weights = attn_weights.transpose(1, 2).reshape(N * self.n_heads, Len_q, self.n_levels * self.n_points)
-        # attn_weights, attn_scale = self.qact_attn_weights(attn_weights, attn_scale)
+        if self.quant_core and attn_scale is None:
+            attn_weights, attn_scale = self.qact_attn_weights(attn_weights, None)
         attn_weights = attn_weights.reshape(N, self.n_heads, Len_q, self.n_levels * self.n_points).transpose(1, 2)
         save_tensor_from_pathname(attn_weights, self.block_name + "7_attention_weights", observe_stat=self.observe_stat)
 
@@ -882,21 +946,33 @@ class IMSDeformAttn(nn.Module):
         value_float = value.transpose(1, 2).contiguous().view(
             N, self.n_heads, self.d_model // self.n_heads, Len_in
         )
-        output = quantized_ms_deform_attn_core_pytorch(
-            value_float,
-            value_scale,
-            input_spatial_shapes,
-            sampling_locations,
-            None,
-            attn_weights,
-            attn_scale,
-            qact_sampled_values=self.qact_sampled_values,
-        )
+        if self.quant_core:
+            output = quantized_ms_deform_attn_core_pytorch(
+                value_float,
+                value_scale,
+                input_spatial_shapes,
+                sampling_locations,
+                None,
+                attn_weights,
+                attn_scale,
+                qact_sampled_values=self.qact_sampled_values,
+            )
+        else:
+            output = ms_deform_attn_core_pytorch(value_float, input_spatial_shapes, sampling_locations, attn_weights)
+            value_scale = None
         save_tensor_from_pathname(output, self.block_name + "8_core_output", observe_stat=self.observe_stat)
-        output, output_scale = self.qact_output(output, None)
+        output_scale = None
+        if self.quant_core or self.quant_output_proj:
+            output, output_scale = self.qact_output(output, None)
 
         # ── output projection ──────────────────────────────────────────
-        output, output_scale = self.output_proj(output, output_scale)
+        output, output_scale = self._linear_maybe_quant(
+            self.output_proj,
+            output,
+            output_scale,
+            self.quant_output_proj,
+            self.qact_output,
+        )
         save_tensor_from_pathname(output, self.block_name + "9_output_proj", observe_stat=self.observe_stat)
 
         return output, output_scale

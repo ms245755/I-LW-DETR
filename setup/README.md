@@ -82,7 +82,13 @@ The scenario scripts only set defaults. You can still turn quantization on or of
 | `ENCODER_QUANT_BLOCKS` | ViT block selection | `all` or block indexes like `"0 3 5"` |
 | `ENCODER_QUANT_COMPONENTS` | Ops inside selected ViT blocks | `linear conv2d matmul softmax gelu layernorm` |
 | `PROJECTOR_QUANT_COMPONENTS` | Ops inside the projector | `conv2d gelu silu layernorm` |
-| `TRANSFORMER_QUANT_COMPONENTS` | Ops inside the transformer | `linear matmul softmax layernorm deformable_attention` |
+| `TRANSFORMER_QUANT_COMPONENTS` | Large decoder blocks inside the transformer | `self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm` |
+| `DECODER_SELF_ATTN_QUANT_COMPONENTS` | Self-attention subcomponents | `all`, `linear matmul softmax`, or `none` |
+| `DECODER_CROSS_ATTN_QUANT_COMPONENTS` | Cross-attention subcomponents | `all`, `value_proj sampling_offsets attention_weights softmax grid_sample_core weighted_sum output_proj`, `core`, or `none` |
+| `DECODER_FFN_QUANT_COMPONENTS` | FFN subcomponents | `all`, `linear`, or `none` |
+| `DECODER_REFPOINT_QUANT_COMPONENTS` | Reference-point path subcomponents | `all`, `linear sine_embed coord_proj`, or `none` |
+| `DECODER_TWO_STAGE_QUANT_COMPONENTS` | Two-stage path subcomponents | `all`, `proposal enc_output enc_output_norm class_head bbox_head bbox_reparam selected_inputs`, or `none` |
+| `DECODER_OUTPUT_NORM_QUANT_COMPONENTS` | Final decoder norm subcomponents | `all`, `layernorm output_qact`, or `none` |
 | `LWDETR_QUANT_COMPONENTS` | LW-DETR prediction heads | `linear` or `none` |
 | `BACKBONE_QUANT_COMPONENTS` | Backbone submodules | `vit`, `projector`, or both |
 | `QUANT_MODEL_COMPONENTS` | Top-level modules | `backbone`, `transformer`, or both |
@@ -99,11 +105,11 @@ bash setup/ptq/vit_only.sh /path/to/coco /path/to/checkpoints
 PROJECTOR_QUANT_COMPONENTS="conv2d layernorm" \
 bash setup/qat/vit_projector.sh /path/to/coco /path/to/checkpoints
 
-TRANSFORMER_QUANT_COMPONENTS="linear layernorm" \
+TRANSFORMER_QUANT_COMPONENTS="self_attn norm" \
 LWDETR_QUANT_COMPONENTS="none" \
 bash setup/ptq/vit_projector_transformer_float_head.sh /path/to/coco /path/to/checkpoints
 
-TRANSFORMER_QUANT_COMPONENTS="linear matmul softmax layernorm deformable_attention" \
+TRANSFORMER_QUANT_COMPONENTS="self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm" \
 LWDETR_QUANT_COMPONENTS="linear" \
 bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoints
 ```

@@ -14,7 +14,15 @@ Optional environment variables:
   ENCODER_QUANT_BLOCKS          ViT block indexes to quantize, or all
   ENCODER_QUANT_COMPONENTS      Ops quantized inside ViT blocks
   PROJECTOR_QUANT_COMPONENTS    Ops quantized inside the projector
-  TRANSFORMER_QUANT_COMPONENTS  Ops quantized inside the transformer
+  TRANSFORMER_QUANT_COMPONENTS  Large decoder blocks quantized inside the transformer
+  DECODER_QUANT_BLOCKS          Decoder layer indexes to quantize, or all
+  DECODER_QUANT_NORMS           Decoder norms to quantize: norm1 norm2 norm3, or all
+  DECODER_SELF_ATTN_QUANT_COMPONENTS
+  DECODER_CROSS_ATTN_QUANT_COMPONENTS
+  DECODER_FFN_QUANT_COMPONENTS
+  DECODER_REFPOINT_QUANT_COMPONENTS
+  DECODER_TWO_STAGE_QUANT_COMPONENTS
+  DECODER_OUTPUT_NORM_QUANT_COMPONENTS
   LWDETR_QUANT_COMPONENTS       Ops quantized inside prediction heads
   DECODER_TWO_STAGE_FLOAT       Keep two-stage proposal/top-k path float
 EOF
@@ -138,14 +146,14 @@ configure_scenario() {
       scenario_label="vit_projector_transformer_float_head"
       quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone transformer}"
       backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
-      transformer_quant_components="${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
+      transformer_quant_components="${TRANSFORMER_QUANT_COMPONENTS:-self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm}"
       lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-none}"
       ;;
     fully_quantized)
       scenario_label="fully_quantized"
       quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone transformer}"
       backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
-      transformer_quant_components="${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
+      transformer_quant_components="${TRANSFORMER_QUANT_COMPONENTS:-self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm}"
       lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-linear}"
       ;;
     *)
@@ -155,8 +163,16 @@ configure_scenario() {
   esac
 
   encoder_quant_blocks="${ENCODER_QUANT_BLOCKS:-all}"
+  decoder_quant_blocks="${DECODER_QUANT_BLOCKS:-all}"
+  decoder_quant_norms="${DECODER_QUANT_NORMS:-all}"
   encoder_quant_components="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
   projector_quant_components="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu silu layernorm}"
+  decoder_self_attn_quant_components="${DECODER_SELF_ATTN_QUANT_COMPONENTS:-all}"
+  decoder_cross_attn_quant_components="${DECODER_CROSS_ATTN_QUANT_COMPONENTS:-all}"
+  decoder_ffn_quant_components="${DECODER_FFN_QUANT_COMPONENTS:-all}"
+  decoder_refpoint_quant_components="${DECODER_REFPOINT_QUANT_COMPONENTS:-all}"
+  decoder_two_stage_quant_components="${DECODER_TWO_STAGE_QUANT_COMPONENTS:-all}"
+  decoder_output_norm_quant_components="${DECODER_OUTPUT_NORM_QUANT_COMPONENTS:-all}"
 }
 
 split_args() {
@@ -170,6 +186,46 @@ make_quant_block_args() {
   if [[ "$encoder_quant_blocks" != "all" ]]; then
     read -r -a quant_block_values <<< "$encoder_quant_blocks"
     quant_block_args=(--encoder_quant_blocks "${quant_block_values[@]}")
+  fi
+  decoder_quant_block_args=()
+  if [[ "$decoder_quant_blocks" != "all" ]]; then
+    read -r -a decoder_quant_block_values <<< "$decoder_quant_blocks"
+    decoder_quant_block_args=(--decoder_quant_blocks "${decoder_quant_block_values[@]}")
+  fi
+  decoder_quant_norm_args=()
+  if [[ "$decoder_quant_norms" != "all" ]]; then
+    read -r -a decoder_quant_norm_values <<< "$decoder_quant_norms"
+    decoder_quant_norm_args=(--decoder_quant_norms "${decoder_quant_norm_values[@]}")
+  fi
+  decoder_self_attn_quant_component_args=()
+  if [[ "$decoder_self_attn_quant_components" != "all" ]]; then
+    read -r -a decoder_self_attn_quant_component_values <<< "$decoder_self_attn_quant_components"
+    decoder_self_attn_quant_component_args=(--decoder_self_attn_quant_components "${decoder_self_attn_quant_component_values[@]}")
+  fi
+  decoder_cross_attn_quant_component_args=()
+  if [[ "$decoder_cross_attn_quant_components" != "all" ]]; then
+    read -r -a decoder_cross_attn_quant_component_values <<< "$decoder_cross_attn_quant_components"
+    decoder_cross_attn_quant_component_args=(--decoder_cross_attn_quant_components "${decoder_cross_attn_quant_component_values[@]}")
+  fi
+  decoder_ffn_quant_component_args=()
+  if [[ "$decoder_ffn_quant_components" != "all" ]]; then
+    read -r -a decoder_ffn_quant_component_values <<< "$decoder_ffn_quant_components"
+    decoder_ffn_quant_component_args=(--decoder_ffn_quant_components "${decoder_ffn_quant_component_values[@]}")
+  fi
+  decoder_refpoint_quant_component_args=()
+  if [[ "$decoder_refpoint_quant_components" != "all" ]]; then
+    read -r -a decoder_refpoint_quant_component_values <<< "$decoder_refpoint_quant_components"
+    decoder_refpoint_quant_component_args=(--decoder_refpoint_quant_components "${decoder_refpoint_quant_component_values[@]}")
+  fi
+  decoder_two_stage_quant_component_args=()
+  if [[ "$decoder_two_stage_quant_components" != "all" ]]; then
+    read -r -a decoder_two_stage_quant_component_values <<< "$decoder_two_stage_quant_components"
+    decoder_two_stage_quant_component_args=(--decoder_two_stage_quant_components "${decoder_two_stage_quant_component_values[@]}")
+  fi
+  decoder_output_norm_quant_component_args=()
+  if [[ "$decoder_output_norm_quant_components" != "all" ]]; then
+    read -r -a decoder_output_norm_quant_component_values <<< "$decoder_output_norm_quant_components"
+    decoder_output_norm_quant_component_args=(--decoder_output_norm_quant_components "${decoder_output_norm_quant_component_values[@]}")
   fi
 }
 
@@ -198,6 +254,14 @@ build_common_model_args() {
     --encoder_quant_components "${encoder_quant_component_args[@]}"
     --projector_quant_components "${projector_quant_component_args[@]}"
     --transformer_quant_components "${transformer_quant_component_args[@]}"
+    "${decoder_quant_block_args[@]}"
+    "${decoder_quant_norm_args[@]}"
+    "${decoder_self_attn_quant_component_args[@]}"
+    "${decoder_cross_attn_quant_component_args[@]}"
+    "${decoder_ffn_quant_component_args[@]}"
+    "${decoder_refpoint_quant_component_args[@]}"
+    "${decoder_two_stage_quant_component_args[@]}"
+    "${decoder_output_norm_quant_component_args[@]}"
     --lwdetr_quant_components "${lwdetr_quant_component_args[@]}"
     --dec_layers 3
     --group_detr 13
