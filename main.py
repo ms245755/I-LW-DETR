@@ -310,6 +310,8 @@ def get_args_parser():
                         help='Skip saving the calibrated checkpoint.')
     parser.set_defaults(calib_eval=True, calib_save=True)
     parser.add_argument('--qat', action='store_true')
+    parser.add_argument('--qat_calib_batches', default=0, type=int,
+                        help='Run PTQ-style activation calibration for this many batches before QAT training. 0 disables.')
     parser.add_argument('--ptq_reconstruct', action='store_true',
                         help='After PTQ calibration, run unlabeled block-wise reconstruction against a float teacher.')
     parser.add_argument('--ptq_reconstruct_modules', default=['auto'], type=str, nargs='+',
@@ -387,6 +389,8 @@ def main(args):
 
     if args.calib or args.qat:
         model, criterion, postprocessors = build_model_quant(args)
+        print(model)
+        # return
     else:
         model, criterion, postprocessors = build_model(args)
     model.to(device)
@@ -646,6 +650,38 @@ def main(args):
     
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
+    if args.qat and args.qat_calib_batches > 0 and args.start_epoch == 0:
+        qat_calib_loader = make_random_calib_loader(
+            dataset_val,
+            batch_size=1,
+            seed=seed,
+            n_samples=args.qat_calib_batches,
+            collate_fn=utils.collate_fn,
+            num_workers=0
+        )
+        calibrate(
+            model,
+            qat_calib_loader,
+            device,
+            args=args,
+            calib_batches=args.qat_calib_batches,
+        )
+        qat_calib_stats, qat_calib_coco_evaluator = evaluate(
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args
+        )
+        if args.output_dir and utils.is_main_process():
+            with (output_dir / "log.txt").open("a") as f:
+                f.write(json.dumps({
+                    "phase": "pre_qat_calib",
+                    "qat_calib_batches": args.qat_calib_batches,
+                    **{f"pre_qat_calib_{k}": v for k, v in qat_calib_stats.items()},
+                }) + "\n")
+            if qat_calib_coco_evaluator is not None:
+                utils.save_on_master(
+                    qat_calib_coco_evaluator.coco_eval["bbox"].eval,
+                    output_dir / "eval_qat_calib.pth",
+                )
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.qat:
             unfreeze_model(model)
