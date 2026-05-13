@@ -236,6 +236,15 @@ def calibrate(
     print("Calibration done. Processed batches:", calib_batches)
 
     freeze_model(model)
+    softmax_m_summary = get_softmax_m_summary(model)
+    if softmax_m_summary is not None:
+        print(
+            "Calibrated IViTSoftmax m: "
+            f"count={softmax_m_summary['count']}, "
+            f"min={softmax_m_summary['min']}, "
+            f"max={softmax_m_summary['max']}"
+        )
+    print_softmax_m(model)
 
     return model
 

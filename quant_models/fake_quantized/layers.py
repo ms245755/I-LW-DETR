@@ -602,11 +602,12 @@ class IViTLayerNorm(nn.LayerNorm):
         )
         self.dim = dim
         norm_scale_shape = (1, normalized_shape, 1, 1) if dim == 1 else (normalized_shape,)
+        self.m = 30
         self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(*norm_scale_shape)))
         self.register_buffer("bias_integer", nn.Parameter(torch.ones(*norm_scale_shape)))
         self.register_buffer(
             "base_act_scaling_factor",
-            nn.Parameter(torch.sqrt(torch.tensor(normalized_shape, dtype=torch.float)) / 2.0**30),
+            nn.Parameter(torch.sqrt(torch.tensor(normalized_shape, dtype=torch.float)) / 2.0**self.m),
         )
         self.block_name = block_name
         self.observe_stat = observe_stat
@@ -657,7 +658,7 @@ class IViTLayerNorm(nn.LayerNorm):
             k = k_1
         std_int = k
         
-        exp = floor_ste.apply((2.0**31 - 1) / std_int)
+        exp = floor_ste.apply((2.0**(self.m+1) - 1) / std_int)
         factor = exp
         y_int = floor_ste.apply(y_int * factor / 2)
         # scaling and shifting
@@ -995,6 +996,7 @@ class ISegGELU(nn.Module):
         scaling_factor_sig = act_scaling_factor * self.temp
 
         x_int_max = torch.clamp(pre_x_int, min=0)
+        # x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
         x_int = pre_x_int - x_int_max
 
         exp_int, _ = self.int_exp_shift(x_int, scaling_factor_sig)
@@ -1026,26 +1028,68 @@ class IViTSoftmax(nn.Module):
     Class to quantize given Softmax layer
     """
 
-    def __init__(self, output_bit=8, n=15, lambda_scaler=1, input_bit=8, m=31, **kwargs):
+    def __init__(
+        self,
+        output_bit=8,
+        n=15,
+        lambda_scaler=1,
+        input_bit=8,
+        m=31,
+        calibrate_m=True,
+        m_guard_bits=8,
+        m_max=63,
+        **kwargs,
+    ):
         super(IViTSoftmax, self).__init__()
         self.output_bit = output_bit
         self.input_bit = input_bit
 
         self.n = n  # sufficiently large integer
         self.lambda_scaler = lambda_scaler
-        self.m = m
+        self.m = int(m)
+        self.calibrate_m = calibrate_m
+        self.m_guard_bits = int(m_guard_bits)
+        self.m_max = int(m_max)
+        self.running_stat = True
         # The minimum value for ensuring accuracy (varies depending on models)
 
         self.register_buffer(
             "act_scaling_factor",
             nn.Parameter(torch.Tensor([1 / 2.0 ** (self.output_bit - 1)])),
         )
+        self.register_buffer("max_exp_int_sum", torch.tensor(0.0))
+        self.register_buffer("calibrated_m", torch.tensor(self.m, dtype=torch.long))
 
     def fix(self):
-        pass
+        if self.calibrate_m and self.max_exp_int_sum.item() > 0:
+            self.m = int(self.calibrated_m.item())
+        self.running_stat = False
 
     def unfix(self):
-        pass
+        self.running_stat = True
+
+    def reset_m_calibration(self):
+        self.max_exp_int_sum.zero_()
+        self.calibrated_m.fill_(self.m)
+
+    def _sync_m_from_calibration(self):
+        if self.calibrate_m and self.max_exp_int_sum.item() > 0:
+            self.m = max(self.m, int(self.calibrated_m.item()))
+        return self.m
+
+    def _update_m_calibration(self, exp_int_sum):
+        if not self.calibrate_m or not self.running_stat:
+            return self.m
+
+        with torch.no_grad():
+            observed_max = exp_int_sum.detach().float().amax()
+            self.max_exp_int_sum.copy_(torch.maximum(self.max_exp_int_sum, observed_max))
+            required_m = torch.ceil(torch.log2(self.max_exp_int_sum.clamp_min(1.0))).long()
+            required_m = required_m + self.m_guard_bits
+            required_m = torch.clamp(required_m, min=self.m, max=self.m_max)
+            self.calibrated_m.copy_(required_m)
+
+        return int(self.calibrated_m.item())
 
     def int_exp_shift(self, x_int, scaling_factor):
         scaled_floor = floor_ste.apply(x_int / 2)
@@ -1071,15 +1115,48 @@ class IViTSoftmax(nn.Module):
 
     def _rowwise_power2_input_quant(self, x, act_scaling_factor):
         x_int = round_ste.apply(x / act_scaling_factor)
+
         with torch.no_grad():
             target = 2.0 ** (self.input_bit - 1) - 1
             row_abs_max = x_int.detach().abs().amax(dim=-1, keepdim=True)
+
             shift_factor = torch.ones_like(row_abs_max)
             for _ in range(self.m):
                 needs_shift = row_abs_max > target * shift_factor
                 shift_factor = torch.where(needs_shift, shift_factor * 2, shift_factor)
+
+        x_int = round_ste.apply(x_int / shift_factor)
         act_scaling_factor = act_scaling_factor * shift_factor
+        x = x_int * act_scaling_factor
+
         return x, act_scaling_factor
+    # def _rowwise_power2_input_quant(self, x, act_scaling_factor):
+    #     x_int = round_ste.apply(x / act_scaling_factor)
+
+    #     with torch.no_grad():
+    #         target = 2.0 ** (self.input_bit - 1) - 1
+    #         row_abs_max = x_int.detach().abs().amax(dim=-1, keepdim=True)
+
+    #         ratio = torch.clamp(row_abs_max / target, min=1.0)
+
+    #         shift_floor = 2.0 ** torch.floor(torch.log2(ratio))
+    #         shift_ceil = 2.0 ** torch.ceil(torch.log2(ratio))
+
+    #         # floor may overflow, so measure clipped reconstruction
+    #         x_floor = torch.clamp(round_ste.apply(x_int / shift_floor), -target, target) * shift_floor
+    #         x_ceil = round_ste.apply(x_int / shift_ceil) * shift_ceil
+
+    #         err_floor = (x_int - x_floor).abs().mean(dim=-1, keepdim=True)
+    #         err_ceil = (x_int - x_ceil).abs().mean(dim=-1, keepdim=True)
+
+    #         shift_factor = torch.where(err_floor <= err_ceil, shift_floor, shift_ceil)
+
+    #     x_int = torch.clamp(round_ste.apply(x_int / shift_factor), -target, target)
+    #     act_scaling_factor = act_scaling_factor * shift_factor
+    #     x = x_int * act_scaling_factor
+
+    #     return x, act_scaling_factor
+
 
     def _rowwise_input_quant(self, x):
         with torch.no_grad():
@@ -1089,6 +1166,8 @@ class IViTSoftmax(nn.Module):
         return x, scale
 
     def forward(self, x, act_scaling_factor, dynamic_input_scale=False):
+        self._sync_m_from_calibration()
+
         if torch.is_tensor(act_scaling_factor) and act_scaling_factor.numel() > 1:
             scale = act_scaling_factor.reshape(-1)
             if scale.numel() == x.shape[-1]:
@@ -1102,9 +1181,9 @@ class IViTSoftmax(nn.Module):
             else:
                 act_scaling_factor = scale.max()
 
-        if dynamic_input_scale:
-            # x, act_scaling_factor = self._rowwise_power2_input_quant(x, act_scaling_factor)
-            x, act_scaling_factor = self._rowwise_input_quant(x)
+        # if dynamic_input_scale:
+        #     x, act_scaling_factor = self._rowwise_power2_input_quant(x, act_scaling_factor)
+        #     # x, act_scaling_factor = self._rowwise_input_quant(x)
 
         x_int = round_ste.apply(x / act_scaling_factor)
         x_int_max, _ = x_int.max(dim=-1, keepdim=True)
@@ -1112,10 +1191,11 @@ class IViTSoftmax(nn.Module):
 
         exp_int = self.int_exp_shift(x_int, act_scaling_factor)
         exp_int_sum = exp_int.sum(dim=-1, keepdim=True)
+        m = self._update_m_calibration(exp_int_sum)
 
         # exp_int_sum.clamp_max_(2**self.m - 1)
-        factor = floor_ste.apply((2.0**self.m - 1) / exp_int_sum)
-        exp_int = floor_ste.apply(exp_int * factor / (2.0 ** (self.m - self.output_bit + 1)))
+        factor = floor_ste.apply((2.0**m - 1) / exp_int_sum)
+        exp_int = floor_ste.apply(exp_int * factor / (2.0 ** (m - self.output_bit + 1)))
 
         return exp_int * self.act_scaling_factor, self.act_scaling_factor
 
