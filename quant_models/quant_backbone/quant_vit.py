@@ -208,15 +208,9 @@ class IViT(nn.Module):
 
         self.qact_input = IViTAct(activation_bit=num_bits)
         self.qact_pos = IViTAct(activation_bit=num_bits)
-        self.qact_block_bridge = nn.ModuleList(IViTAct(activation_bit=num_bits) for _ in range(depth))
 
         self.observe_stat = observe_stat
         self.block_name = block_name
-
-    @staticmethod
-    def _block_needs_input_scale(block):
-        unwrapped = getattr(block, "unwrapped", block)
-        return bool(getattr(unwrapped, "quant_layernorm", False))
 
     def export(self):
         self._export = True
@@ -261,8 +255,6 @@ class IViT(nn.Module):
         out = []
         for idx, blk in enumerate(self.blocks):
             if self.block_is_quant[idx]:
-                if act_scaling_factor is None and self._block_needs_input_scale(blk):
-                    x, act_scaling_factor = self.qact_block_bridge[idx](x=x, act_scaling_factor=None)
                 x, act_scaling_factor = blk(x, mask=None, act_scaling_factor=act_scaling_factor)
             else:
                 x = blk(x, mask=None)

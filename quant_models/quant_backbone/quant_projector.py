@@ -63,7 +63,7 @@ def _is_quant_norm(layer):
 
 
 def _is_quant_activation(layer):
-    return isinstance(layer, ISegGELU)
+    return isinstance(layer, (ISegGELU, IViTSiLU))
 
 
 def _forward_projector_layer(layer, x, act_scaling_factor, qact_bridge=None, qact_post=None):
@@ -154,8 +154,14 @@ class IConvX(nn.Module):
             inplace=True,
             quant=(act in quant_components),
         )
-        self.qact_conv_input_bridge = IViTAct()
-        self.qact_post_conv = IViTAct()
+        self.qact_conv_input_bridge = IViTAct(
+            observer_mode="percentile",
+            percentile=99.9,
+        )
+        self.qact_post_conv = IViTAct(
+            observer_mode="percentile",
+            percentile=99.9,
+        )
         self.qact_act_input_bridge = IViTAct()
         self.qact_post_act = IViTAct()
         self.block_name = block_name

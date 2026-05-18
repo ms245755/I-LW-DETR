@@ -348,17 +348,15 @@ class IAttention(nn.Module):
         # Quantize + softmax
         save_tensor_from_pathname(attn, self.block_name+"1_attn", observe_stat=self.observe_stat)
         if self.quant_softmax:
-            if self.window:
-                attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=act_scaling_factor)
-                attn, act_scaling_factor = self.softmax(x=attn, act_scaling_factor=act_scaling_factor)
-            else:
-                if act_scaling_factor is None:
-                    attn, act_scaling_factor = self.qact_attn_out(x=attn, act_scaling_factor=None)
-                attn, act_scaling_factor = self.softmax(
-                    x=attn,
-                    act_scaling_factor=act_scaling_factor,
-                    dynamic_input_scale=False,
-                )
+            attn, act_scaling_factor = self.qact_attn_out(
+                x=attn,
+                act_scaling_factor=act_scaling_factor,
+            )
+            attn, act_scaling_factor = self.softmax(
+                x=attn,
+                act_scaling_factor=act_scaling_factor,
+                dynamic_input_scale=False,
+            )
         else:
             attn = F.softmax(attn, dim=-1)
             act_scaling_factor = None
@@ -473,10 +471,11 @@ class IBlock(nn.Module):
         shortcut = x
         shortcut_scale = act_scaling_factor
         if self.quant_layernorm:
-            if act_scaling_factor is None:
-                x, act_scaling_factor = self.qact_norm1_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.norm1(x, act_scaling_factor)
-            x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
+            if self.attn.quant_linear:
+                x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
+            else:
+                act_scaling_factor = None
         else:
             x = self.norm1(x)
             act_scaling_factor = None
@@ -522,10 +521,11 @@ class IBlock(nn.Module):
 
         # FeedForward branch
         if self.quant_layernorm:
-            if act_scaling_factor is None:
-                x, act_scaling_factor = self.qact_norm2_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.norm2(x=x, act_scaling_factor=act_scaling_factor)
-            x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)
+            if self.mlp.quant_linear:
+                x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)
+            else:
+                act_scaling_factor = None
         else:
             x = self.norm2(x)
             act_scaling_factor = None

@@ -619,15 +619,20 @@ class Transformer(nn.Module):
                         enc_outputs_coord_delta_gidx_scale = None
                     else:
                         enc_outputs_coord_delta_gidx, enc_outputs_coord_delta_gidx_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
-                    enc_outputs_coord_cxcy_gidx = enc_outputs_coord_delta_gidx[...,
-                        :2] * output_proposals[..., 2:] + output_proposals[..., :2]
-                    enc_outputs_coord_cxcy_gidx_scale = (
-                        None
-                        if enc_outputs_coord_delta_gidx_scale is None or output_proposals_scale is None
-                        else enc_outputs_coord_delta_gidx_scale * output_proposals_scale
+                    tmp, tmp_scale = _multiply_tensor_scale(
+                        enc_outputs_coord_delta_gidx[..., :2],
+                        enc_outputs_coord_delta_gidx_scale,
+                        output_proposals[..., 2:],
+                        output_proposals_scale,
                     )
 
-                    # Cong: careful about this exp function, we can also approximate by bit shift (convert to 2^(log e * value))
+                    enc_outputs_coord_cxcy_gidx, enc_outputs_coord_cxcy_gidx_scale = _add_tensor_scale(
+                        tmp,
+                        tmp_scale,
+                        output_proposals[..., :2],
+                        output_proposals_scale,
+                    )
+
                     if quant_two_stage and "bbox_reparam" in self.two_stage_quant_components:
                         tmp, tmp_scale = _exp_tensor_scale(
                             self.int_exp,
@@ -914,13 +919,13 @@ class TransformerDecoder(nn.Module):
                 intermediate.append(normed_output)
                 intermediate_scales.append(normed_output_scale)
 
-        if self.norm is not None:
-            output, output_scale = self._apply_norm(output, output_scale)
-            if self.return_intermediate:
-                intermediate.pop()
-                intermediate_scales.pop()
-                intermediate.append(output)
-                intermediate_scales.append(output_scale)
+        # if self.norm is not None:
+        #     output, output_scale = self._apply_norm(output, output_scale)
+        #     if self.return_intermediate:
+        #         intermediate.pop()
+        #         intermediate_scales.pop()
+        #         intermediate.append(output)
+        #         intermediate_scales.append(output_scale)
 
         if self.return_intermediate:
             if self._export:

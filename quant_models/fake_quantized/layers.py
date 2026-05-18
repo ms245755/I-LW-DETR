@@ -644,6 +644,11 @@ class IViTLayerNorm(nn.LayerNorm):
     def forward(self, x, act_scaling_factor=None):
         # Normalization: computes mean and variance(std)
         dim = self._normalized_dim(x)
+        if act_scaling_factor is None:
+            with torch.no_grad():
+                target = 2.0 ** 7 - 1
+                max_abs = x.detach().abs().amax(dim=dim, keepdim=True)
+                act_scaling_factor = torch.clamp(max_abs / target, min=torch.finfo(x.dtype).eps)
         x_int = round_ste.apply(x / act_scaling_factor)
         mean_int = round_ste.apply(x_int.sum(dim=dim, keepdim=True) / x_int.shape[dim])
 
@@ -842,7 +847,7 @@ class IViTSiLU(nn.Module):
     Uses the same exp-shift trick + max-subtraction for a stable integer sigmoid.
     """
 
-    def __init__(self, output_bit=8, n=23, lambda_scaler=1):
+    def __init__(self, output_bit=8, n=23, lambda_scaler=6):
         super().__init__()
         self.output_bit = output_bit
 
@@ -899,8 +904,8 @@ class IViTSiLU(nn.Module):
         # For SiLU, sigmoid input scale is just act_scaling_factor (no 1.702 multiplier)
         act_scaling_factor_sig = act_scaling_factor
 
-        # stable sigmoid: sigmoid(z) = exp(z - zmax) / (exp(z - zmax) + exp(-zmax))
-        x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
+        # Match ISegGELU's local positive clamp instead of reducing over width.
+        x_int_max = torch.clamp(pre_x_int, min=0)
         z_int = pre_x_int - x_int_max
 
         exp_int, _ = self.int_exp_shift(z_int, act_scaling_factor_sig)          # e^(z - zmax)
