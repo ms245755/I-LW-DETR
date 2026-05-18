@@ -312,6 +312,8 @@ def get_args_parser():
     parser.add_argument('--qat', action='store_true')
     parser.add_argument('--qat_calib_batches', default=0, type=int,
                         help='Run PTQ-style activation calibration for this many batches before QAT training. 0 disables.')
+    parser.add_argument('--qat_freeze_observers', action='store_true',
+                        help='Keep quantization activation/softmax observers frozen during QAT. Useful when resuming from a calibrated PTQ checkpoint.')
     parser.add_argument('--ptq_reconstruct', action='store_true',
                         help='After PTQ calibration, run unlabeled block-wise reconstruction against a float teacher.')
     parser.add_argument('--ptq_reconstruct_modules', default=['auto'], type=str, nargs='+',
@@ -681,9 +683,12 @@ def main(args):
                     qat_calib_coco_evaluator.coco_eval["bbox"].eval,
                     output_dir / "eval_qat_calib.pth",
                 )
+    if args.qat and args.qat_freeze_observers:
+        print("QAT observers are frozen; training weights with fixed quantization ranges.")
+        freeze_model(model)
 
     for epoch in range(args.start_epoch, args.epochs):
-        if args.qat:
+        if args.qat and not args.qat_freeze_observers:
             unfreeze_model(model)
         epoch_start_time = time.time()
         if args.distributed:

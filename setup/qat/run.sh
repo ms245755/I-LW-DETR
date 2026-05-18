@@ -41,6 +41,7 @@ weight_decay="${WEIGHT_DECAY:-1e-4}"
 act_observer="${ACT_OBSERVER:-ema_minmax}"
 act_percentile="${ACT_PERCENTILE:-99.9}"
 qat_calib_batches="${QAT_CALIB_BATCHES:-0}"
+qat_freeze_observers="${QAT_FREEZE_OBSERVERS:-false}"
 output_root="${OUTPUT_ROOT:-output}"
 output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_qat_${scenario_label}_${model_size}}"
 resume_optimizer="${RESUME_OPTIMIZER:-false}"
@@ -52,6 +53,11 @@ decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
 resume_optimizer_args=()
 if [[ "$resume_optimizer" == "1" || "$resume_optimizer" == "true" || "$resume_optimizer" == "yes" ]]; then
   resume_optimizer_args=(--resume_optimizer)
+fi
+
+qat_freeze_observer_args=()
+if [[ "$qat_freeze_observers" == "1" || "$qat_freeze_observers" == "true" || "$qat_freeze_observers" == "yes" ]]; then
+  qat_freeze_observer_args=(--qat_freeze_observers)
 fi
 
 decoder_cross_attn_float_args=()
@@ -131,6 +137,7 @@ python -u -m torch.distributed.launch \
   --qat \
   --find_unused_parameters \
   "${resume_optimizer_args[@]}" \
+  "${qat_freeze_observer_args[@]}" \
   "${decoder_cross_attn_float_args[@]}" \
   "${decoder_cross_attn_value_per_channel_args[@]}" \
   "${decoder_two_stage_float_args[@]}" \
