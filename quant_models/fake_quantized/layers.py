@@ -602,7 +602,7 @@ class IViTLayerNorm(nn.LayerNorm):
         )
         self.dim = dim
         norm_scale_shape = (1, normalized_shape, 1, 1) if dim == 1 else (normalized_shape,)
-        self.m = 30
+        self.m = 20
         self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(*norm_scale_shape)))
         self.register_buffer("bias_integer", nn.Parameter(torch.ones(*norm_scale_shape)))
         self.register_buffer(
@@ -658,7 +658,7 @@ class IViTLayerNorm(nn.LayerNorm):
 
         # Integer Iteration
         k = 2.0**16
-        for _ in range(10):
+        for _ in range(20):
             k_1 = floor_ste.apply((k + floor_ste.apply(var_int / k)) / 2)
             k = k_1
         std_int = k
@@ -763,7 +763,7 @@ class IViTExp(nn.Module):
       y_scaling_factor: scale Sy such that y_real ≈ y_int * Sy
     """
 
-    def __init__(self, output_bit=None, n=23, clamp_min_real=-10.0, clamp_max_real=10.0):
+    def __init__(self, output_bit=None, n=23, clamp_min_real=-20.0, clamp_max_real=20.0):
         super().__init__()
         self.output_bit = output_bit
         self.n = n
@@ -782,7 +782,7 @@ class IViTExp(nn.Module):
 
     def int_exp_shift(self, x_int, scaling_factor):
         # same core as IViTGELU
-        x_int = x_int + floor_ste.apply(x_int / 2) - floor_ste.apply(x_int / 2**4)
+        x_int = x_int + floor_ste.apply(x_int / 2) - floor_ste.apply(x_int / 2**4) + floor_ste.apply(x_int / 2**8) + floor_ste.apply(x_int / 2**9)
 
         with torch.no_grad():
             x0_int = torch.floor(-1.0 / scaling_factor)
@@ -802,10 +802,10 @@ class IViTExp(nn.Module):
         assert act_scaling_factor is not None, "act_scaling_factor must be provided"
 
         # "integer" representation (still float tensor in your framework)
-        x_int = x / act_scaling_factor
+        x_int = round_ste.apply(x / act_scaling_factor)
 
         # Optional real-domain clamp for stability:
-        # x_real = x_int * act_scaling_factor, so clamp x_int to [min/S, max/S]
+        # # x_real = x_int * act_scaling_factor, so clamp x_int to [min/S, max/S]
         if self.clamp_min_real is not None or self.clamp_max_real is not None:
             with torch.no_grad():
                 lo = None if self.clamp_min_real is None else torch.floor(
@@ -1041,7 +1041,7 @@ class IViTSoftmax(nn.Module):
         input_bit=8,
         m=31,
         calibrate_m=True,
-        m_guard_bits=8,
+        m_guard_bits=2,
         m_max=63,
         **kwargs,
     ):
