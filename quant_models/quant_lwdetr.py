@@ -33,7 +33,14 @@ from .fake_quantized.layers import *
 from .quant_backbone import build_backbone
 from .quant_transformer import build_transformer as build_quant_transformer
 from .quant_transformer import IMLP as TransformerIMLP
-from .quant_transformer import ScaleLinear, _add_tensor_scale, _component_set
+from .quant_transformer import (
+    ScaleLinear,
+    _add_tensor_scale,
+    _component_set,
+    _concat_optional_tensor_scale,
+    _exp_tensor_scale,
+    _multiply_tensor_scale,
+)
 from models.matcher import build_matcher
 from models.lwdetr import LWDETR
 from models.transformer import build_transformer as build_float_transformer
@@ -83,6 +90,9 @@ class ILWDETR(nn.Module):
         self.qact_query_feat = IViTAct()
         self.qact_hs_head = IViTAct()
         self.qact_hs_enc = IViTAct()
+        self.qact_bbox_delta_xy = IViTAct()
+        self.qact_bbox_delta_wh = IViTAct()
+        self.int_exp = IViTExp()
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
         self.backbone = backbone
@@ -125,6 +135,35 @@ class ILWDETR(nn.Module):
             if hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
                 m.export()
 
+    def _qact_channel_last(self, qact, x, act_scaling_factor):
+        if x.dim() != 4:
+            return qact(x, act_scaling_factor)
+
+        original_shape = x.shape
+        x = x.reshape(-1, original_shape[-2], original_shape[-1])
+        x, act_scaling_factor = qact(x, act_scaling_factor)
+        return x.reshape(original_shape), act_scaling_factor
+
+    def _split_bbox_delta_groups(self, outputs_coord_delta, outputs_coord_delta_scale):
+        delta_xy = outputs_coord_delta[..., :2]
+        delta_wh = outputs_coord_delta[..., 2:]
+
+        if outputs_coord_delta_scale is None:
+            return delta_xy, None, delta_wh, None
+
+        delta_xy, delta_xy_scale = self._qact_channel_last(
+            self.qact_bbox_delta_xy,
+            delta_xy,
+            outputs_coord_delta_scale,
+        )
+        delta_wh, delta_wh_scale = self._qact_channel_last(
+            self.qact_bbox_delta_wh,
+            delta_wh,
+            outputs_coord_delta_scale,
+        )
+
+        return delta_xy, delta_xy_scale, delta_wh, delta_wh_scale
+
     def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -165,16 +204,45 @@ class ILWDETR(nn.Module):
         save_tensor_from_pathname(hs, self.block_name + "0_transformer_hs", observe_stat=self.observe_stat)
         save_tensor_from_pathname(ref_unsigmoid, self.block_name + "1_transformer_ref_unsigmoid", observe_stat=self.observe_stat)
 
-        hs_head, hs_head_scale = self.qact_hs_head(hs, None)
+        if "linear" in self.quant_components:
+            hs_head, hs_head_scale = self.qact_hs_head(hs, hs_scale)
+        else:
+            hs_head, hs_head_scale = hs, None
         save_tensor_from_pathname(hs_head, self.block_name + "2_head_input", observe_stat=self.observe_stat)
 
         if self.bbox_reparam:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
             save_tensor_from_pathname(outputs_coord_delta, self.block_name + "3_bbox_delta", observe_stat=self.observe_stat)
-            outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
-            outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
-            outputs_coord = torch.concat(
-                [outputs_coord_cxcy, outputs_coord_wh], dim=-1
+            outputs_coord_delta_xy, outputs_coord_delta_xy_scale, outputs_coord_delta_wh, outputs_coord_delta_wh_scale = (
+                self._split_bbox_delta_groups(outputs_coord_delta, outputs_coord_delta_scale)
+            )
+            tmp, tmp_scale = _multiply_tensor_scale(
+                outputs_coord_delta_xy,
+                outputs_coord_delta_xy_scale,
+                ref_unsigmoid[..., 2:],
+                ref_scale,
+            )
+            outputs_coord_cxcy, outputs_coord_cxcy_scale = _add_tensor_scale(
+                tmp,
+                tmp_scale,
+                ref_unsigmoid[..., :2],
+                ref_scale,
+            )
+            # outputs_coord_delta_scale = None
+            tmp, tmp_scale = _exp_tensor_scale(
+                self.int_exp,
+                outputs_coord_delta_wh,
+                outputs_coord_delta_wh_scale,
+            )
+            outputs_coord_wh, outputs_coord_wh_scale = _multiply_tensor_scale(
+                tmp,
+                tmp_scale,
+                ref_unsigmoid[..., 2:],
+                ref_scale,
+            )
+            outputs_coord, _ = _concat_optional_tensor_scale(
+                [(outputs_coord_cxcy, outputs_coord_cxcy_scale), (outputs_coord_wh, outputs_coord_wh_scale)],
+                dim=-1,
             )
         else:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
@@ -217,14 +285,42 @@ class ILWDETR(nn.Module):
         hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self.transformer(
             srcs, None, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
 
-        hs_head, hs_head_scale = self.qact_hs_head(hs, None)
+        if "linear" in self.quant_components:
+            hs_head, hs_head_scale = self.qact_hs_head(hs, None)
+        else:
+            hs_head, hs_head_scale = hs, None
 
         if self.bbox_reparam:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
-            outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
-            outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
-            outputs_coord = torch.concat(
-                [outputs_coord_cxcy, outputs_coord_wh], dim=-1
+            outputs_coord_delta_xy, outputs_coord_delta_xy_scale, outputs_coord_delta_wh, outputs_coord_delta_wh_scale = (
+                self._split_bbox_delta_groups(outputs_coord_delta, outputs_coord_delta_scale)
+            )
+            tmp, tmp_scale = _multiply_tensor_scale(
+                outputs_coord_delta_xy,
+                outputs_coord_delta_xy_scale,
+                ref_unsigmoid[..., 2:],
+                ref_scale,
+            )
+            outputs_coord_cxcy, outputs_coord_cxcy_scale = _add_tensor_scale(
+                tmp,
+                tmp_scale,
+                ref_unsigmoid[..., :2],
+                ref_scale,
+            )
+            tmp, tmp_scale = _exp_tensor_scale(
+                self.int_exp,
+                outputs_coord_delta_wh,
+                outputs_coord_delta_wh_scale,
+            )
+            outputs_coord_wh, outputs_coord_wh_scale = _multiply_tensor_scale(
+                tmp,
+                tmp_scale,
+                ref_unsigmoid[..., 2:],
+                ref_scale,
+            )
+            outputs_coord, _ = _concat_optional_tensor_scale(
+                [(outputs_coord_cxcy, outputs_coord_cxcy_scale), (outputs_coord_wh, outputs_coord_wh_scale)],
+                dim=-1,
             )
         else:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
