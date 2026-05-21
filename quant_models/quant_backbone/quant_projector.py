@@ -36,7 +36,7 @@ def _get_activation(name, inplace=False, quant=False):
     if name == "gelu":
         return ISegGELU() if quant else nn.GELU()
     if name == "silu":
-        return IViTSiLU() if quant else nn.SiLU()
+        return IViTSiLU(lambda_scaler=8) if quant else nn.SiLU()
     if name == "relu":
         return nn.ReLU(inplace=inplace)
     if name in ["LeakyReLU", "leakyrelu", "lrelu"]:
@@ -83,7 +83,7 @@ def _forward_projector_layer(layer, x, act_scaling_factor, qact_bridge=None, qac
     if _is_quant_activation(layer):
         x, act_scaling_factor = _as_quant_input(x, act_scaling_factor, qact_bridge)
         x, act_scaling_factor = layer(x, act_scaling_factor)
-        return qact_post(x, act_scaling_factor)
+        return x, act_scaling_factor
 
     if _is_conv(layer) or _is_norm(layer) or isinstance(layer, (nn.GELU, nn.SiLU, nn.ReLU, nn.LeakyReLU)):
         return layer(x), None

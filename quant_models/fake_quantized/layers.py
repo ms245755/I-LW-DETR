@@ -853,6 +853,7 @@ class IViTSiLU(nn.Module):
 
         self.n = n  # sufficiently large integer
         self.lambda_scaler = lambda_scaler
+        self.m = 31
         self.register_buffer("act_scaling_factor", torch.zeros(1))
         self.register_buffer(
             "sigmoid_scaling_factor",
@@ -879,55 +880,54 @@ class IViTSiLU(nn.Module):
         pass
 
     def int_exp_shift(self, x_int, scaling_factor):
-        # same as your IViTGELU
-        x_int = x_int + floor_ste.apply(x_int / 2) - floor_ste.apply(x_int / 2**4)
+        scaled_floor = floor_ste.apply(x_int / 2)
+        scaled_exp_floor = floor_ste.apply(x_int / (2.0**4))
+        x_int = x_int + scaled_floor - scaled_exp_floor
 
         with torch.no_grad():
-            x0_int = torch.floor(-1.0 / scaling_factor)
+            x0_int = torch.ceil(1.0 / scaling_factor)
 
-        x_int = torch.max(x_int, self.n * self.lambda_scaler * x0_int)
+        min_x_int = torch.clamp(self.n * self.lambda_scaler * (-x0_int), min=-(2.0**self.m))
+        x_int = torch.maximum(x_int, min_x_int)
 
-        q = floor_ste.apply(x_int / x0_int)
-        r = x_int - x0_int * q
+        q = floor_ste.apply(x_int / (-x0_int))
+        r = -(x_int - q * (-x0_int))
 
-        exp_int = r / 2 - x0_int
-        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** (self.n - q)), min=0)
+        exp_int = floor_ste.apply((-r) / 2)
+        exp_int += x0_int
+        exp_int = floor_ste.apply(exp_int * 2.0 ** (self.n - q))
 
         scaling_factor = scaling_factor / 2.0**self.n
         return exp_int, scaling_factor
 
     def forward(self, x, act_scaling_factor=None):
-        # x is assumed float tensor that represents quantized values:
-        # real(x) ≈ act_scaling_factor * pre_x_int
-        pre_x_int = x / act_scaling_factor
+        pre_x_int = round_ste.apply(x / act_scaling_factor)
 
         # For SiLU, sigmoid input scale is just act_scaling_factor (no 1.702 multiplier)
-        act_scaling_factor_sig = act_scaling_factor
+        scaling_factor_sig = act_scaling_factor
 
-        # Match ISegGELU's local positive clamp instead of reducing over width.
         x_int_max = torch.clamp(pre_x_int, min=0)
-        z_int = pre_x_int - x_int_max
+        x_int = pre_x_int - x_int_max
 
-        exp_int, _ = self.int_exp_shift(z_int, act_scaling_factor_sig)          # e^(z - zmax)
-        exp_int_max, _ = self.int_exp_shift(-x_int_max, act_scaling_factor_sig) # e^(-zmax)
+        exp_int, _ = self.int_exp_shift(x_int, scaling_factor_sig)
+        exp_int_max, _ = self.int_exp_shift(-x_int_max, scaling_factor_sig)
         exp_int_sum = exp_int + exp_int_max
 
-        exp_int_sum.clamp_max_(2.0**31 - 1)
+        # Clamp to avoid overflow or divide-by-zero
+        exp_int_sum = torch.clamp(exp_int_sum, min=1, max=2.0**self.m - 1)
 
-        # approximate division: exp_int / exp_int_sum
-        factor = floor_ste.apply((2**31 - 1) / exp_int_sum)
+        factor = floor_ste.apply((2.0**self.m - 1) / exp_int_sum)
 
-        # produce sigmoid_int in a fixed-point range determined by output_bit
-        # (matches your GELU implementation)
-        sigmoid_int = floor_ste.apply(
-            exp_int * factor / 2.0 ** (31 - self.output_bit + 1)
-        )
-        # SiLU: x_int * sigmoid_int (done in "integer-ish" domain)
+        sigmoid_int = floor_ste.apply(exp_int * factor / (2.0 ** (self.m - self.output_bit + 1)))
+
         y_int = pre_x_int * sigmoid_int
-        y_scaling = act_scaling_factor * self.sigmoid_scaling_factor.to(x.device)
 
-        self.act_scaling_factor = y_scaling
-        return y_int * y_scaling, y_scaling
+        act_scaling_factor = act_scaling_factor * self.sigmoid_scaling_factor.to(x.device)
+        self.act_scaling_factor = act_scaling_factor
+
+        out = y_int * act_scaling_factor
+
+        return out, act_scaling_factor
 
 @track_init_args
 class ISegGELU(nn.Module):
