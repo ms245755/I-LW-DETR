@@ -564,7 +564,7 @@ def _is_power_of_2(n):
 class MSDeformAttn(nn.Module):
     """Multi-Scale Deformable Attention Module"""
 
-    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
+    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, sampling_mode="bilinear"):
         """
         Multi-Scale Deformable Attention Module
         :param d_model      hidden dimension
@@ -590,6 +590,7 @@ class MSDeformAttn(nn.Module):
         self.n_levels = n_levels
         self.n_heads = n_heads
         self.n_points = n_points
+        self.sampling_mode = sampling_mode
 
         self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
@@ -674,7 +675,13 @@ class MSDeformAttn(nn.Module):
         attention_weights = F.softmax(attention_weights, -1)
 
         value = value.transpose(1, 2).contiguous().view(N, self.n_heads, self.d_model // self.n_heads, Len_in)
-        output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
+        output = ms_deform_attn_core_pytorch(
+            value,
+            input_spatial_shapes,
+            sampling_locations,
+            attention_weights,
+            mode=self.sampling_mode,
+        )
         output = self.output_proj(output)
         return output
 
@@ -687,6 +694,7 @@ class IMSDeformAttn(nn.Module):
         n_levels=4,
         n_heads=8,
         n_points=4,
+        sampling_mode="bilinear",
         use_float_path=False,
         value_per_channel=False,
         quant_components=None,
@@ -709,6 +717,7 @@ class IMSDeformAttn(nn.Module):
         self.n_levels = n_levels
         self.n_heads  = n_heads
         self.n_points = n_points
+        self.sampling_mode = sampling_mode
         self.use_float_path = use_float_path
         self.value_per_channel = value_per_channel
         self.quant_components = self._cross_attn_component_set(quant_components)
@@ -733,10 +742,10 @@ class IMSDeformAttn(nn.Module):
         self.qact_input            = IViTAct()   # quantize input_flatten
         self.qact_query            = IViTAct()   # quantize query
         self.qact_value            = IViTAct(per_channel=value_per_channel)   # after value_proj
-        self.qact_reference_points = IViTAct()   # quantize reference point coordinates
+        self.qact_reference_points = IViTAct(activation_bit=16)   # quantize reference point coordinates
         self.qact_sampling_offsets = IViTAct()   # after sampling_offsets
         self.qact_sampling_locs    = IViTAct()   # quantize sampling locations
-        self.qact_attn_weights     = IViTAct()   # after attention_weights + softmax
+        self.qact_attn_weights     = IViTAct(activation_bit=8)   # after attention_weights + softmax
         self.qact_sampled_values   = IViTAct(per_channel=True)   # after grid sampling
         self.qact_output           = IViTAct()   # after ms_deform_attn_core
 
@@ -855,7 +864,13 @@ class IMSDeformAttn(nn.Module):
             value = value.transpose(1, 2).contiguous().view(
                 N, self.n_heads, self.d_model // self.n_heads, Len_in
             )
-            output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attn_weights)
+            output = ms_deform_attn_core_pytorch(
+                value,
+                input_spatial_shapes,
+                sampling_locations,
+                attn_weights,
+                mode=self.sampling_mode,
+            )
             save_tensor_from_pathname(output, self.block_name + "8_core_output", observe_stat=self.observe_stat)
             output = F.linear(output, self.output_proj.weight, self.output_proj.bias)
             save_tensor_from_pathname(output, self.block_name + "9_output_proj", observe_stat=self.observe_stat)
@@ -944,7 +959,8 @@ class IMSDeformAttn(nn.Module):
                 qact_sampled_values=self.qact_sampled_values,
             )
         else:
-            # Float fallback keeps the original bilinear deformable-attention geometry.
+            # Float fallback uses the configured sampler so easy-quantize can match
+            # nearest-neighbor deformable-attention geometry.
             if reference_points.shape[-1] == 2:
                 offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
                 sampling_locations = (
@@ -961,7 +977,13 @@ class IMSDeformAttn(nn.Module):
                     "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
                 )
             save_tensor_from_pathname(sampling_locations, self.block_name + "6_sampling_locations", observe_stat=self.observe_stat)
-            output = ms_deform_attn_core_pytorch(value_float, input_spatial_shapes, sampling_locations, attn_weights)
+            output = ms_deform_attn_core_pytorch(
+                value_float,
+                input_spatial_shapes,
+                sampling_locations,
+                attn_weights,
+                mode=self.sampling_mode,
+            )
             value_scale = None
         save_tensor_from_pathname(output, self.block_name + "8_core_output", observe_stat=self.observe_stat)
         output_scale = None
@@ -980,7 +1002,7 @@ class IMSDeformAttn(nn.Module):
 
         return output, output_scale
 
-def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights):
+def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights, mode="bilinear"):
     """ "for debug and test only, need to use cuda version instead"""
     # B, n_heads, head_dim, N
     B, n_heads, head_dim, _ = value.shape
@@ -995,7 +1017,7 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
         sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
         # B*n_heads, head_dim, Len_q, P
         sampling_value_l_ = F.grid_sample(
-            value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False
+            value_l_, sampling_grid_l_, mode=mode, padding_mode="zeros", align_corners=False
         )
         sampling_value_list.append(sampling_value_l_)
     # (B, Len_q, n_heads, L * P) -> (B, n_heads, Len_q, L, P) -> (B*n_heads, 1, Len_q, L*P)

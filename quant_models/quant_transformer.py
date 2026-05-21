@@ -436,6 +436,7 @@ class Transformer(nn.Module):
                 group_detr=group_detr,
                 num_feature_levels=num_feature_levels,
                 dec_n_points=dec_n_points,
+                easy_quantize=easy_quantize,
                 decoder_cross_attn_float=decoder_cross_attn_float,
                 decoder_cross_attn_value_per_channel=decoder_cross_attn_value_per_channel,
                 skip_self_attn=False,
@@ -690,7 +691,6 @@ class Transformer(nn.Module):
         refpoint_embed = refpoint_embed.unsqueeze(0).repeat(bs, 1, 1)
         if self.two_stage:
             if self.bbox_reparam:
-                # Cong: dont use this function
                 tmp, tmp_scale = _multiply_tensor_scale(refpoint_embed[..., :2], refpoint_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
                 refpoint_embed_cxcy, refpoint_embed_cxcy_scale = _add_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., :2], refpoint_embed_ts_scale)
 
@@ -1033,6 +1033,7 @@ class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, sa_nhead, ca_nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False, group_detr=1, 
                  num_feature_levels=4, dec_n_points=4,
+                 easy_quantize=False,
                  decoder_cross_attn_float=False,
                  decoder_cross_attn_value_per_channel=False,
                  skip_self_attn=False,
@@ -1082,6 +1083,7 @@ class TransformerDecoderLayer(nn.Module):
             cross_attn_kwargs["quant_components"] = self.cross_attn_quant_components
         self.cross_attn = cross_attn_cls(
             d_model, n_levels=num_feature_levels, n_heads=ca_nhead, n_points=dec_n_points,
+            sampling_mode="nearest" if easy_quantize else "bilinear",
             use_float_path=decoder_cross_attn_float,
             value_per_channel=decoder_cross_attn_value_per_channel,
             observe_stat=observe_stat,
