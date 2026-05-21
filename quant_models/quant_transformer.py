@@ -477,12 +477,12 @@ class Transformer(nn.Module):
                                           block_name=block_name + "2_decoder/")
         
         self.int_exp = IViTExp()
-        self.qact_output_proposal = IViTAct()
-        self.qact_memory_cat = IViTAct()
+        self.qact_output_proposal = IViTAct(activation_bit=16)
+        self.qact_memory_cat = IViTAct(activation_bit=16)
         self.qact_src_input_bridge = IViTAct()
-        self.qact_two_stage_memory = IViTAct()
-        self.qact_two_stage_refpoints = IViTAct()
-        self.qact_two_stage_boxes = IViTAct()
+        self.qact_two_stage_memory = IViTAct(activation_bit=16)
+        self.qact_two_stage_refpoints = IViTAct(activation_bit=16)
+        self.qact_two_stage_boxes = IViTAct(activation_bit=16)
 
         self.two_stage = two_stage
         if two_stage:
