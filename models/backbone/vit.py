@@ -18,10 +18,46 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fairscale.nn.checkpoint import checkpoint_wrapper
-from timm.models.layers import DropPath, Mlp, trunc_normal_
+from timm.models.layers import DropPath, trunc_normal_
 
 from util.box_ops import box_cxcywh_to_xyxy
 from util.decorators import save_tensor_from_pathname
+
+
+class Mlp(nn.Module):
+    """MLP as used by timm ViT blocks, with local observation hooks."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        drop=0.0,
+        observe_stat=False,
+        block_name="",
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.drop = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.observe_stat = observe_stat
+        self.block_name = block_name
+
+    def forward(self, x):
+        x = self.fc1(x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"0_fc1", observe_stat=self.observe_stat)
+        x = self.act(x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"1_gelu", observe_stat=self.observe_stat)
+        x = self.drop(x)
+        x = self.fc2(x)
+        save_tensor_from_pathname(x=x, component_path=self.block_name+"2_fc2", observe_stat=self.observe_stat)
+        x = self.drop(x)
+        return x
+
 
 class MyLayerNorm(nn.Module):
     """
@@ -234,7 +270,13 @@ class Block(nn.Module):
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim, observe_stat=observe_stat, block_name=block_name+"4_norm2/")
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            observe_stat=observe_stat,
+            block_name=block_name+"5_mlp/",
+        )
 
         self.window = window
 
