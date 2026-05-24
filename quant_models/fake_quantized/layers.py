@@ -602,7 +602,7 @@ class IViTLayerNorm(nn.LayerNorm):
         )
         self.dim = dim
         norm_scale_shape = (1, normalized_shape, 1, 1) if dim == 1 else (normalized_shape,)
-        self.m = 20
+        self.m = 30
         self.register_buffer("norm_scaling_factor", nn.Parameter(torch.ones(*norm_scale_shape)))
         self.register_buffer("bias_integer", nn.Parameter(torch.ones(*norm_scale_shape)))
         self.register_buffer(
@@ -906,6 +906,22 @@ class IViTSiLU(nn.Module):
         # For SiLU, sigmoid input scale is just act_scaling_factor (no 1.702 multiplier)
         scaling_factor_sig = act_scaling_factor
 
+        # A = 2.0
+        # A_int = round_ste.apply(
+        #     torch.tensor(A, device=x.device, dtype=x.dtype) / act_scaling_factor
+        # )
+
+        # pos_mask = pre_x_int > 0
+
+        # x_int_max_base = torch.clamp(pre_x_int, min=0)
+
+        # x_int_max = torch.where(
+        #     pos_mask,
+        #     pre_x_int + A_int,
+        #     x_int_max_base
+        # )
+
+
         x_int_max = torch.clamp(pre_x_int, min=0)
         x_int = pre_x_int - x_int_max
 
@@ -953,21 +969,6 @@ class ISegGELU(nn.Module):
         )
         self.temp = temp
 
-    # def set_calibration_params(self, n=None, lambda_scaler=None, temp=None, output_bit=None):
-    #     if output_bit is not None and output_bit != self.output_bit:
-    #         self.output_bit = output_bit
-    #         self.sigmoid_scaling_factor.data = torch.tensor(
-    #             [1 / 2.0 ** (self.output_bit - 1)],
-    #             device=self.sigmoid_scaling_factor.device,
-    #             dtype=self.sigmoid_scaling_factor.dtype,
-    #         )
-    #     if n is not None:
-    #         self.n = n
-    #     if lambda_scaler is not None:
-    #         self.lambda_scaler = lambda_scaler
-    #     if temp is not None:
-    #         self.temp = temp
-
     def fix(self):
         pass
 
@@ -1000,31 +1001,41 @@ class ISegGELU(nn.Module):
         pre_x_int = round_ste.apply(x / act_scaling_factor)
         scaling_factor_sig = act_scaling_factor * self.temp
 
-        x_int_max = torch.clamp(pre_x_int, min=0)
-        # x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
+        A = 2.0
+        A_int = round_ste.apply(
+            torch.tensor(A, device=x.device, dtype=x.dtype) / act_scaling_factor
+        )
+
+        pos_mask = pre_x_int > 0
+
+        x_int_max_base = torch.clamp(pre_x_int, min=0)
+
+        x_int_max = torch.where(
+            pos_mask,
+            pre_x_int + A_int,
+            x_int_max_base
+        )
+
         x_int = pre_x_int - x_int_max
 
         exp_int, _ = self.int_exp_shift(x_int, scaling_factor_sig)
         exp_int_max, _ = self.int_exp_shift(-x_int_max, scaling_factor_sig)
 
         exp_int_sum = exp_int + exp_int_max
-
-        # Clamp to avoid overflow or divide-by-zero
         exp_int_sum = torch.clamp(exp_int_sum, min=1, max=2.0**self.m - 1)
 
         factor = floor_ste.apply((2.0**self.m - 1) / exp_int_sum)
 
         sigmoid_int = floor_ste.apply(exp_int * factor / (2.0 ** (self.m - self.output_bit + 1)))
 
-        x_int = pre_x_int * sigmoid_int
+        x_int_out = pre_x_int * sigmoid_int
 
-        act_scaling_factor = act_scaling_factor * self.sigmoid_scaling_factor
-        self.act_scaling_factor = act_scaling_factor
+        out_scaling_factor = act_scaling_factor * self.sigmoid_scaling_factor
+        self.act_scaling_factor = out_scaling_factor
 
-        out = x_int * act_scaling_factor
+        out = x_int_out * out_scaling_factor
 
-        return out, act_scaling_factor
-
+        return out, out_scaling_factor
 
 @track_init_args
 class IViTSoftmax(nn.Module):
@@ -1041,7 +1052,7 @@ class IViTSoftmax(nn.Module):
         input_bit=8,
         m=31,
         calibrate_m=True,
-        m_guard_bits=2,
+        m_guard_bits=4,
         m_max=63,
         **kwargs,
     ):
