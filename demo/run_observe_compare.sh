@@ -40,21 +40,25 @@ case "$quant_scope" in
   vit)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit}"
     quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
+    lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-none}"
     stats_components=(vit projector)
     ;;
   vit_projector)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
     quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone}"
+    lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-none}"
     stats_components=(vit projector)
     ;;
   transformer)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
     quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone transformer}"
+    lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-none}"
     stats_components=(transformer lwdetr)
     ;;
   full)
     backbone_quant_components="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
     quant_model_components="${QUANT_MODEL_COMPONENTS:-backbone transformer}"
+    lwdetr_quant_components="${LWDETR_QUANT_COMPONENTS:-linear}"
     stats_components=(vit projector transformer lwdetr)
     ;;
   *)
@@ -98,7 +102,8 @@ read -r -a backbone_quant_component_args <<< "$backbone_quant_components"
 read -r -a quant_model_component_args <<< "$quant_model_components"
 read -r -a encoder_quant_component_args <<< "${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
 read -r -a projector_quant_component_args <<< "${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu silu layernorm}"
-read -r -a transformer_quant_component_args <<< "${TRANSFORMER_QUANT_COMPONENTS:-linear matmul softmax layernorm deformable_attention}"
+read -r -a transformer_quant_component_args <<< "${TRANSFORMER_QUANT_COMPONENTS:-self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm}"
+read -r -a lwdetr_quant_component_args <<< "$lwdetr_quant_components"
 
 easy_quantize_args=()
 for component in "${quant_model_component_args[@]}"; do
@@ -174,6 +179,7 @@ python demo/demo.py \
   --encoder_quant_components "${encoder_quant_component_args[@]}" \
   --projector_quant_components "${projector_quant_component_args[@]}" \
   --transformer_quant_components "${transformer_quant_component_args[@]}" \
+  --lwdetr_quant_components "${lwdetr_quant_component_args[@]}" \
   --act_observer "${ACT_OBSERVER:-mean}" \
   --act_percentile "${ACT_PERCENTILE:-99}"
 

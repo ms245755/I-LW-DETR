@@ -123,6 +123,14 @@ python demo/demo.py \
   --encoder_quant_components "${encoder_quant_component_args[@]}" \
   --projector_quant_components "${projector_quant_component_args[@]}" \
   --transformer_quant_components "${transformer_quant_component_args[@]}" \
+  "${decoder_quant_block_args[@]}" \
+  "${decoder_quant_norm_args[@]}" \
+  "${decoder_self_attn_quant_component_args[@]}" \
+  "${decoder_cross_attn_quant_component_args[@]}" \
+  "${decoder_ffn_quant_component_args[@]}" \
+  "${decoder_refpoint_quant_component_args[@]}" \
+  "${decoder_two_stage_quant_component_args[@]}" \
+  "${decoder_output_norm_quant_component_args[@]}" \
   --lwdetr_quant_components "${lwdetr_quant_component_args[@]}" \
   --act_observer "${ACT_OBSERVER:-mean}" \
   --act_percentile "${ACT_PERCENTILE:-99}"

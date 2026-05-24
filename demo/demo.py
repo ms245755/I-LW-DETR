@@ -122,10 +122,48 @@ def get_args_parser():
                         choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm', 'silu'),
                         help='Operation families to quantize inside the projector.')
     parser.add_argument('--transformer_quant_components',
-                        default=['linear', 'matmul', 'softmax', 'layernorm', 'deformable_attention'],
+                        default=['self_attn', 'cross_attn', 'ffn', 'norm', 'refpoint', 'two_stage', 'decoder_output_norm'],
                         type=str, nargs='+',
-                        choices=('linear', 'matmul', 'softmax', 'layernorm', 'deformable_attention', 'none'),
-                        help='Operation families to quantize inside the quantized transformer.')
+                        choices=(
+                            'self_attn', 'cross_attn', 'ffn', 'norm', 'refpoint', 'two_stage', 'decoder_output_norm',
+                            'none'
+                        ),
+                        help='Large transformer decoder blocks to quantize.')
+    parser.add_argument('--decoder_quant_blocks', default=None, type=int, nargs='+',
+                        help='Decoder layer indexes to quantize. Default: all decoder layers.')
+    parser.add_argument('--decoder_quant_norms', default=None, type=str, nargs='+',
+                        choices=('norm1', 'norm2', 'norm3', 'none'),
+                        help='Decoder LayerNorm modules to quantize when transformer norm quantization is enabled.')
+    parser.add_argument('--decoder_self_attn_quant_components',
+                        default=None,
+                        type=str, nargs='+',
+                        choices=('linear', 'matmul', 'softmax', 'none'),
+                        help='Subcomponents to quantize inside decoder self-attention when self_attn is enabled.')
+    parser.add_argument('--decoder_cross_attn_quant_components',
+                        default=None,
+                        type=str, nargs='+',
+                        choices=('value_proj', 'sampling_offsets', 'attention_weights', 'softmax', 'grid_sample_core', 'weighted_sum', 'output_proj', 'core', 'all', 'none'),
+                        help='Subcomponents to quantize inside decoder deformable cross-attention when cross_attn is enabled.')
+    parser.add_argument('--decoder_ffn_quant_components',
+                        default=None,
+                        type=str, nargs='+',
+                        choices=('linear', 'none'),
+                        help='Subcomponents to quantize inside decoder FFN when ffn is enabled.')
+    parser.add_argument('--decoder_refpoint_quant_components',
+                        default=None,
+                        type=str, nargs='+',
+                        choices=('linear', 'sine_embed', 'coord_proj', 'none'),
+                        help='Subcomponents to quantize inside decoder reference-point/query-position path when refpoint is enabled.')
+    parser.add_argument('--decoder_two_stage_quant_components',
+                        default=None,
+                        type=str, nargs='+',
+                        choices=('proposal', 'enc_output', 'enc_output_norm', 'class_head', 'bbox_head', 'bbox_reparam', 'selected_inputs', 'none'),
+                        help='Subcomponents to quantize inside the optional two-stage decoder proposal path when two_stage is enabled.')
+    parser.add_argument('--decoder_output_norm_quant_components',
+                        default=None,
+                        type=str, nargs='+',
+                        choices=('layernorm', 'output_qact', 'none'),
+                        help='Subcomponents to quantize in the final decoder output norm when decoder_output_norm is enabled.')
     parser.add_argument('--lwdetr_quant_components',
                         default=['linear'],
                         type=str, nargs='+',
