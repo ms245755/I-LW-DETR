@@ -21,6 +21,7 @@ prepare_common_args
 build_common_model_args
 
 checkpoint="${RESUME:-$(resolve_path "$checkpoint_root" "$resume_name" "resume checkpoint")}"
+master_port="${MASTER_PORT:-29500}"
 act_observer="${ACT_OBSERVER:-mean}"
 act_percentile="${ACT_PERCENTILE:-99}"
 calib_batches="${CALIB_BATCHES:-500}"
@@ -120,9 +121,10 @@ fi
 cd "$repo_root"
 
 if [[ "$has_quant_components" == "false" ]]; then
-  python -u -m torch.distributed.launch \
-    --nproc_per_node "$nproc_per_node" \
-    --use_env \
+	  python -u -m torch.distributed.launch \
+	    --nproc_per_node "$nproc_per_node" \
+	    --master_port "$master_port" \
+	    --use_env \
     main.py \
     --batch_size "$batch_size" \
     "${common_model_args[@]}" \
@@ -132,9 +134,10 @@ if [[ "$has_quant_components" == "false" ]]; then
   exit 0
 fi
 
-python -u -m torch.distributed.launch \
-  --nproc_per_node "$nproc_per_node" \
-  --use_env \
+	python -u -m torch.distributed.launch \
+	  --nproc_per_node "$nproc_per_node" \
+	  --master_port "$master_port" \
+	  --use_env \
   main.py \
   --batch_size "$batch_size" \
   "${common_model_args[@]}" \

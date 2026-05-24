@@ -38,6 +38,7 @@ pretrain_weights="${PRETRAIN_WEIGHTS:-$(resolve_path "$checkpoint_dir" "$pretrai
 lr="${LR:-2e-5}"
 lr_encoder="${LR_ENCODER:-2e-5}"
 weight_decay="${WEIGHT_DECAY:-1e-4}"
+master_port="${MASTER_PORT:-29500}"
 act_observer="${ACT_OBSERVER:-ema_minmax}"
 act_percentile="${ACT_PERCENTILE:-99.9}"
 qat_calib_batches="${QAT_CALIB_BATCHES:-0}"
@@ -115,6 +116,7 @@ cd "$repo_root"
 
 python -u -m torch.distributed.launch \
   --nproc_per_node "$nproc_per_node" \
+  --master_port "$master_port" \
   --use_env \
   main.py \
   --lr "$lr" \

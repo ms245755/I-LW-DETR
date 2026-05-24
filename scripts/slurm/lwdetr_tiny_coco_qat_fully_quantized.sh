@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=lwdetr_tiny_qat_full
-#SBATCH --time=150:00:00
+#SBATCH --time=72:00:00
 #SBATCH --partition=gpu40G
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -9,9 +9,11 @@
 #SBATCH --gres=gpu:4
 
 set -euo pipefail
+trap 'status=$?; echo "FAILED at line $LINENO with exit code $status"; exit $status' ERR
 
 repo_root="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$repo_root"
+mkdir -p logs/qat
 
 conda_sh="${CONDA_SH:-/home/tl286648/miniforge3/etc/profile.d/conda.sh}"
 conda_env="${CONDA_ENV:-lwdetr2}"
@@ -23,6 +25,12 @@ fi
 
 export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+  export MASTER_PORT="${MASTER_PORT:-$((29500 + SLURM_JOB_ID % 1000))}"
+else
+  export MASTER_PORT="${MASTER_PORT:-29500}"
+fi
 
 export MODEL_SIZE="${MODEL_SIZE:-tiny}"
 export SCENARIO="${SCENARIO:-fully_quantized}"
@@ -64,6 +72,9 @@ echo "QAT_FREEZE_OBSERVERS: $QAT_FREEZE_OBSERVERS"
 echo "PTQ output dir: $ptq_output_dir"
 echo "QAT output dir: $qat_output_dir"
 echo "Repo root: $repo_root"
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-none}"
+echo "MASTER_PORT: $MASTER_PORT"
+echo "Starting PTQ phase"
 
 export OUTPUT_DIR="$ptq_output_dir"
 srun bash "setup/ptq/${SCENARIO}.sh" "$coco_path" "$checkpoint_path"
@@ -79,5 +90,6 @@ export RESUME="${QAT_RESUME:-$calibrated_checkpoint}"
 export QAT_CALIB_BATCHES="${EXTRA_QAT_CALIB_BATCHES:-0}"
 echo "QAT resume checkpoint: $RESUME"
 echo "QAT_CALIB_BATCHES for QAT phase: $QAT_CALIB_BATCHES"
+echo "Starting QAT phase"
 
 srun bash "setup/qat/${SCENARIO}.sh" "$coco_path" "$checkpoint_root"
