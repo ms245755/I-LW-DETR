@@ -217,6 +217,12 @@ def get_args_parser():
                         type=str, nargs='+',
                         choices=('linear', 'none'),
                         help='Operation families to quantize inside LW-DETR prediction heads.')
+    parser.add_argument('--transformer_exp_mode', default='ivit', type=str,
+                        choices=('float', 'ivit'),
+                        help='Use float exp or IViTExp in quantized transformer bbox reparameterization paths.')
+    parser.add_argument('--lwdetr_exp_mode', default='ivit', type=str,
+                        choices=('float', 'ivit'),
+                        help='Use float exp or IViTExp in quantized LW-DETR bbox head reparameterization.')
     parser.add_argument('--act_observer', default='ema_minmax', type=str,
                         choices=('ema_minmax', 'percentile', 'mean'),
                         help='Activation observer used by IViTAct during calibration/QAT.')

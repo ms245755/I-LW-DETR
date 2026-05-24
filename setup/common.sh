@@ -24,6 +24,8 @@ Optional environment variables:
   DECODER_TWO_STAGE_QUANT_COMPONENTS
   DECODER_OUTPUT_NORM_QUANT_COMPONENTS
   LWDETR_QUANT_COMPONENTS       Ops quantized inside prediction heads
+  TRANSFORMER_EXP_MODE          float or ivit for transformer bbox exp
+  LWDETR_EXP_MODE               float or ivit for LW-DETR bbox exp
   DECODER_TWO_STAGE_FLOAT       Keep two-stage proposal/top-k path float
 EOF
 }
@@ -173,6 +175,8 @@ configure_scenario() {
   decoder_refpoint_quant_components="${DECODER_REFPOINT_QUANT_COMPONENTS:-all}"
   decoder_two_stage_quant_components="${DECODER_TWO_STAGE_QUANT_COMPONENTS:-all}"
   decoder_output_norm_quant_components="${DECODER_OUTPUT_NORM_QUANT_COMPONENTS:-all}"
+  transformer_exp_mode="${TRANSFORMER_EXP_MODE:-ivit}"
+  lwdetr_exp_mode="${LWDETR_EXP_MODE:-ivit}"
 }
 
 split_args() {
@@ -263,6 +267,8 @@ build_common_model_args() {
     "${decoder_two_stage_quant_component_args[@]}"
     "${decoder_output_norm_quant_component_args[@]}"
     --lwdetr_quant_components "${lwdetr_quant_component_args[@]}"
+    --transformer_exp_mode "$transformer_exp_mode"
+    --lwdetr_exp_mode "$lwdetr_exp_mode"
     --dec_layers 3
     --group_detr 13
     --two_stage

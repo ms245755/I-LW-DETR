@@ -42,7 +42,7 @@ from .quant_transformer import (
     _multiply_tensor_scale,
 )
 from models.matcher import build_matcher
-from models.lwdetr import LWDETR
+from models.lwdetr import LWDETR, MLP as FloatMLP
 from models.transformer import build_transformer as build_float_transformer
 
 class ILWDETR(nn.Module):
@@ -58,6 +58,7 @@ class ILWDETR(nn.Module):
                  lite_refpoint_refine=False,
                  bbox_reparam=False,
                  lwdetr_quant_components=None,
+                 exp_mode="ivit",
                  observe_stat=False,
                  block_name="observed_tensor/quant/lwdetr/"):
         """ Initializes the model.
@@ -73,8 +74,12 @@ class ILWDETR(nn.Module):
         """
         super().__init__()
         self.quant_components = _component_set(lwdetr_quant_components)
+        if exp_mode not in {"float", "ivit"}:
+            raise ValueError(f"unknown LW-DETR exp_mode: {exp_mode}")
+        self.exp_mode = exp_mode
         self.num_queries = num_queries
         self.transformer = transformer
+        self.transformer_uses_quant_scales = self.transformer.__class__.__module__.startswith("quant_models.")
         self.observe_stat = observe_stat
         self.block_name = block_name
         hidden_dim = transformer.d_model
@@ -101,9 +106,7 @@ class ILWDETR(nn.Module):
 
         # iter update
         self.lite_refpoint_refine = lite_refpoint_refine
-        if not self.lite_refpoint_refine:
-            self.transformer.decoder.bbox_embed = self.bbox_embed
-        else:
+        if self.lite_refpoint_refine:
             self.transformer.decoder.bbox_embed = None
 
         self.bbox_reparam = bbox_reparam
@@ -117,13 +120,26 @@ class ILWDETR(nn.Module):
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
 
+        if self.transformer_uses_quant_scales:
+            transformer_class_embed = self.class_embed
+            transformer_bbox_embed = self.bbox_embed
+        else:
+            transformer_class_embed = nn.Linear(hidden_dim, num_classes)
+            transformer_bbox_embed = FloatMLP(hidden_dim, hidden_dim, 4, 3)
+            transformer_class_embed.bias.data = torch.ones(num_classes) * bias_value
+            nn.init.constant_(transformer_bbox_embed.layers[-1].weight.data, 0)
+            nn.init.constant_(transformer_bbox_embed.layers[-1].bias.data, 0)
+
+        if not self.lite_refpoint_refine:
+            self.transformer.decoder.bbox_embed = transformer_bbox_embed
+
         # two_stage
         self.two_stage = two_stage
         if self.two_stage:
             self.transformer.enc_out_bbox_embed = nn.ModuleList(
-                [copy.deepcopy(self.bbox_embed) for _ in range(group_detr)])
+                [copy.deepcopy(transformer_bbox_embed) for _ in range(group_detr)])
             self.transformer.enc_out_class_embed = nn.ModuleList(
-                [copy.deepcopy(self.class_embed) for _ in range(group_detr)])
+                [copy.deepcopy(transformer_class_embed) for _ in range(group_detr)])
 
         self._export = False
 
@@ -164,6 +180,41 @@ class ILWDETR(nn.Module):
 
         return delta_xy, delta_xy_scale, delta_wh, delta_wh_scale
 
+    def _exp(self, x, scale):
+        if self.exp_mode == "float":
+            return x.clamp(min=-20.0, max=20.0).exp(), None
+        return _exp_tensor_scale(self.int_exp, x, scale)
+
+    def _run_transformer(
+        self,
+        srcs,
+        masks,
+        poss,
+        refpoint_embed_weight,
+        refpoint_scale,
+        query_feat_weight,
+        query_scale,
+    ):
+        if self.transformer_uses_quant_scales:
+            return self.transformer(
+                srcs,
+                masks,
+                poss,
+                refpoint_embed_weight,
+                refpoint_scale,
+                query_feat_weight,
+                query_scale,
+            )
+
+        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
+            srcs,
+            masks,
+            poss,
+            refpoint_embed_weight,
+            query_feat_weight,
+        )
+        return hs, None, ref_unsigmoid, None, hs_enc, None, ref_enc
+
     def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -192,14 +243,20 @@ class ILWDETR(nn.Module):
             assert mask is not None
 
         if self.training:
-            refpoint_embed_weight, refpoint_scale = self.qact_refpoint(self.refpoint_embed.weight, None)
-            query_feat_weight, query_scale = self.qact_query_feat(self.query_feat.weight, None)
+            refpoint_embed_weight = self.refpoint_embed.weight
+            query_feat_weight = self.query_feat.weight
         else:
             # only use one group in inference
-            refpoint_embed_weight, refpoint_scale = self.qact_refpoint(self.refpoint_embed.weight[:self.num_queries], None)
-            query_feat_weight, query_scale = self.qact_query_feat(self.query_feat.weight[:self.num_queries], None)
+            refpoint_embed_weight = self.refpoint_embed.weight[:self.num_queries]
+            query_feat_weight = self.query_feat.weight[:self.num_queries]
 
-        hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self.transformer(
+        refpoint_scale = None
+        query_scale = None
+        if self.transformer_uses_quant_scales:
+            refpoint_embed_weight, refpoint_scale = self.qact_refpoint(refpoint_embed_weight, None)
+            query_feat_weight, query_scale = self.qact_query_feat(query_feat_weight, None)
+
+        hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self._run_transformer(
             srcs, masks, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
         save_tensor_from_pathname(hs, self.block_name + "0_transformer_hs", observe_stat=self.observe_stat)
         save_tensor_from_pathname(ref_unsigmoid, self.block_name + "1_transformer_ref_unsigmoid", observe_stat=self.observe_stat)
@@ -229,11 +286,7 @@ class ILWDETR(nn.Module):
                 ref_scale,
             )
             # outputs_coord_delta_scale = None
-            tmp, tmp_scale = _exp_tensor_scale(
-                self.int_exp,
-                outputs_coord_delta_wh,
-                outputs_coord_delta_wh_scale,
-            )
+            tmp, tmp_scale = self._exp(outputs_coord_delta_wh, outputs_coord_delta_wh_scale)
             outputs_coord_wh, outputs_coord_wh_scale = _multiply_tensor_scale(
                 tmp,
                 tmp_scale,
@@ -261,14 +314,19 @@ class ILWDETR(nn.Module):
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
         if self.two_stage:
-            if hs_enc_scale is None:
+            if self.transformer_uses_quant_scales and hs_enc_scale is None:
                 hs_enc, hs_enc_scale = self.qact_hs_enc(hs_enc, None)
             save_tensor_from_pathname(hs_enc, self.block_name + "8_encoder_head/0_hs_enc", observe_stat=self.observe_stat)
             hs_enc_list = hs_enc.split(self.num_queries, dim=1)
             cls_enc = []
             group_detr = self.group_detr if self.training else 1
             for g_idx in range(group_detr):
-                cls_enc_gidx, _ = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx], hs_enc_scale)
+                if self.transformer_uses_quant_scales:
+                    cls_enc_gidx = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx], hs_enc_scale)
+                else:
+                    cls_enc_gidx = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx])
+                if isinstance(cls_enc_gidx, tuple):
+                    cls_enc_gidx = cls_enc_gidx[0]
                 cls_enc.append(cls_enc_gidx)
             cls_enc = torch.cat(cls_enc, dim=1)
             save_tensor_from_pathname(cls_enc, self.block_name + "8_encoder_head/1_class_logits", observe_stat=self.observe_stat)
@@ -279,10 +337,15 @@ class ILWDETR(nn.Module):
     def forward_export(self, tensors):
         srcs, _, poss = self.backbone(tensors)
         # only use one group in inference
-        refpoint_embed_weight, refpoint_scale = self.qact_refpoint(self.refpoint_embed.weight[:self.num_queries], None)
-        query_feat_weight, query_scale = self.qact_query_feat(self.query_feat.weight[:self.num_queries], None)
+        refpoint_embed_weight = self.refpoint_embed.weight[:self.num_queries]
+        query_feat_weight = self.query_feat.weight[:self.num_queries]
+        refpoint_scale = None
+        query_scale = None
+        if self.transformer_uses_quant_scales:
+            refpoint_embed_weight, refpoint_scale = self.qact_refpoint(refpoint_embed_weight, None)
+            query_feat_weight, query_scale = self.qact_query_feat(query_feat_weight, None)
 
-        hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self.transformer(
+        hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self._run_transformer(
             srcs, None, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
 
         if "linear" in self.quant_components:
@@ -307,11 +370,7 @@ class ILWDETR(nn.Module):
                 ref_unsigmoid[..., :2],
                 ref_scale,
             )
-            tmp, tmp_scale = _exp_tensor_scale(
-                self.int_exp,
-                outputs_coord_delta_wh,
-                outputs_coord_delta_wh_scale,
-            )
+            tmp, tmp_scale = self._exp(outputs_coord_delta_wh, outputs_coord_delta_wh_scale)
             outputs_coord_wh, outputs_coord_wh_scale = _multiply_tensor_scale(
                 tmp,
                 tmp_scale,
@@ -715,6 +774,7 @@ def build(args):
     model_kwargs["block_name"] = "observed_tensor/quant/lwdetr/"
     if model_cls is ILWDETR:
         model_kwargs["lwdetr_quant_components"] = getattr(args, "lwdetr_quant_components", None)
+        model_kwargs["exp_mode"] = getattr(args, "lwdetr_exp_mode", "ivit")
     model = model_cls(
         backbone,
         transformer,

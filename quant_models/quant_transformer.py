@@ -163,8 +163,12 @@ def _multiply_tensor_scale(x, scale_x, y, scale_y):
 
 def _exp_tensor_scale(exp_module, x, scale):
     if scale is None:
-        return x.exp(), None
+        return x.clamp(min=-20.0, max=20.0).exp(), None
     return exp_module(x, scale)
+
+
+def _sanitize_boxes(boxes):
+    return torch.nan_to_num(boxes, nan=0.0, posinf=1.0, neginf=0.0)
 
 
 class ScaleLinear(nn.Linear):
@@ -404,9 +408,12 @@ class Transformer(nn.Module):
                  decoder_refpoint_quant_components=None,
                  decoder_two_stage_quant_components=None,
                  decoder_output_norm_quant_components=None,
+                 exp_mode="ivit",
                  observe_stat=False,
                  block_name="observed_tensor/quant/transformer/"):
         super().__init__()
+        if exp_mode not in {"float", "ivit"}:
+            raise ValueError(f"unknown transformer exp_mode: {exp_mode}")
         self.encoder = None
         self.decoder_block_components = _decoder_block_components(transformer_quant_components)
         self.quant_components = set()
@@ -428,6 +435,7 @@ class Transformer(nn.Module):
         self.observe_stat = observe_stat
         self.block_name = block_name
         self.decoder_two_stage_float = decoder_two_stage_float
+        self.exp_mode = exp_mode
 
         decoder_layers = nn.ModuleList([
             TransformerDecoderLayer(
@@ -474,16 +482,17 @@ class Transformer(nn.Module):
                                           ),
                                           refpoint_head_float=decoder_refpoint_head_float,
                                           quant_components=self.refpoint_quant_components if "refpoint" in self.decoder_block_components else [],
+                                          exp_mode=exp_mode,
                                           observe_stat=observe_stat,
                                           block_name=block_name + "2_decoder/")
         
         self.int_exp = IViTExp()
         self.qact_output_proposal = IViTAct(activation_bit=16)
-        self.qact_memory_cat = IViTAct(activation_bit=16)
+        self.qact_memory_cat = IViTAct()
         self.qact_src_input_bridge = IViTAct()
-        self.qact_two_stage_memory = IViTAct(activation_bit=16)
+        self.qact_two_stage_memory = IViTAct()
         self.qact_two_stage_refpoints = IViTAct(activation_bit=16)
-        self.qact_two_stage_boxes = IViTAct(activation_bit=16)
+        self.qact_two_stage_boxes = IViTAct()
 
         self.two_stage = two_stage
         if two_stage:
@@ -508,6 +517,11 @@ class Transformer(nn.Module):
         self.bbox_reparam = bbox_reparam
 
         self._export = False
+
+    def _exp(self, x, scale):
+        if self.exp_mode == "float":
+            return x.exp(), None
+        return _exp_tensor_scale(self.int_exp, x, scale)
     
     def export(self):
         self._export = True
@@ -635,13 +649,12 @@ class Transformer(nn.Module):
                     )
 
                     if quant_two_stage and "bbox_reparam" in self.two_stage_quant_components:
-                        tmp, tmp_scale = _exp_tensor_scale(
-                            self.int_exp,
+                        tmp, tmp_scale = self._exp(
                             enc_outputs_coord_delta_gidx[..., 2:],
                             enc_outputs_coord_delta_gidx_scale,
                         )
                     else:
-                        tmp = enc_outputs_coord_delta_gidx[..., 2:].exp()
+                        tmp = enc_outputs_coord_delta_gidx[..., 2:].clamp(min=-20.0, max=20.0).exp()
                         tmp_scale = None
                     enc_outputs_coord_wh_gidx, enc_outputs_coord_wh_gidx_scale = _multiply_tensor_scale(tmp, tmp_scale, output_proposals[..., 2:], output_proposals_scale)
 
@@ -655,6 +668,7 @@ class Transformer(nn.Module):
                     else:
                         tmp, tmp_scale = self.enc_out_bbox_embed[g_idx](output_memory_gidx, output_memory_gidx_scale)
                     enc_outputs_coord_unselected_gidx, enc_outputs_coord_unselected_gidx_scale = _add_tensor_scale(tmp, tmp_scale, output_proposals, output_proposals_scale)
+                enc_outputs_coord_unselected_gidx = _sanitize_boxes(enc_outputs_coord_unselected_gidx)
 
                 topk = self.num_queries
                 # Return the index of top k, not the value
@@ -694,9 +708,10 @@ class Transformer(nn.Module):
                 tmp, tmp_scale = _multiply_tensor_scale(refpoint_embed[..., :2], refpoint_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
                 refpoint_embed_cxcy, refpoint_embed_cxcy_scale = _add_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., :2], refpoint_embed_ts_scale)
 
-                tmp, tmp_scale = _exp_tensor_scale(self.int_exp, refpoint_embed[..., 2:], refpoint_scale)
+                tmp, tmp_scale = self._exp(refpoint_embed[..., 2:], refpoint_scale)
                 refpoint_embed_wh, refpoint_embed_wh_scale = _multiply_tensor_scale(tmp, tmp_scale, refpoint_embed_ts[..., 2:], refpoint_embed_ts_scale)
                 refpoint_embed, refpoint_scale = _concat_optional_tensor_scale([(refpoint_embed_cxcy, refpoint_embed_cxcy_scale), (refpoint_embed_wh, refpoint_embed_wh_scale)], dim=-1)
+                refpoint_embed = _sanitize_boxes(refpoint_embed)
             else:
                 refpoint_embed, refpoint_scale = _add_tensor_scale(refpoint_embed, refpoint_scale, refpoint_embed_ts, refpoint_embed_ts_scale)
 
@@ -709,7 +724,7 @@ class Transformer(nn.Module):
         save_tensor_from_pathname(references, self.block_name + "4_references", observe_stat=self.observe_stat)
         if self.two_stage:
             if self.bbox_reparam:
-                return hs, hs_scale, references, references_scale, memory_ts, memory_ts_scale, boxes_ts
+                return hs, hs_scale, references, references_scale, memory_ts, memory_ts_scale, _sanitize_boxes(boxes_ts)
             else:
                 return hs, hs_scale, references, references_scale, memory_ts, memory_ts_scale, boxes_ts.sigmoid()
         return hs, hs_scale, references, references_scale, None, None, None
@@ -729,9 +744,12 @@ class TransformerDecoder(nn.Module):
                  norm_output_qact=False,
                  refpoint_head_float=False,
                  quant_components=None,
+                 exp_mode="ivit",
                  observe_stat=False,
                  block_name=""):
         super().__init__()
+        if exp_mode not in {"float", "ivit"}:
+            raise ValueError(f"unknown decoder exp_mode: {exp_mode}")
         self.quant_components = _component_set(quant_components)
         if isinstance(decoder_layer, nn.ModuleList):
             self.layers = decoder_layer
@@ -749,6 +767,8 @@ class TransformerDecoder(nn.Module):
         self.norm_output_qact = norm_output_qact
         self.refpoint_head_float = refpoint_head_float
         self.quant_sine_embed = "sine_embed" in self.quant_components
+        self.exp_mode = exp_mode
+        self.int_exp = IViTExp()
         self.observe_stat = observe_stat
         self.block_name = block_name
 
@@ -766,6 +786,11 @@ class TransformerDecoder(nn.Module):
     
     def export(self):
         self._export = True
+
+    def _exp(self, x, scale):
+        if self.exp_mode == "float":
+            return x.clamp(min=-20.0, max=20.0).exp(), None
+        return _exp_tensor_scale(self.int_exp, x, scale)
 
     def _apply_norm(self, x, scale):
         if self.norm is None:
@@ -794,16 +819,21 @@ class TransformerDecoder(nn.Module):
                 refpoints_unsigmoid[..., :2],
                 refpoints_scale,
             )
-            new_refpoints_wh = new_refpoints_delta[..., 2:].exp() * refpoints_unsigmoid[..., 2:]
-            new_refpoints_wh_scale = (
-                None
-                if new_refpoints_delta_scale is None or refpoints_scale is None
-                else new_refpoints_delta_scale * refpoints_scale
+            tmp, tmp_scale = self._exp(
+                new_refpoints_delta[..., 2:],
+                new_refpoints_delta_scale,
+            )
+            new_refpoints_wh, new_refpoints_wh_scale = _multiply_tensor_scale(
+                tmp,
+                tmp_scale,
+                refpoints_unsigmoid[..., 2:],
+                refpoints_scale,
             )
             new_refpoints_unsigmoid, new_refpoints_scale = _concat_optional_tensor_scale(
                 [(new_refpoints_cxcy, new_refpoints_cxcy_scale), (new_refpoints_wh, new_refpoints_wh_scale)],
                 dim=-1,
             )
+            new_refpoints_unsigmoid = _sanitize_boxes(new_refpoints_unsigmoid)
         else:
             new_refpoints_unsigmoid, new_refpoints_scale = _add_tensor_scale(
                 refpoints_unsigmoid,
@@ -1288,5 +1318,6 @@ def build_transformer(args):
         decoder_refpoint_quant_components=getattr(args, "decoder_refpoint_quant_components", None),
         decoder_two_stage_quant_components=getattr(args, "decoder_two_stage_quant_components", None),
         decoder_output_norm_quant_components=getattr(args, "decoder_output_norm_quant_components", None),
+        exp_mode=getattr(args, "transformer_exp_mode", "ivit"),
         observe_stat=getattr(args, "observe_stat", False),
     )
