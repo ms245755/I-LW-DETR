@@ -115,21 +115,22 @@ class IFeedForward(nn.Module):
         self.quant_gelu = "gelu" in self.quant_components
         linear_cls = IViTLinear if self.quant_linear else nn.Linear
         self.fc1 = linear_cls(in_features=dim, out_features=hidden_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(dim, hidden_dim)
-        self.act = ISegGELU(output_bit=16, n=gelu_n, lambda_scaler=gelu_lambda, channel_len=hidden_dim)
+        # self.act = ISegGELU(output_bit=16, n=gelu_n, lambda_scaler=gelu_lambda, channel_len=None)
         self.act_fp = nn.GELU()
-        self.act_no_lambda = IViTGELU(output_bit=16)
+        # self.act_no_lambda = IViTGELU(output_bit=16)
+        self.act = ISignGELU(output_bit=16, n=gelu_n, lambda_scaler=gelu_lambda, channel_len=None)
         if out_dim is None:
             out_dim = dim
         self.fc2 = linear_cls(in_features=hidden_dim, out_features=out_dim, weight_bit=num_bits, bias_bit=num_bits*4) if self.quant_linear else linear_cls(hidden_dim, out_dim)
         self.drop = nn.Dropout(p=dropout)
-        self.gelu_choice = gelu_choice
+        self.gelu_choice = "sign_gelu"
 
         # Quantization activations around GELU and dropout
         self.qact_fc1_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_pre_gelu = IViTAct(activation_bit=num_bits, per_channel=True)
-        self.qact_gelu_input_bridge = IViTAct(activation_bit=num_bits)
+        # self.qact_gelu_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_post_gelu = IViTAct(activation_bit=16)
-        self.qact_fc2_input_bridge = IViTAct(activation_bit=num_bits)
+        # self.qact_fc2_input_bridge = IViTAct(activation_bit=num_bits)
         self.qact_drop2_stub = IViTAct(activation_bit=num_bits*2)
         # self.qact_post_gelu1 = IViTAct(activation_bit=16)
 
@@ -192,6 +193,8 @@ class IFeedForward(nn.Module):
             if act_scaling_factor is None:
                 x, act_scaling_factor = self.qact_pre_gelu(x=x, act_scaling_factor=None)
             if self.gelu_choice == "l_shiftgelu":
+                x, act_scaling_factor = self.act(x=x, act_scaling_factor=act_scaling_factor)
+            elif self.gelu_choice == "sign_gelu":
                 x, act_scaling_factor = self.act(x=x, act_scaling_factor=act_scaling_factor)
             elif self.gelu_choice == "shiftgelu":
                 x, act_scaling_factor = self.act_no_lambda(x=x, act_scaling_factor=act_scaling_factor)
@@ -442,10 +445,10 @@ class IBlock(nn.Module):
         self.window = window
 
         # Quantized activations around residual paths
-        self.qact_norm1_input_bridge = IViTAct(activation_bit=num_bits)
+        self.qact_norm1_input_bridge = IViTAct(activation_bit=16)
         self.pre_attn_scaler = IViTAct(activation_bit=num_bits)
         self.qact_drop_1 = IViTAct(activation_bit=num_bits*2)
-        self.qact_norm2_input_bridge = IViTAct(activation_bit=num_bits)
+        self.qact_norm2_input_bridge = IViTAct(activation_bit=16)
         self.pre_mlp_scaler = IViTAct(activation_bit=num_bits)
         self.qact_drop_2 = IViTAct(activation_bit=num_bits*2)
         self.use_cae = use_cae
@@ -468,6 +471,8 @@ class IBlock(nn.Module):
         shortcut = x
         shortcut_scale = act_scaling_factor
         if self.quant_layernorm:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.qact_norm1_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.norm1(x, act_scaling_factor)
             if self.attn.quant_linear:
                 x, act_scaling_factor = self.pre_attn_scaler(x=x, act_scaling_factor=act_scaling_factor)
@@ -518,6 +523,8 @@ class IBlock(nn.Module):
 
         # FeedForward branch
         if self.quant_layernorm:
+            if act_scaling_factor is None:
+                x, act_scaling_factor = self.qact_norm2_input_bridge(x=x, act_scaling_factor=None)
             x, act_scaling_factor = self.norm2(x=x, act_scaling_factor=act_scaling_factor)
             if self.mlp.quant_linear:
                 x, act_scaling_factor = self.pre_mlp_scaler(x=x, act_scaling_factor=act_scaling_factor)

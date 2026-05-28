@@ -644,11 +644,11 @@ class IViTLayerNorm(nn.LayerNorm):
     def forward(self, x, act_scaling_factor=None):
         # Normalization: computes mean and variance(std)
         dim = self._normalized_dim(x)
-        if act_scaling_factor is None:
-            with torch.no_grad():
-                target = 2.0 ** 7 - 1
-                max_abs = x.detach().abs().amax(dim=dim, keepdim=True)
-                act_scaling_factor = torch.clamp(max_abs / target, min=torch.finfo(x.dtype).eps)
+        # if act_scaling_factor is None:
+        #     with torch.no_grad():
+        #         target = 2.0 ** 7 - 1
+        #         max_abs = x.detach().abs().amax(dim=dim, keepdim=True)
+        #         act_scaling_factor = torch.clamp(max_abs / target, min=torch.finfo(x.dtype).eps)
         x_int = round_ste.apply(x / act_scaling_factor)
         mean_int = round_ste.apply(x_int.sum(dim=dim, keepdim=True) / x_int.shape[dim])
 
@@ -696,13 +696,13 @@ class IViTGELU(nn.Module):
     Class to quantize given GELU layer
     """
 
-    def __init__(self, output_bit=8, temp =1.702):
+    def __init__(self, output_bit=8):
         super(IViTGELU, self).__init__()
         self.output_bit = output_bit
 
         self.n = 23  # sufficiently large integer
         # The minimum value for ensuring accuracy (varies depending on models)
-        self.temp = temp
+
         self.register_buffer("act_scaling_factor", torch.zeros(1))
 
     def fix(self):
@@ -728,9 +728,9 @@ class IViTGELU(nn.Module):
 
     def forward(self, x, act_scaling_factor=None):
         pre_x_int = x / act_scaling_factor
-        act_scaling_factor_sig = act_scaling_factor * self.temp
+        act_scaling_factor_sig = act_scaling_factor * 1.702
 
-        x_int_max = torch.clamp(pre_x_int, min=0)
+        x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
         x_int = pre_x_int - x_int_max
 
         exp_int, _ = self.int_exp_shift(x_int, act_scaling_factor_sig)  # e^(x-x_max)
@@ -946,14 +946,14 @@ class IViTSiLU(nn.Module):
         return out, act_scaling_factor
 
 @track_init_args
-class ISegGELU(nn.Module):
+class ISignGELU(nn.Module):
     """
     Implementation of ShiftGELU
     Class to quantize given GELU layer
     """
 
     def __init__(self, output_bit=8, n=23, lambda_scaler=6, temp = 1.702, channel_len=None):
-        super(ISegGELU, self).__init__()
+        super(ISignGELU, self).__init__()
         self.output_bit = output_bit
 
         self.n = n  # sufficiently large integer
@@ -1036,6 +1036,86 @@ class ISegGELU(nn.Module):
         out = x_int_out * out_scaling_factor
 
         return out, out_scaling_factor
+
+@track_init_args
+class ISegGELU(nn.Module):
+    """
+    Implementation of ShiftGELU
+    Class to quantize given GELU layer
+    """
+
+    def __init__(self, output_bit=8, n=23, lambda_scaler=6, temp = 1.702, channel_len=None):
+        super(ISegGELU, self).__init__()
+        self.output_bit = output_bit
+
+        self.n = n  # sufficiently large integer
+        self.lambda_scaler = lambda_scaler
+        self.m = 31
+        # The minimum value for ensuring accuracy (varies depending on models)
+
+        scale_shape = channel_len if channel_len is not None else 1
+        self.register_buffer("act_scaling_factor", nn.Parameter(torch.zeros(scale_shape)))
+        self.register_buffer(
+            "sigmoid_scaling_factor",
+            nn.Parameter(torch.Tensor([1 / 2.0 ** (self.output_bit - 1)])),
+        )
+        self.temp = temp
+
+    def fix(self):
+        pass
+
+    def unfix(self):
+        pass
+
+    def int_exp_shift(self, x_int, scaling_factor):
+        scaled_floor = floor_ste.apply(x_int / 2)
+        scaled_exp_floor = floor_ste.apply(x_int / (2.0**4))
+        x_int = x_int + scaled_floor - scaled_exp_floor
+
+        with torch.no_grad():
+            x0_int = torch.ceil(1.0 / scaling_factor)
+
+        min_x_int = torch.clamp(self.n * self.lambda_scaler * (-x0_int), min=-(2.0**self.m))
+        x_int = torch.maximum(x_int, min_x_int)
+
+        q = floor_ste.apply(x_int / (-x0_int))
+        r = -(x_int - q * (-x0_int))
+
+        exp_int = floor_ste.apply((-r) / 2)
+        exp_int += x0_int
+        exp_int = floor_ste.apply(exp_int * 2.0 ** (self.n - q))
+
+        scaling_factor = scaling_factor / 2.0**self.n
+
+        return exp_int, scaling_factor
+
+    def forward(self, x, act_scaling_factor=None):
+        pre_x_int = round_ste.apply(x / act_scaling_factor)
+        scaling_factor_sig = act_scaling_factor * 1.702
+
+        x_int_max, _ = pre_x_int.max(dim=-1, keepdim=True)
+        x_int = pre_x_int - x_int_max
+
+        exp_int, _ = self.int_exp_shift(x_int, scaling_factor_sig)
+        exp_int_max, _ = self.int_exp_shift(-x_int_max, scaling_factor_sig)
+
+        exp_int_sum = exp_int + exp_int_max
+
+        # Clamp to avoid overflow or divide-by-zero
+        exp_int_sum = torch.clamp(exp_int_sum, min=1, max=2.0**self.m - 1)
+
+        factor = floor_ste.apply((2.0**self.m - 1) / exp_int_sum)
+
+        sigmoid_int = floor_ste.apply(exp_int * factor / (2.0 ** (self.m - self.output_bit + 1)))
+
+        x_int = pre_x_int * sigmoid_int
+
+        act_scaling_factor = act_scaling_factor * self.sigmoid_scaling_factor
+        self.act_scaling_factor = act_scaling_factor
+
+        out = x_int * act_scaling_factor
+
+        return out, act_scaling_factor
 
 @track_init_args
 class IViTSoftmax(nn.Module):
