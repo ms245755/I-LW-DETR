@@ -1063,6 +1063,8 @@ class IViTSoftmax(nn.Module):
         self.n = n  # sufficiently large integer
         self.lambda_scaler = lambda_scaler
         self.m = int(m)
+        if calibrate_m:
+            self.m = 25
         self.calibrate_m = calibrate_m
         self.m_guard_bits = int(m_guard_bits)
         self.m_max = int(m_max)

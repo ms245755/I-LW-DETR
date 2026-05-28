@@ -18,6 +18,18 @@ def unfreeze_model(model):
         if isinstance(m, (IViTAct, IViTSoftmax)):
             m.unfix()
 
+
+def configure_softmax_m_calibration(model, calibrate_m=True, m_guard_bits=None):
+    count = 0
+    for module in model.modules():
+        if isinstance(module, IViTSoftmax):
+            module.calibrate_m = calibrate_m
+            if m_guard_bits is not None:
+                module.m_guard_bits = int(m_guard_bits)
+            count += 1
+    return count
+
+
 def get_softmax_m_summary(model):
     softmax_ms = [m.m for m in model.modules() if isinstance(m, IViTSoftmax)]
     if not softmax_ms:

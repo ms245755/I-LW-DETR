@@ -44,6 +44,8 @@ decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-fa
 decoder_two_stage_float="${DECODER_TWO_STAGE_FLOAT:-false}"
 decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
 decoder_refpoint_head_float="${DECODER_REFPOINT_HEAD_FLOAT:-false}"
+softmax_calibrate_m="${SOFTMAX_CALIBRATE_M:-true}"
+softmax_m_safe_guard="${SOFTMAX_M_SAFE_GUARD:-${SAFE_GUARD:-4}}"
 
 has_quant_components=false
 if [[ " $quant_model_components " == *" backbone "* ]]; then
@@ -118,6 +120,11 @@ if [[ "$calib_eval" == "0" || "$calib_eval" == "false" || "$calib_eval" == "no" 
   calib_eval_args=(--no_calib_eval)
 fi
 
+softmax_calibrate_m_args=()
+if [[ "$softmax_calibrate_m" == "0" || "$softmax_calibrate_m" == "false" || "$softmax_calibrate_m" == "no" ]]; then
+  softmax_calibrate_m_args=(--no_softmax_calibrate_m)
+fi
+
 cd "$repo_root"
 
 if [[ "$has_quant_components" == "false" ]]; then
@@ -143,6 +150,8 @@ fi
   "${common_model_args[@]}" \
   --act_observer "$act_observer" \
   --act_percentile "$act_percentile" \
+  --softmax_m_safe_guard "$softmax_m_safe_guard" \
+  "${softmax_calibrate_m_args[@]}" \
   --calib_batches "$calib_batches" \
   --calib \
   "${calib_eval_args[@]}" \

@@ -254,7 +254,7 @@ class IAttention(nn.Module):
 
         # Quantized matmul + softmax
         self.matmul = IViTMatMul()
-        self.softmax = IViTSoftmax(output_bit=16, dim=-1, m=31)
+        self.softmax = IViTSoftmax(output_bit=16, dim=-1)
 
         # Quantized activations
         self.qact_qkv = IViTAct(activation_bit=num_bits)

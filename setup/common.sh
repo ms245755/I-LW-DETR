@@ -26,6 +26,8 @@ Optional environment variables:
   LWDETR_QUANT_COMPONENTS       Ops quantized inside prediction heads
   TRANSFORMER_EXP_MODE          float or ivit for transformer bbox exp
   LWDETR_EXP_MODE               float or ivit for LW-DETR bbox exp
+  SOFTMAX_CALIBRATE_M           true or false for IViTSoftmax m calibration
+  SOFTMAX_M_SAFE_GUARD          Guard bits added to calibrated IViTSoftmax m
   DECODER_TWO_STAGE_FLOAT       Keep two-stage proposal/top-k path float
 EOF
 }

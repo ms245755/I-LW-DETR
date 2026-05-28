@@ -39,7 +39,11 @@ from engine import (
 )
 from models import build_model
 from quant_models import build_model_quant
-from quant_models.fake_quantized.model_utils import freeze_model, unfreeze_model
+from quant_models.fake_quantized.model_utils import (
+    configure_softmax_m_calibration,
+    freeze_model,
+    unfreeze_model,
+)
 from util.drop_scheduler import drop_scheduler
 from util.get_param_dicts import get_param_dict
 import util.misc as utils
@@ -228,6 +232,12 @@ def get_args_parser():
                         help='Activation observer used by IViTAct during calibration/QAT.')
     parser.add_argument('--act_percentile', default=99.9, type=float,
                         help='Percentile used when --act_observer percentile is selected.')
+    parser.add_argument('--softmax_m_safe_guard', default=4, type=int,
+                        help='Guard bits added when calibrating IViTSoftmax m.')
+    parser.add_argument('--no_softmax_calibrate_m', dest='softmax_calibrate_m',
+                        action='store_false',
+                        help='Disable calibration of IViTSoftmax m during calibration/QAT observer collection.')
+    parser.set_defaults(softmax_calibrate_m=True)
 
 
     # * Transformer
@@ -397,6 +407,17 @@ def main(args):
 
     if args.calib or args.qat:
         model, criterion, postprocessors = build_model_quant(args)
+        softmax_count = configure_softmax_m_calibration(
+            model,
+            calibrate_m=args.softmax_calibrate_m,
+            m_guard_bits=args.softmax_m_safe_guard,
+        )
+        print(
+            "Configured IViTSoftmax m calibration: "
+            f"count={softmax_count}, "
+            f"calibrate_m={args.softmax_calibrate_m}, "
+            f"safe_guard={args.softmax_m_safe_guard}"
+        )
         print(model)
         # return
     else:
