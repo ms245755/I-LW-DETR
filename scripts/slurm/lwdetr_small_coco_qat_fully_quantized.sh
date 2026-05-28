@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=lwdetr_small_qat_full
-#SBATCH --time=72:00:00
+#SBATCH --time=100:00:00
 #SBATCH --partition=gpu80G
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:6
 
 set -euo pipefail
 trap 'status=$?; echo "FAILED at line $LINENO with exit code $status"; exit $status' ERR
@@ -23,7 +23,7 @@ if [[ -f "$conda_sh" ]]; then
   conda activate "$conda_env"
 fi
 
-export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -74,21 +74,32 @@ echo "QAT output dir: $qat_output_dir"
 echo "Repo root: $repo_root"
 echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-none}"
 echo "MASTER_PORT: $MASTER_PORT"
-echo "Starting PTQ phase"
 
-export OUTPUT_DIR="$ptq_output_dir"
-srun bash "setup/ptq/${SCENARIO}.sh" "$coco_path" "$checkpoint_path"
+if [[ -n "${QAT_RESUME:-}" ]]; then
+  if [[ ! -f "$QAT_RESUME" ]]; then
+    echo "QAT_RESUME does not exist: $QAT_RESUME" >&2
+    exit 1
+  fi
+  echo "QAT_RESUME is set; skipping PTQ phase."
+  calibrated_checkpoint="$QAT_RESUME"
+else
+  echo "Starting PTQ phase"
+  export OUTPUT_DIR="$ptq_output_dir"
+  srun bash "setup/ptq/${SCENARIO}.sh" "$coco_path" "$checkpoint_path"
 
-calibrated_checkpoint="$ptq_output_dir/checkpoint_calibrated.pth"
-if [[ ! -f "$calibrated_checkpoint" ]]; then
-  echo "Expected calibrated checkpoint not found: $calibrated_checkpoint" >&2
-  exit 1
+  calibrated_checkpoint="$ptq_output_dir/checkpoint_calibrated.pth"
+  if [[ ! -f "$calibrated_checkpoint" ]]; then
+    echo "Expected calibrated checkpoint not found: $calibrated_checkpoint" >&2
+    exit 1
+  fi
 fi
 
 export OUTPUT_DIR="$qat_output_dir"
-export RESUME="${QAT_RESUME:-$calibrated_checkpoint}"
+export RESUME="$calibrated_checkpoint"
+export SKIP_PRETRAIN="${SKIP_PRETRAIN:-true}"
 export QAT_CALIB_BATCHES="${EXTRA_QAT_CALIB_BATCHES:-0}"
 echo "QAT resume checkpoint: $RESUME"
+echo "SKIP_PRETRAIN for QAT phase: $SKIP_PRETRAIN"
 echo "QAT_CALIB_BATCHES for QAT phase: $QAT_CALIB_BATCHES"
 echo "Starting QAT phase"
 

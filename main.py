@@ -312,7 +312,7 @@ def get_args_parser():
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--resume_optimizer', default=False, action='store_true',
-                        help='restore optimizer, scheduler, and start epoch from --resume checkpoint')
+                        help='restore optimizer, scheduler, and start epoch from --resume checkpoint; use only to continue the same training run')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
@@ -538,9 +538,7 @@ def main(args):
             else:
                 del ema_m
                 ema_m = ModelEma(model) 
-        resume_training_state = not args.eval and (
-            args.resume_optimizer or not args.qat
-        )
+        resume_training_state = not args.eval and args.resume_optimizer
         if resume_training_state and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             checkpoint['optimizer']["param_groups"] = optimizer.state_dict()["param_groups"]
             checkpoint['lr_scheduler'].pop("step_size", None)

@@ -32,8 +32,18 @@ else
   checkpoint_dir="$checkpoint_root"
   resume="${RESUME:-$(resolve_path "$checkpoint_dir" "$resume_name" "resume checkpoint")}"
 fi
-pretrained_encoder="${PRETRAINED_ENCODER:-$(resolve_path "$checkpoint_dir" "$pretrained_encoder_name" "pretrained encoder")}"
-pretrain_weights="${PRETRAIN_WEIGHTS:-$(resolve_path "$checkpoint_dir" "$pretrain_weights_name" "pretrain weights")}"
+skip_pretrain="${SKIP_PRETRAIN:-false}"
+pretrain_args=()
+if [[ "$skip_pretrain" == "1" || "$skip_pretrain" == "true" || "$skip_pretrain" == "yes" ]]; then
+  echo "SKIP_PRETRAIN is set; QAT will initialize from --resume without loading pretrained encoder/pretrain weights."
+else
+  pretrained_encoder="${PRETRAINED_ENCODER:-$(resolve_path "$checkpoint_dir" "$pretrained_encoder_name" "pretrained encoder")}"
+  pretrain_weights="${PRETRAIN_WEIGHTS:-$(resolve_path "$checkpoint_dir" "$pretrain_weights_name" "pretrain weights")}"
+  pretrain_args=(
+    --pretrained_encoder "$pretrained_encoder"
+    --pretrain_weights "$pretrain_weights"
+  )
+fi
 
 lr="${LR:-2e-5}"
 lr_encoder="${LR_ENCODER:-2e-5}"
@@ -133,8 +143,7 @@ python -u -m torch.distributed.launch \
   --qat_calib_batches "$qat_calib_batches" \
   --ia_bce_loss \
   --cls_loss_coef 1 \
-  --pretrained_encoder "$pretrained_encoder" \
-  --pretrain_weights "$pretrain_weights" \
+  "${pretrain_args[@]}" \
   --resume "$resume" \
   --qat \
   --find_unused_parameters \
