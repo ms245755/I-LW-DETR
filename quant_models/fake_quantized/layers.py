@@ -407,9 +407,9 @@ class IViTConv2d(nn.Conv2d):
         x = x.flatten(2).transpose(1, 2)
         return self.post_act_scaler(x, act_scaling_factor)
 
-    def forward(self, x, act_scaling_factor=None):
+    def quantized_weight(self):
         if self.quant_mode == "symmetric":
-            self.weight_function = SymmetricQuantFunction.apply
+            weight_function = SymmetricQuantFunction.apply
         elif self.quant_mode == "asymmetric":
             raise NotImplementedError("unsupported quant mode: {}".format(self.quant_mode))
         else:
@@ -430,11 +430,15 @@ class IViTConv2d(nn.Conv2d):
                 self.weight_bit, self.min_val, self.max_val
             )
 
-        self.weight_integer = self.weight_function(
+        self.weight_integer = weight_function(
             self.weight, self.weight_bit, self.conv_scaling_factor, True
         )
+        return self.weight_integer, self.conv_scaling_factor
+
+    def forward(self, x, act_scaling_factor=None):
+        self.weight_integer, self.conv_scaling_factor = self.quantized_weight()
         bias_scaling_factor = self.conv_scaling_factor * act_scaling_factor
-        self.bias_integer = self.weight_function(
+        self.bias_integer = SymmetricQuantFunction.apply(
             self.bias, self.bias_bit, bias_scaling_factor, True
         )
 

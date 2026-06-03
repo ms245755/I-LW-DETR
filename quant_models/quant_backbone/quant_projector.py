@@ -133,6 +133,7 @@ class IConvX(nn.Module):
         observe_stat=False,
         block_name="",
         quant_components=None,
+        split_input_channels=None,
     ):
         super().__init__()
         quant_components = _component_set(quant_components)
@@ -157,6 +158,12 @@ class IConvX(nn.Module):
         self.qact_conv_input_bridge = IViTAct(
             observer_mode="percentile",
             percentile=99.9,
+        )
+        self.qact_split_input_bridges = nn.ModuleList(
+            [
+                IViTAct(observer_mode="percentile", percentile=99.9)
+                for _ in (split_input_channels or [])
+            ]
         )
         self.qact_post_conv = IViTAct(
             observer_mode="percentile",
@@ -185,6 +192,100 @@ class IConvX(nn.Module):
         )
         save_tensor_from_pathname(x, self.block_name + "1_act", observe_stat=self.observe_stat)
         return x, act_scaling_factor
+
+    def forward_split_inputs(self, inputs):
+        conv_out, conv_scale = self._forward_split_conv(inputs)
+        conv_out, conv_scale = self.qact_post_conv(conv_out, conv_scale)
+        save_tensor_from_pathname(conv_out, self.block_name + "0_conv", observe_stat=self.observe_stat)
+        conv_out, conv_scale = _forward_projector_layer(
+            self.act,
+            conv_out,
+            conv_scale,
+            self.qact_act_input_bridge,
+            self.qact_post_act,
+        )
+        save_tensor_from_pathname(conv_out, self.block_name + "1_act", observe_stat=self.observe_stat)
+        return conv_out, conv_scale
+
+    def _forward_split_conv(self, inputs):
+        """Apply one Conv2d to multiple input-channel blocks without concatenating them first."""
+        if isinstance(self.conv, IViTConv2d):
+            return self._forward_split_quant_conv2d(inputs)
+
+        if isinstance(self.conv, nn.Conv2d):
+            return self._forward_split_float_conv2d(inputs)
+
+        raise TypeError("split projector conv only supports Conv2d, got {}".format(type(self.conv)))
+
+    def _forward_split_quant_conv2d(self, inputs):
+        weight_integer, conv_scaling_factor = self.conv.quantized_weight()
+        partials = []
+        partial_scales = []
+        start = 0
+
+        for input_idx, (feat, scale) in enumerate(inputs):
+            channels = feat.shape[1]
+            end = start + channels
+            weight_slice = weight_integer[:, start:end]
+
+            if scale is None:
+                qact_bridge = (
+                    self.qact_split_input_bridges[input_idx]
+                    if input_idx < len(self.qact_split_input_bridges)
+                    else self.qact_conv_input_bridge
+                )
+                feat, scale = qact_bridge(feat, None)
+            if scale.numel() != 1:
+                scale = scale.max()
+
+            x_int = round_ste.apply(feat / scale)
+            y_int = F.conv2d(
+                x_int,
+                weight_slice,
+                None,
+                self.conv.stride,
+                self.conv.padding,
+                self.conv.dilation,
+                self.conv.groups,
+            )
+            partial_scale = conv_scaling_factor * scale
+            partials.append(y_int * partial_scale.view(1, -1, 1, 1))
+            partial_scales.append(partial_scale)
+            start = end
+
+        out_scale = torch.stack([scale.max() for scale in partial_scales]).max()
+        out_int = sum(round_ste.apply(partial / out_scale) for partial in partials)
+        if self.conv.bias is not None:
+            bias_int = round_ste.apply(self.conv.bias / out_scale)
+            self.conv.bias_integer = bias_int
+            out_int = out_int + bias_int.view(1, -1, 1, 1)
+        return out_int * out_scale, out_scale
+
+    def _forward_split_float_conv2d(self, inputs):
+        outputs = []
+        start = 0
+
+        for feat, _ in inputs:
+            channels = feat.shape[1]
+            end = start + channels
+            weight_slice = self.conv.weight[:, start:end]
+            outputs.append(
+                F.conv2d(
+                    feat,
+                    weight_slice,
+                    None,
+                    self.conv.stride,
+                    self.conv.padding,
+                    self.conv.dilation,
+                    self.conv.groups,
+                )
+            )
+            start = end
+
+        out = sum(outputs)
+        if self.conv.bias is not None:
+            out = out + self.conv.bias.view(1, -1, 1, 1)
+        return out, None
 
 
 class IBottleneck(nn.Module):
@@ -242,12 +343,23 @@ class IC2f(nn.Module):
         observe_stat=False,
         block_name="",
         quant_components=None,
+        split_input_channels=None,
     ):
         super().__init__()
         self.observe_stat = observe_stat
         self.block_name = block_name
         self.c = int(c2 * e)
-        self.cv1 = IConvX(c1, 2 * self.c, 1, 1, act=act, observe_stat=observe_stat, block_name=block_name + "0_cv1/", quant_components=quant_components)
+        self.cv1 = IConvX(
+            c1,
+            2 * self.c,
+            1,
+            1,
+            act=act,
+            observe_stat=observe_stat,
+            block_name=block_name + "0_cv1/",
+            quant_components=quant_components,
+            split_input_channels=split_input_channels,
+        )
         self.cv2 = IConvX((2 + n) * self.c, c2, 1, act=act, observe_stat=observe_stat, block_name=block_name + "2_cv2/", quant_components=quant_components)
         self.m = nn.ModuleList(
             IBottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, act=act, block_name=block_name + f"1_bot{i}/", observe_stat=observe_stat, quant_components=quant_components)
@@ -256,6 +368,22 @@ class IC2f(nn.Module):
 
     def forward(self, x, act_scaling_factor=None):
         x_out, act_scaling_factor = self.cv1(x, act_scaling_factor)
+        y = [(tmp, act_scaling_factor) for tmp in x_out.split((self.c, self.c), 1)]
+
+        for layer in self.m:
+            x_out, scale = layer(y[-1][0], y[-1][1])
+            y.append((x_out, scale))
+
+        if any(scale is None for _, scale in y):
+            concatenated_output = torch.cat([feat for feat, _ in y], 1)
+            act_scaling_factor = None
+        else:
+            concatenated_output, act_scaling_factor = concat_list_tensor_scale(y, 1)
+
+        return self.cv2(concatenated_output, act_scaling_factor)
+
+    def forward_split_inputs(self, inputs):
+        x_out, act_scaling_factor = self.cv1.forward_split_inputs(inputs)
         y = [(tmp, act_scaling_factor) for tmp in x_out.split((self.c, self.c), 1)]
 
         for layer in self.m:
@@ -306,6 +434,7 @@ class IMultiScaleProjector(nn.Module):
             stages_sampling.append([])
             stages_sampling_qact_bridge.append([])
             stages_sampling_qact_post.append([])
+            stage_input_channels = []
             for input_idx, in_dim in enumerate(in_channels):
                 sampling_block_name = stage_block_name + f"0_sampling/input{input_idx}/"
                 out_dim = in_dim
@@ -355,6 +484,7 @@ class IMultiScaleProjector(nn.Module):
                     continue
                 else:
                     raise NotImplementedError("Unsupported scale_factor:{}".format(scale))
+                stage_input_channels.append(out_dim)
                 layers = nn.Sequential(*layers)
                 stages_sampling[-1].append(layers)
                 stages_sampling_qact_bridge[-1].append(nn.ModuleList([IViTAct() for _ in layers]))
@@ -363,9 +493,17 @@ class IMultiScaleProjector(nn.Module):
             stages_sampling_qact_bridge[-1] = nn.ModuleList(stages_sampling_qact_bridge[-1])
             stages_sampling_qact_post[-1] = nn.ModuleList(stages_sampling_qact_post[-1])
 
-            in_dim = out_dim * len(in_channels)
+            in_dim = sum(stage_input_channels)
             layers = [
-                IC2f(in_dim, out_channels, num_blocks, observe_stat=observe_stat, block_name=stage_block_name + "1_c2f/", quant_components=self.quant_components),
+                IC2f(
+                    in_dim,
+                    out_channels,
+                    num_blocks,
+                    observe_stat=observe_stat,
+                    block_name=stage_block_name + "1_c2f/",
+                    quant_components=self.quant_components,
+                    split_input_channels=stage_input_channels,
+                ),
                 _make_norm(out_channels, self.quant_components),
             ]
             layers = nn.Sequential(*layers)
@@ -380,49 +518,76 @@ class IMultiScaleProjector(nn.Module):
         self.stages_qact_bridge = nn.ModuleList(stages_qact_bridge)
         self.stages_qact_post = nn.ModuleList(stages_qact_post)
 
+    def _sample_stage_inputs(self, stage_idx, x):
+        sampled_inputs = []
+        for feat_idx, stage_sampling in enumerate(self.stages_sampling[stage_idx]):
+            feat, scale = x[feat_idx] if isinstance(x[feat_idx], tuple) else (x[feat_idx], None)
+            sampled_inputs.append(
+                _forward_projector_sequence(
+                    stage_sampling,
+                    self.stages_sampling_qact_bridge[stage_idx][feat_idx],
+                    self.stages_sampling_qact_post[stage_idx][feat_idx],
+                    feat,
+                    scale,
+                )
+            )
+        return sampled_inputs
+
+    def _can_split_first_stage_conv(self, stage, sampled_inputs):
+        return (
+            len(sampled_inputs) > 1
+            and hasattr(stage[0], "forward_split_inputs")
+            and isinstance(stage[0].cv1.conv, IViTConv2d)
+        )
+
+    def _concat_sampled_inputs(self, sampled_inputs):
+        if len(sampled_inputs) == 1:
+            return sampled_inputs[0]
+
+        feat_cat = torch.cat([feat for feat, _ in sampled_inputs], dim=1)
+        if any(scale is None for _, scale in sampled_inputs):
+            return feat_cat, None
+
+        scale_cat = torch.cat(
+            [scale.expand(feat.shape[1]) for feat, scale in sampled_inputs],
+            dim=0,
+        )
+        return self.qact_post_fuse(feat_cat, scale_cat)
+
+    def _forward_remaining_stage_layers(self, stage_idx, stage, start_layer, feat, scale):
+        for layer_idx in range(start_layer, len(stage)):
+            feat, scale = _forward_projector_layer(
+                stage[layer_idx],
+                feat,
+                scale,
+                self.stages_qact_bridge[stage_idx][layer_idx],
+                self.stages_qact_post[stage_idx][layer_idx],
+            )
+            save_tensor_from_pathname(
+                feat,
+                self.block_name + f"stage{stage_idx}/2_stage/layer{layer_idx}",
+                observe_stat=self.observe_stat,
+            )
+        return feat, scale
+
     def forward(self, x):
         results = []
 
         for stage_idx, stage in enumerate(self.stages):
-            feat_fuse = []
-            for feat_idx, stage_sampling in enumerate(self.stages_sampling[stage_idx]):
-                feat, scale = x[feat_idx] if isinstance(x[feat_idx], tuple) else (x[feat_idx], None)
-                feat_fuse.append(
-                    _forward_projector_sequence(
-                        stage_sampling,
-                        self.stages_sampling_qact_bridge[stage_idx][feat_idx],
-                        self.stages_sampling_qact_post[stage_idx][feat_idx],
-                        feat,
-                        scale,
-                    )
-                )
-            if len(feat_fuse) > 1:
-                feat_cat = torch.cat([feat for (feat, _) in feat_fuse], dim=1)
-                if any(scale is None for _, scale in feat_fuse):
-                    feat_fuse = feat_cat
-                    max_scale = None
-                else:
-                    scale_cat = torch.cat([fs.expand(feat.shape[1]) for (feat, fs) in feat_fuse], dim=0)
-                    feat_fuse, max_scale = self.qact_post_fuse(feat_cat, scale_cat)
-            else:
-                max_scale = feat_fuse[0][1]
-                feat_fuse = feat_fuse[0][0]
+            sampled_inputs = self._sample_stage_inputs(stage_idx, x)
 
-            feat = feat_fuse
-            scale = max_scale
-            for layer_idx, layer in enumerate(stage):
-                feat, scale = _forward_projector_layer(
-                    layer,
-                    feat,
-                    scale,
-                    self.stages_qact_bridge[stage_idx][layer_idx],
-                    self.stages_qact_post[stage_idx][layer_idx],
-                )
+            if self._can_split_first_stage_conv(stage, sampled_inputs):
+                feat, scale = stage[0].forward_split_inputs(sampled_inputs)
                 save_tensor_from_pathname(
                     feat,
-                    self.block_name + f"stage{stage_idx}/2_stage/layer{layer_idx}",
+                    self.block_name + f"stage{stage_idx}/2_stage/layer0",
                     observe_stat=self.observe_stat,
                 )
+                feat, scale = self._forward_remaining_stage_layers(stage_idx, stage, 1, feat, scale)
+            else:
+                feat, scale = self._concat_sampled_inputs(sampled_inputs)
+                feat, scale = self._forward_remaining_stage_layers(stage_idx, stage, 0, feat, scale)
+
             save_tensor_from_pathname(
                 feat,
                 self.block_name + f"stage{stage_idx}/3_output",
