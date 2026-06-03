@@ -696,11 +696,11 @@ class IViTGELU(nn.Module):
     Class to quantize given GELU layer
     """
 
-    def __init__(self, output_bit=8):
+    def __init__(self, output_bit=8, n = 23):
         super(IViTGELU, self).__init__()
         self.output_bit = output_bit
 
-        self.n = 23  # sufficiently large integer
+        self.n = n  # sufficiently large integer
         # The minimum value for ensuring accuracy (varies depending on models)
 
         self.register_buffer("act_scaling_factor", torch.zeros(1))
@@ -739,6 +739,92 @@ class IViTGELU(nn.Module):
         exp_int_sum = exp_int + exp_int_max
 
         exp_int_sum.clamp_max_(2.0**31 - 1)
+        factor = floor_ste.apply((2**31 - 1) / exp_int_sum)
+        sigmoid_int = floor_ste.apply(exp_int * factor / 2.0 ** (31 - self.output_bit + 1))
+        sigmoid_act_scaling_factor = torch.Tensor([1 / 2.0 ** (self.output_bit - 1)]).to(x.device)
+
+        x_int = pre_x_int * sigmoid_int
+        act_scaling_factor = act_scaling_factor * sigmoid_act_scaling_factor
+        self.act_scaling_factor = act_scaling_factor
+        return x_int * act_scaling_factor, act_scaling_factor
+
+@track_init_args
+class IViTGELUWithSigmoidRange(nn.Module):
+    """
+    IViTGELU with the sigmoid input range transform from Eq. (15)-(16).
+
+    The transform is applied only to the sigmoid approximation input:
+        I_X' = clamp(I_X * 2^M, -127, 127)
+        S_X' = S_X / 2^M
+    where S_X is the GELU sigmoid scale, i.e. the input scale multiplied by 1.702.
+    """
+
+    def __init__(self, output_bit=8, input_bit=8, sigmoid_bound=6.0):
+        super(IViTGELUWithSigmoidRange, self).__init__()
+        self.output_bit = output_bit
+        self.input_bit = input_bit
+        self.sigmoid_bound = sigmoid_bound
+
+        self.n = 23  # sufficiently large integer
+
+        self.register_buffer("act_scaling_factor", torch.zeros(1))
+
+    def fix(self):
+        pass
+
+    def unfix(self):
+        pass
+
+    def _sigmoid_range_transform(self, x_int, scaling_factor):
+        target_int = 2.0 ** (self.input_bit - 1) - 1
+        target_scaling_factor = torch.tensor(
+            self.sigmoid_bound / target_int,
+            device=scaling_factor.device,
+            dtype=scaling_factor.dtype,
+        )
+
+        with torch.no_grad():
+            ratio = scaling_factor / target_scaling_factor
+            m = torch.clamp(torch.ceil(torch.log2(torch.clamp(ratio, min=1.0))) - 1.0, min=0.0)
+            shift_factor = 2.0 ** m
+
+        x_int = torch.clamp(x_int * shift_factor, min=-target_int, max=target_int)
+        scaling_factor = scaling_factor / shift_factor
+
+        return x_int, scaling_factor
+
+    def int_exp_shift(self, x_int, scaling_factor):
+        x_int = x_int + floor_ste.apply(x_int / 2) - floor_ste.apply(x_int / 2**4)
+
+        with torch.no_grad():
+            x0_int = torch.floor(-1.0 / scaling_factor)
+        x_int = torch.max(x_int, self.n * x0_int)
+
+        q = floor_ste.apply(x_int / x0_int)
+        r = x_int - x0_int * q
+        exp_int = r / 2 - x0_int
+        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** (self.n - q)), min=0)
+        scaling_factor = scaling_factor / 2.0**self.n
+
+        return exp_int, scaling_factor
+
+    def forward(self, x, act_scaling_factor=None):
+        pre_x_int = x / act_scaling_factor
+        act_scaling_factor_sig = act_scaling_factor * 1.702
+
+        sigmoid_x_int, sigmoid_scaling_factor = self._sigmoid_range_transform(
+            pre_x_int,
+            act_scaling_factor_sig,
+        )
+
+        x_int_max, _ = sigmoid_x_int.max(dim=-1, keepdim=True)
+        x_int = sigmoid_x_int - x_int_max
+
+        exp_int, _ = self.int_exp_shift(x_int, sigmoid_scaling_factor)
+        exp_int_max, _ = self.int_exp_shift(-x_int_max, sigmoid_scaling_factor)
+        exp_int_sum = exp_int + exp_int_max
+
+        exp_int_sum = torch.clamp(exp_int_sum, min=1, max=2.0**31 - 1)
         factor = floor_ste.apply((2**31 - 1) / exp_int_sum)
         sigmoid_int = floor_ste.apply(exp_int * factor / 2.0 ** (31 - self.output_bit + 1))
         sigmoid_act_scaling_factor = torch.Tensor([1 / 2.0 ** (self.output_bit - 1)]).to(x.device)
@@ -832,6 +918,123 @@ class IViTExp(nn.Module):
         if self.output_bit is not None:
             # map to signed range if you want (exp is non-negative, so unsigned would be better,
             # but we keep the same style as the rest of your code)
+            max_int = 2 ** (self.output_bit - 1) - 1
+            exp_int = torch.clamp(exp_int, 0, max_int)
+
+        self.act_scaling_factor = exp_scale
+        return exp_int * exp_scale, exp_scale
+
+@track_init_args
+class IViTExpV2(nn.Module):
+    """
+    ShiftExp variant with separate negative and positive integer paths.
+
+    Negative inputs keep the same approximation used by IViTExp. Positive
+    inputs use a positive x0_int and direct 2**q growth, so they do not need
+    the 2**n output-scale compensation used by the negative branch.
+    """
+
+    def __init__(self, output_bit=None, n=23, clamp_min_real=-20.0, clamp_max_real=20.0):
+        super().__init__()
+        self.output_bit = output_bit
+        self.n = n
+        self.clamp_min_real = clamp_min_real
+        self.clamp_max_real = clamp_max_real
+
+        self.register_buffer("act_scaling_factor", torch.zeros(1))
+
+    def fix(self):
+        pass
+
+    def unfix(self):
+        pass
+
+    def _log2_input_shift(self, x_int):
+        # IMPROVE_APPROX: tune these shift terms to better approximate x / ln(2).
+        return (
+            x_int
+            + floor_ste.apply(x_int / 2)
+            - floor_ste.apply(x_int / 2**4)
+            + floor_ste.apply(x_int / 2**8)
+            + floor_ste.apply(x_int / 2**9)
+        )
+
+    def _int_exp_shift_negative(self, x_int, scaling_factor):
+        with torch.no_grad():
+            x0_int = torch.floor(-1.0 / scaling_factor)
+
+        x_int = torch.max(x_int, self.n * x0_int)
+
+        q = floor_ste.apply(x_int / x0_int)
+        r = x_int - x0_int * q
+
+        # IMPROVE_APPROX: replace this linear residual with a better 2**u approximation for u in [-1, 0].
+        exp_int = r / 2 - x0_int
+        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** (self.n - q)), min=0)
+
+        return exp_int
+
+    def _int_exp_shift_positive(self, x_int, scaling_factor):
+        with torch.no_grad():
+            x0_int = torch.ceil(1.0 / scaling_factor)
+
+        q = floor_ste.apply(x_int / x0_int)
+        r = x_int - x0_int * q
+
+        # IMPROVE_APPROX: this is the main positive-side residual approximation.
+        # It approximates 2**(r / x0_int) with the line 1 + r / x0_int.
+        exp_int = x0_int + r
+        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** q), min=0)
+
+        return exp_int
+
+    def int_exp_shift(self, x_int, scaling_factor):
+        pos_mask = x_int >= 0
+        x_int = self._log2_input_shift(x_int)
+
+        exp_int = torch.empty_like(x_int)
+
+        if torch.any(pos_mask):
+            exp_int[pos_mask] = self._int_exp_shift_positive(
+                x_int[pos_mask],
+                scaling_factor,
+            )
+
+        if torch.any(~pos_mask):
+            neg_exp_int = self._int_exp_shift_negative(
+                x_int[~pos_mask],
+                scaling_factor,
+            )
+            # The negative branch internally uses scale / 2**n. Convert it to
+            # the common positive-branch scale so forward can return one scale.
+            exp_int[~pos_mask] = neg_exp_int / 2.0**self.n
+
+        return exp_int, scaling_factor
+
+    def forward(self, x, act_scaling_factor=None):
+        assert act_scaling_factor is not None, "act_scaling_factor must be provided"
+
+        x_int = round_ste.apply(x / act_scaling_factor)
+
+        if self.clamp_min_real is not None or self.clamp_max_real is not None:
+            with torch.no_grad():
+                lo = None if self.clamp_min_real is None else torch.floor(
+                    torch.tensor(self.clamp_min_real, device=x.device, dtype=torch.float32) / act_scaling_factor
+                )
+                hi = None if self.clamp_max_real is None else torch.ceil(
+                    torch.tensor(self.clamp_max_real, device=x.device, dtype=torch.float32) / act_scaling_factor
+                )
+
+            if lo is not None and hi is not None:
+                x_int = torch.clamp(x_int, lo.item(), hi.item())
+            elif lo is not None:
+                x_int = torch.max(x_int, lo.item())
+            elif hi is not None:
+                x_int = torch.min(x_int, hi.item())
+
+        exp_int, exp_scale = self.int_exp_shift(x_int, act_scaling_factor)
+
+        if self.output_bit is not None:
             max_int = 2 ** (self.output_bit - 1) - 1
             exp_int = torch.clamp(exp_int, 0, max_int)
 
@@ -984,6 +1187,95 @@ class ISignGELU(nn.Module):
             x0_int = torch.ceil(1.0 / scaling_factor)
 
         min_x_int = torch.clamp(self.n * self.lambda_scaler * (-x0_int), min=-(2.0**self.m))
+        x_int = torch.maximum(x_int, min_x_int)
+
+        q = floor_ste.apply(x_int / (-x0_int))
+        r = -(x_int - q * (-x0_int))
+
+        exp_int = floor_ste.apply((-r) / 2)
+        exp_int += x0_int
+        exp_int = floor_ste.apply(exp_int * 2.0 ** (self.n - q))
+
+        scaling_factor = scaling_factor / 2.0**self.n
+
+        return exp_int, scaling_factor
+
+    def forward(self, x, act_scaling_factor=None):
+        pre_x_int = round_ste.apply(x / act_scaling_factor)
+        scaling_factor_sig = act_scaling_factor * self.temp
+
+        A = 2.0
+        A_int = round_ste.apply(
+            torch.tensor(A, device=x.device, dtype=x.dtype) / act_scaling_factor
+        )
+
+        pos_mask = pre_x_int > 0
+
+        x_int_max_base = torch.clamp(pre_x_int, min=0)
+
+        x_int_max = torch.where(
+            pos_mask,
+            pre_x_int + A_int,
+            x_int_max_base
+        )
+
+        x_int = pre_x_int - x_int_max
+
+        exp_int, _ = self.int_exp_shift(x_int, scaling_factor_sig)
+        exp_int_max, _ = self.int_exp_shift(-x_int_max, scaling_factor_sig)
+
+        exp_int_sum = exp_int + exp_int_max
+        exp_int_sum = torch.clamp(exp_int_sum, min=1, max=2.0**self.m - 1)
+
+        factor = floor_ste.apply((2.0**self.m - 1) / exp_int_sum)
+
+        sigmoid_int = floor_ste.apply(exp_int * factor / (2.0 ** (self.m - self.output_bit + 1)))
+
+        x_int_out = pre_x_int * sigmoid_int
+
+        out_scaling_factor = act_scaling_factor * self.sigmoid_scaling_factor
+        self.act_scaling_factor = out_scaling_factor
+
+        out = x_int_out * out_scaling_factor
+
+        return out, out_scaling_factor
+
+@track_init_args
+class ISignGELUNoLambda(nn.Module):
+    """
+    ISignGELU variant without lambda scaling in the integer exp clamp.
+    """
+
+    def __init__(self, output_bit=8, n=23, temp=1.702, channel_len=None):
+        super(ISignGELUNoLambda, self).__init__()
+        self.output_bit = output_bit
+
+        self.n = n  # sufficiently large integer
+        self.m = 31
+
+        scale_shape = channel_len if channel_len is not None else 1
+        self.register_buffer("act_scaling_factor", nn.Parameter(torch.zeros(scale_shape)))
+        self.register_buffer(
+            "sigmoid_scaling_factor",
+            nn.Parameter(torch.Tensor([1 / 2.0 ** (self.output_bit - 1)])),
+        )
+        self.temp = temp
+
+    def fix(self):
+        pass
+
+    def unfix(self):
+        pass
+
+    def int_exp_shift(self, x_int, scaling_factor):
+        scaled_floor = floor_ste.apply(x_int / 2)
+        scaled_exp_floor = floor_ste.apply(x_int / (2.0**4))
+        x_int = x_int + scaled_floor - scaled_exp_floor
+
+        with torch.no_grad():
+            x0_int = torch.ceil(1.0 / scaling_factor)
+
+        min_x_int = torch.clamp(self.n * (-x0_int), min=-(2.0**self.m))
         x_int = torch.maximum(x_int, min_x_int)
 
         q = floor_ste.apply(x_int / (-x0_int))
