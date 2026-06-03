@@ -28,6 +28,9 @@ Optional environment variables:
   LWDETR_EXP_MODE               float or ivit for LW-DETR bbox exp
   SOFTMAX_CALIBRATE_M           true or false for IViTSoftmax m calibration
   SOFTMAX_M_SAFE_GUARD          Guard bits added to calibrated IViTSoftmax m
+  SOFTMAX_M_CALIB_MODE          max, percentile, or ema_percentile
+  SOFTMAX_M_PERCENTILE          Percentile used for percentile softmax m calibration
+  SOFTMAX_M_EMA_MOMENTUM        EMA momentum for ema_percentile softmax m calibration
   DECODER_TWO_STAGE_FLOAT       Keep two-stage proposal/top-k path float
 EOF
 }

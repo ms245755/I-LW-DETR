@@ -1130,9 +1130,12 @@ class IViTSoftmax(nn.Module):
         n=15,
         lambda_scaler=1,
         input_bit=8,
-        m=31,
+        m=27,
         calibrate_m=True,
         m_guard_bits=4,
+        m_calib_mode="ema_percentile",
+        m_percentile=99.9,
+        m_ema_momentum=0.95,
         m_max=63,
         **kwargs,
     ):
@@ -1147,6 +1150,9 @@ class IViTSoftmax(nn.Module):
             self.m = 25
         self.calibrate_m = calibrate_m
         self.m_guard_bits = int(m_guard_bits)
+        self.m_calib_mode = str(m_calib_mode)
+        self.m_percentile = float(m_percentile)
+        self.m_ema_momentum = float(m_ema_momentum)
         self.m_max = int(m_max)
         self.running_stat = True
         # The minimum value for ensuring accuracy (varies depending on models)
@@ -1156,7 +1162,10 @@ class IViTSoftmax(nn.Module):
             nn.Parameter(torch.Tensor([1 / 2.0 ** (self.output_bit - 1)])),
         )
         self.register_buffer("max_exp_int_sum", torch.tensor(0.0))
+        self.register_buffer("percentile_exp_int_sum", torch.tensor(0.0))
+        self.register_buffer("ema_exp_int_sum", torch.tensor(0.0))
         self.register_buffer("calibrated_m", torch.tensor(self.m, dtype=torch.long))
+        self.register_buffer("m_calib_batches", torch.tensor(0, dtype=torch.long))
 
     def fix(self):
         if self.calibrate_m and self.max_exp_int_sum.item() > 0:
@@ -1168,7 +1177,10 @@ class IViTSoftmax(nn.Module):
 
     def reset_m_calibration(self):
         self.max_exp_int_sum.zero_()
+        self.percentile_exp_int_sum.zero_()
+        self.ema_exp_int_sum.zero_()
         self.calibrated_m.fill_(self.m)
+        self.m_calib_batches.zero_()
 
     def _sync_m_from_calibration(self):
         if self.calibrate_m and self.max_exp_int_sum.item() > 0:
@@ -1180,12 +1192,41 @@ class IViTSoftmax(nn.Module):
             return self.m
 
         with torch.no_grad():
-            observed_max = exp_int_sum.detach().float().amax()
+            exp_values = exp_int_sum.detach().float().reshape(-1)
+            observed_max = exp_values.amax()
             self.max_exp_int_sum.copy_(torch.maximum(self.max_exp_int_sum, observed_max))
-            required_m = torch.ceil(torch.log2(self.max_exp_int_sum.clamp_min(1.0))).long()
+
+            if self.m_calib_mode == "percentile":
+                q = min(max(self.m_percentile / 100.0, 0.0), 1.0)
+                observed_ref = torch.quantile(exp_values, q)
+                self.percentile_exp_int_sum.copy_(
+                    torch.maximum(self.percentile_exp_int_sum, observed_ref)
+                )
+                calib_ref = self.percentile_exp_int_sum
+            elif self.m_calib_mode == "ema_percentile":
+                q = min(max(self.m_percentile / 100.0, 0.0), 1.0)
+                observed_ref = torch.quantile(exp_values, q)
+                self.percentile_exp_int_sum.copy_(
+                    torch.maximum(self.percentile_exp_int_sum, observed_ref)
+                )
+                if self.m_calib_batches.item() == 0:
+                    self.ema_exp_int_sum.copy_(observed_ref)
+                else:
+                    self.ema_exp_int_sum.copy_(
+                        self.ema_exp_int_sum * self.m_ema_momentum
+                        + observed_ref * (1.0 - self.m_ema_momentum)
+                    )
+                calib_ref = self.ema_exp_int_sum
+            elif self.m_calib_mode == "max":
+                calib_ref = self.max_exp_int_sum
+            else:
+                raise ValueError(f"unknown softmax m calibration mode: {self.m_calib_mode}")
+
+            required_m = torch.ceil(torch.log2(calib_ref.clamp_min(1.0))).long()
             required_m = required_m + self.m_guard_bits
             required_m = torch.clamp(required_m, min=self.m, max=self.m_max)
             self.calibrated_m.copy_(required_m)
+            self.m_calib_batches += 1
 
         return int(self.calibrated_m.item())
 

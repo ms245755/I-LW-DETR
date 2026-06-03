@@ -46,6 +46,9 @@ decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
 decoder_refpoint_head_float="${DECODER_REFPOINT_HEAD_FLOAT:-false}"
 softmax_calibrate_m="${SOFTMAX_CALIBRATE_M:-true}"
 softmax_m_safe_guard="${SOFTMAX_M_SAFE_GUARD:-${SAFE_GUARD:-4}}"
+softmax_m_calib_mode="${SOFTMAX_M_CALIB_MODE:-max}"
+softmax_m_percentile="${SOFTMAX_M_PERCENTILE:-99.9}"
+softmax_m_ema_momentum="${SOFTMAX_M_EMA_MOMENTUM:-0.99}"
 
 has_quant_components=false
 if [[ " $quant_model_components " == *" backbone "* ]]; then
@@ -151,6 +154,9 @@ fi
   --act_observer "$act_observer" \
   --act_percentile "$act_percentile" \
   --softmax_m_safe_guard "$softmax_m_safe_guard" \
+  --softmax_m_calib_mode "$softmax_m_calib_mode" \
+  --softmax_m_percentile "$softmax_m_percentile" \
+  --softmax_m_ema_momentum "$softmax_m_ema_momentum" \
   "${softmax_calibrate_m_args[@]}" \
   --calib_batches "$calib_batches" \
   --calib \

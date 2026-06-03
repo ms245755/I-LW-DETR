@@ -40,7 +40,7 @@ model_size="${MODEL_SIZE:-tiny}"
 sweep_root="${SWEEP_OUTPUT_ROOT:-output/ptq_softmax_m_guard_sweep_exp02}/${model_size}"
 csv_path="${SWEEP_CSV:-$sweep_root/summary.csv}"
 summary_log="${SWEEP_LOG:-$sweep_root/summary.log}"
-guards="${SAFE_GUARDS:-0 1 2 3}"
+guards="${SAFE_GUARDS:-0 1 2 4 8}"
 nproc_per_node="${NPROC_PER_NODE:-4}"
 ap_pattern="Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ]"
 

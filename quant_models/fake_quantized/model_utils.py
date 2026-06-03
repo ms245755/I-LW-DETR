@@ -19,13 +19,26 @@ def unfreeze_model(model):
             m.unfix()
 
 
-def configure_softmax_m_calibration(model, calibrate_m=True, m_guard_bits=None):
+def configure_softmax_m_calibration(
+    model,
+    calibrate_m=True,
+    m_guard_bits=None,
+    m_calib_mode=None,
+    m_percentile=None,
+    m_ema_momentum=None,
+):
     count = 0
     for module in model.modules():
         if isinstance(module, IViTSoftmax):
             module.calibrate_m = calibrate_m
             if m_guard_bits is not None:
                 module.m_guard_bits = int(m_guard_bits)
+            if m_calib_mode is not None:
+                module.m_calib_mode = str(m_calib_mode)
+            if m_percentile is not None:
+                module.m_percentile = float(m_percentile)
+            if m_ema_momentum is not None:
+                module.m_ema_momentum = float(m_ema_momentum)
             count += 1
     return count
 
@@ -46,5 +59,11 @@ def print_softmax_m(model):
             print(
                 f"{name}: m={module.m}, "
                 f"calibrated_m={int(module.calibrated_m.item())}, "
-                f"max_exp_int_sum={float(module.max_exp_int_sum.item()):.1f}"
+                f"m_calib_mode={module.m_calib_mode}, "
+                f"m_percentile={module.m_percentile:.4g}, "
+                f"m_ema_momentum={module.m_ema_momentum:.4g}, "
+                f"max_exp_int_sum={float(module.max_exp_int_sum.item()):.1f}, "
+                f"percentile_exp_int_sum={float(module.percentile_exp_int_sum.item()):.1f}, "
+                f"ema_exp_int_sum={float(module.ema_exp_int_sum.item()):.1f}, "
+                f"m_calib_batches={int(module.m_calib_batches.item())}"
             )

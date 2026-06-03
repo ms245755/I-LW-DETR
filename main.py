@@ -234,6 +234,13 @@ def get_args_parser():
                         help='Percentile used when --act_observer percentile is selected.')
     parser.add_argument('--softmax_m_safe_guard', default=4, type=int,
                         help='Guard bits added when calibrating IViTSoftmax m.')
+    parser.add_argument('--softmax_m_calib_mode', default='max', type=str,
+                        choices=('max', 'percentile', 'ema_percentile'),
+                        help='Statistic used to calibrate IViTSoftmax m.')
+    parser.add_argument('--softmax_m_percentile', default=99.9, type=float,
+                        help='Percentile used when --softmax_m_calib_mode percentile is selected.')
+    parser.add_argument('--softmax_m_ema_momentum', default=0.99, type=float,
+                        help='EMA momentum used when --softmax_m_calib_mode ema_percentile is selected.')
     parser.add_argument('--no_softmax_calibrate_m', dest='softmax_calibrate_m',
                         action='store_false',
                         help='Disable calibration of IViTSoftmax m during calibration/QAT observer collection.')
@@ -411,12 +418,18 @@ def main(args):
             model,
             calibrate_m=args.softmax_calibrate_m,
             m_guard_bits=args.softmax_m_safe_guard,
+            m_calib_mode=args.softmax_m_calib_mode,
+            m_percentile=args.softmax_m_percentile,
+            m_ema_momentum=args.softmax_m_ema_momentum,
         )
         print(
             "Configured IViTSoftmax m calibration: "
             f"count={softmax_count}, "
             f"calibrate_m={args.softmax_calibrate_m}, "
-            f"safe_guard={args.softmax_m_safe_guard}"
+            f"safe_guard={args.softmax_m_safe_guard}, "
+            f"mode={args.softmax_m_calib_mode}, "
+            f"percentile={args.softmax_m_percentile}, "
+            f"ema_momentum={args.softmax_m_ema_momentum}"
         )
         print(model)
         # return
