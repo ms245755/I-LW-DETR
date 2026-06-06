@@ -1426,7 +1426,7 @@ class IViTSoftmax(nn.Module):
         n=15,
         lambda_scaler=1,
         input_bit=8,
-        m=27,
+        m=31,
         calibrate_m=True,
         m_guard_bits=4,
         m_calib_mode="ema_percentile",
@@ -1442,8 +1442,10 @@ class IViTSoftmax(nn.Module):
         self.n = n  # sufficiently large integer
         self.lambda_scaler = lambda_scaler
         self.m = int(m)
-        if calibrate_m:
-            self.m = 25
+        # if calibrate_m:
+        #     self.m = 21
+        # else:
+        #     self.m = 31
         self.calibrate_m = calibrate_m
         self.m_guard_bits = int(m_guard_bits)
         self.m_calib_mode = str(m_calib_mode)

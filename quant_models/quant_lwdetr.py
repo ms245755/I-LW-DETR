@@ -96,7 +96,7 @@ class ILWDETR(nn.Module):
         self.qact_hs_head = IViTAct()
         self.qact_hs_enc = IViTAct()
         self.qact_bbox_delta_xy = IViTAct()
-        self.qact_bbox_delta_wh = IViTAct()
+        self.qact_bbox_delta_wh = IViTAct(activation_bit=16)
         self.int_exp = IViTExp()
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
