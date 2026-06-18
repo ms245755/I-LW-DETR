@@ -358,6 +358,8 @@ class IAttention(nn.Module):
                 x=attn,
                 act_scaling_factor=act_scaling_factor,
             )
+            save_tensor_from_pathname(attn, self.block_name+"1_attn_softmax_input", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(act_scaling_factor, self.block_name+"1_attn_softmax_input_scale", observe_stat=self.observe_stat)
             attn, act_scaling_factor = self.softmax(
                 x=attn,
                 act_scaling_factor=act_scaling_factor,
@@ -938,6 +940,8 @@ class IMSDeformAttn(nn.Module):
                 attn_weights, attn_scale = self.qact_attn_weights(attn_weights, None)
             if torch.is_tensor(attn_scale) and attn_scale.numel() == self.n_heads * self.n_levels * self.n_points:
                 attn_scale = attn_scale.view(self.n_heads, self.n_levels * self.n_points)
+            save_tensor_from_pathname(attn_weights, self.block_name + "5_attention_logits_softmax_input", observe_stat=self.observe_stat)
+            save_tensor_from_pathname(attn_scale, self.block_name + "5_attention_logits_softmax_input_scale", observe_stat=self.observe_stat)
             attn_weights, attn_scale = self.softmax(attn_weights, attn_scale, dynamic_input_scale=True)
         else:
             attn_weights = F.softmax(attn_weights, -1)

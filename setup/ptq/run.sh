@@ -49,6 +49,7 @@ softmax_m_safe_guard="${SOFTMAX_M_SAFE_GUARD:-${SAFE_GUARD:-4}}"
 softmax_m_calib_mode="${SOFTMAX_M_CALIB_MODE:-max}"
 softmax_m_percentile="${SOFTMAX_M_PERCENTILE:-99.9}"
 softmax_m_ema_momentum="${SOFTMAX_M_EMA_MOMENTUM:-0.99}"
+observe_stat="${OBSERVE_STAT:-false}"
 
 has_quant_components=false
 if [[ " $quant_model_components " == *" backbone "* ]]; then
@@ -128,6 +129,11 @@ if [[ "$softmax_calibrate_m" == "0" || "$softmax_calibrate_m" == "false" || "$so
   softmax_calibrate_m_args=(--no_softmax_calibrate_m)
 fi
 
+observe_stat_args=()
+if [[ "$observe_stat" == "1" || "$observe_stat" == "true" || "$observe_stat" == "yes" ]]; then
+  observe_stat_args=(--observe_stat)
+fi
+
 cd "$repo_root"
 
 if [[ "$has_quant_components" == "false" ]]; then
@@ -160,6 +166,7 @@ fi
   "${softmax_calibrate_m_args[@]}" \
   --calib_batches "$calib_batches" \
   --calib \
+  "${observe_stat_args[@]}" \
   "${calib_eval_args[@]}" \
   "${ptq_reconstruct_args[@]}" \
   "${decoder_cross_attn_float_args[@]}" \

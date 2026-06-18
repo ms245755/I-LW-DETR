@@ -31,6 +31,7 @@ Optional environment variables:
   SOFTMAX_M_CALIB_MODE          max, percentile, or ema_percentile
   SOFTMAX_M_PERCENTILE          Percentile used for percentile softmax m calibration
   SOFTMAX_M_EMA_MOMENTUM        EMA momentum for ema_percentile softmax m calibration
+  OBSERVE_STAT                  true to save observed tensors during PTQ calibration
   DECODER_TWO_STAGE_FLOAT       Keep two-stage proposal/top-k path float
 EOF
 }
