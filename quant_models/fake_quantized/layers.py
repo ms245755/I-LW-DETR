@@ -839,213 +839,6 @@ class IViTGELUWithSigmoidRange(nn.Module):
         return x_int * act_scaling_factor, act_scaling_factor
 
 @track_init_args
-class IViTExp(nn.Module):
-    """
-    Integer-ish Exp layer (ShiftExp)
-    Computes y = exp(x) with an integer exp approximation + scaling-factor tracking.
-
-    Input:
-      x: tensor representing real values (usually float tensor carrying quantized values)
-      act_scaling_factor: scale Sx such that x_real ≈ (x / Sx) * Sx
-
-    Output:
-      y: approximate exp(x_real)
-      y_scaling_factor: scale Sy such that y_real ≈ y_int * Sy
-    """
-
-    def __init__(self, output_bit=None, n=23, clamp_min_real=-20.0, clamp_max_real=20.0):
-        super().__init__()
-        self.output_bit = output_bit
-        self.n = n
-
-        # Optional clamp to keep exp stable in integer-only pipelines
-        self.clamp_min_real = clamp_min_real
-        self.clamp_max_real = clamp_max_real
-
-        self.register_buffer("act_scaling_factor", torch.zeros(1))
-
-    def fix(self):
-        pass
-
-    def unfix(self):
-        pass
-
-    def int_exp_shift(self, x_int, scaling_factor):
-        # same core as IViTGELU
-        x_int = x_int + floor_ste.apply(x_int / 2) - floor_ste.apply(x_int / 2**4) + floor_ste.apply(x_int / 2**8) + floor_ste.apply(x_int / 2**9)
-
-        with torch.no_grad():
-            x0_int = torch.floor(-1.0 / scaling_factor)
-
-        x_int = torch.max(x_int, self.n * x0_int)
-
-        q = floor_ste.apply(x_int / x0_int)
-        r = x_int - x0_int * q
-
-        exp_int = r / 2 - x0_int
-        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** (self.n - q)), min=0)
-
-        scaling_factor = scaling_factor / 2.0**self.n
-        return exp_int, scaling_factor
-
-    def forward(self, x, act_scaling_factor=None):
-        assert act_scaling_factor is not None, "act_scaling_factor must be provided"
-
-        # "integer" representation (still float tensor in your framework)
-        x_int = round_ste.apply(x / act_scaling_factor)
-
-        # Optional real-domain clamp for stability:
-        # # x_real = x_int * act_scaling_factor, so clamp x_int to [min/S, max/S]
-        if self.clamp_min_real is not None or self.clamp_max_real is not None:
-            with torch.no_grad():
-                lo = None if self.clamp_min_real is None else torch.floor(
-                    torch.tensor(self.clamp_min_real, device=x.device, dtype=torch.float32) / act_scaling_factor
-                )
-                hi = None if self.clamp_max_real is None else torch.ceil(
-                    torch.tensor(self.clamp_max_real, device=x.device, dtype=torch.float32) / act_scaling_factor
-                )
-
-            if lo is not None and hi is not None:
-                x_int = torch.clamp(x_int, lo.item(), hi.item())
-            elif lo is not None:
-                x_int = torch.max(x_int, lo.item())
-            elif hi is not None:
-                x_int = torch.min(x_int, hi.item())
-
-        # Integer exp approximation:
-        # exp_int is an integer-like tensor, exp_scale is the scale for exp_int
-        exp_int, exp_scale = self.int_exp_shift(x_int, act_scaling_factor)
-
-        # Optionally quantize exp_int down to a fixed-point format controlled by output_bit.
-        # Your int_exp_shift returns an exp_int with its own exp_scale; you can keep it as-is.
-        # But if you want exp_int to fit into a fixed range:
-        if self.output_bit is not None:
-            # map to signed range if you want (exp is non-negative, so unsigned would be better,
-            # but we keep the same style as the rest of your code)
-            max_int = 2 ** (self.output_bit - 1) - 1
-            exp_int = torch.clamp(exp_int, 0, max_int)
-
-        self.act_scaling_factor = exp_scale
-        return exp_int * exp_scale, exp_scale
-
-@track_init_args
-class IViTExpV2(nn.Module):
-    """
-    ShiftExp variant with separate negative and positive integer paths.
-
-    Negative inputs keep the same approximation used by IViTExp. Positive
-    inputs use a positive x0_int and direct 2**q growth, so they do not need
-    the 2**n output-scale compensation used by the negative branch.
-    """
-
-    def __init__(self, output_bit=None, n=23, clamp_min_real=-20.0, clamp_max_real=20.0):
-        super().__init__()
-        self.output_bit = output_bit
-        self.n = n
-        self.clamp_min_real = clamp_min_real
-        self.clamp_max_real = clamp_max_real
-
-        self.register_buffer("act_scaling_factor", torch.zeros(1))
-
-    def fix(self):
-        pass
-
-    def unfix(self):
-        pass
-
-    def _log2_input_shift(self, x_int):
-        # IMPROVE_APPROX: tune these shift terms to better approximate x / ln(2).
-        return (
-            x_int
-            + floor_ste.apply(x_int / 2)
-            - floor_ste.apply(x_int / 2**4)
-            + floor_ste.apply(x_int / 2**8)
-            + floor_ste.apply(x_int / 2**9)
-        )
-
-    def _int_exp_shift_negative(self, x_int, scaling_factor):
-        with torch.no_grad():
-            x0_int = torch.floor(-1.0 / scaling_factor)
-
-        x_int = torch.max(x_int, self.n * x0_int)
-
-        q = floor_ste.apply(x_int / x0_int)
-        r = x_int - x0_int * q
-
-        # IMPROVE_APPROX: replace this linear residual with a better 2**u approximation for u in [-1, 0].
-        exp_int = r / 2 - x0_int
-        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** (self.n - q)), min=0)
-
-        return exp_int
-
-    def _int_exp_shift_positive(self, x_int, scaling_factor):
-        with torch.no_grad():
-            x0_int = torch.ceil(1.0 / scaling_factor)
-
-        q = floor_ste.apply(x_int / x0_int)
-        r = x_int - x0_int * q
-
-        # IMPROVE_APPROX: this is the main positive-side residual approximation.
-        # It approximates 2**(r / x0_int) with the line 1 + r / x0_int.
-        exp_int = x0_int + r
-        exp_int = torch.clamp(floor_ste.apply(exp_int * 2.0 ** q), min=0)
-
-        return exp_int
-
-    def int_exp_shift(self, x_int, scaling_factor):
-        pos_mask = x_int >= 0
-        x_int = self._log2_input_shift(x_int)
-
-        exp_int = torch.empty_like(x_int)
-
-        if torch.any(pos_mask):
-            exp_int[pos_mask] = self._int_exp_shift_positive(
-                x_int[pos_mask],
-                scaling_factor,
-            )
-
-        if torch.any(~pos_mask):
-            neg_exp_int = self._int_exp_shift_negative(
-                x_int[~pos_mask],
-                scaling_factor,
-            )
-            # The negative branch internally uses scale / 2**n. Convert it to
-            # the common positive-branch scale so forward can return one scale.
-            exp_int[~pos_mask] = neg_exp_int / 2.0**self.n
-
-        return exp_int, scaling_factor
-
-    def forward(self, x, act_scaling_factor=None):
-        assert act_scaling_factor is not None, "act_scaling_factor must be provided"
-
-        x_int = round_ste.apply(x / act_scaling_factor)
-
-        if self.clamp_min_real is not None or self.clamp_max_real is not None:
-            with torch.no_grad():
-                lo = None if self.clamp_min_real is None else torch.floor(
-                    torch.tensor(self.clamp_min_real, device=x.device, dtype=torch.float32) / act_scaling_factor
-                )
-                hi = None if self.clamp_max_real is None else torch.ceil(
-                    torch.tensor(self.clamp_max_real, device=x.device, dtype=torch.float32) / act_scaling_factor
-                )
-
-            if lo is not None and hi is not None:
-                x_int = torch.clamp(x_int, lo.item(), hi.item())
-            elif lo is not None:
-                x_int = torch.max(x_int, lo.item())
-            elif hi is not None:
-                x_int = torch.min(x_int, hi.item())
-
-        exp_int, exp_scale = self.int_exp_shift(x_int, act_scaling_factor)
-
-        if self.output_bit is not None:
-            max_int = 2 ** (self.output_bit - 1) - 1
-            exp_int = torch.clamp(exp_int, 0, max_int)
-
-        self.act_scaling_factor = exp_scale
-        return exp_int * exp_scale, exp_scale
-    
-@track_init_args
 class IViTSiLU(nn.Module):
     """
     Integer-ish SiLU (Swish-1): SiLU(x) = x * sigmoid(x)
@@ -1732,3 +1525,216 @@ class QuantizedBaseModelOutputWithPooling(ModelOutput):
     pooler_output: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+
+@track_init_args
+class IViTExp(nn.Module):
+    """
+    ShiftExp variant with separate negative and positive integer paths.
+
+    Negative inputs keep the original I-ViT ShiftExp approximation.
+    Positive inputs use a separate positive decomposition, which is needed
+    when exp() receives positive values, for example in box refinement.
+
+    The function returns one common output scale. Here, both branches are
+    represented using the positive-branch natural scale S.
+    """
+
+    def __init__(self, output_bit=None, n=23, clamp_min_real=-20.0, clamp_max_real=20.0):
+        super().__init__()
+        self.output_bit = output_bit
+        self.n = n
+        self.clamp_min_real = clamp_min_real
+        self.clamp_max_real = clamp_max_real
+
+        self.register_buffer("act_scaling_factor", torch.zeros(1))
+
+    def fix(self):
+        pass
+
+    def unfix(self):
+        pass
+
+    def _log2_input_shift(self, x_int):
+        """
+        Approximate multiplication by log2(e).
+
+        e^x = 2^(x log2(e))
+
+        log2(e) ≈ 1 + 2^-1 - 2^-4 + 2^-8 + 2^-9
+        """
+        return (
+            x_int
+            + floor_ste.apply(x_int / 2)
+            - floor_ste.apply(x_int / 2**4)
+            + floor_ste.apply(x_int / 2**8)
+            + floor_ste.apply(x_int / 2**9)
+        )
+
+    def _int_exp_shift_negative(self, x_int, scaling_factor):
+        """
+        Negative branch.
+
+        Assumes x_int <= 0 after log2(e) approximation.
+
+        Natural output scale:
+            S_exp_neg = S / 2^n
+
+        Returned integer:
+            exp_int_neg
+        """
+        with torch.no_grad():
+            x0_int = torch.floor(-1.0 / scaling_factor)
+
+        # Avoid too negative values, which would be rounded to zero anyway.
+        x_int = torch.max(x_int, self.n * x0_int)
+
+        q = floor_ste.apply(x_int / x0_int)
+        r = x_int - x0_int * q
+
+        # Residual approximation on [-1, 0]:
+        # 2^u ≈ 1 + u / 2
+        exp_int = r / 2 - x0_int
+
+        # Apply 2^(n-q), then floor to integer.
+        exp_int = torch.clamp(
+            floor_ste.apply(exp_int * 2.0 ** (self.n - q)),
+            min=0
+        )
+
+        return exp_int
+
+    def _int_exp_shift_positive(self, x_int, scaling_factor):
+        """
+        Positive branch.
+
+        Assumes x_int >= 0 after log2(e) approximation.
+
+        Uses:
+            q = floor(x_int / x0_int)
+            r = x_int - q x0_int
+
+        with:
+            x0_int ≈ 1 / S
+
+        Then:
+            2^(S x_int) ≈ 2^q (1 + S r)
+                          ≈ S (x0_int + r) 2^q
+
+        Natural output scale:
+            S_exp_pos = S
+
+        Returned integer:
+            exp_int_pos = (x0_int + r) 2^q
+        """
+        with torch.no_grad():
+            # Match the magnitude used by the original negative-sign
+            # formulation: floor(-1 / S) == -ceil(1 / S).
+            x0_int = torch.ceil(1.0 / scaling_factor)
+            x0_int = torch.clamp(x0_int, min=1)
+
+        q = floor_ste.apply(x_int / x0_int)
+        r = x_int - x0_int * q
+
+        # Residual approximation on [0, 1):
+        # 2^u ≈ 1 + u
+        exp_int = x0_int + r
+
+        # Apply 2^q as a left shift.
+        exp_int = torch.clamp(
+            floor_ste.apply(exp_int * 2.0 ** q),
+            min=0
+        )
+
+        return exp_int
+
+    def int_exp_shift(self, x_int, scaling_factor):
+        """
+        Integer exponential approximation.
+
+        The sign must be checked after the log2(e) approximation, because
+        the decomposition is applied to I_p, not to the original integer input.
+        """
+
+        # Approximate I * log2(e)
+        x_int = self._log2_input_shift(x_int)
+
+        # Branch according to I_p
+        pos_mask = x_int >= 0
+
+        exp_int = torch.empty_like(x_int)
+
+        if torch.any(pos_mask):
+            exp_int[pos_mask] = self._int_exp_shift_positive(
+                x_int[pos_mask],
+                scaling_factor
+            )
+
+        if torch.any(~pos_mask):
+            neg_exp_int = self._int_exp_shift_negative(
+                x_int[~pos_mask],
+                scaling_factor
+            )
+
+            # Negative branch natural scale is S / 2^n.
+            # To return one common scale S, convert:
+            #
+            #   neg_exp_int * (S / 2^n)
+            # = (neg_exp_int / 2^n) * S
+            #
+            # This keeps the same real value, but the returned exp_int is
+            # not strictly integer-like for negative values.
+            exp_int[~pos_mask] = neg_exp_int / 2.0**self.n
+
+        # Common output scale.
+        exp_scale = scaling_factor
+
+        return exp_int, exp_scale
+
+    def forward(self, x, act_scaling_factor=None):
+        assert act_scaling_factor is not None, "act_scaling_factor must be provided"
+
+        # Convert real-valued tensor to integer representation.
+        x_int = round_ste.apply(x / act_scaling_factor)
+
+        # Optional real-domain clamp.
+        if self.clamp_min_real is not None or self.clamp_max_real is not None:
+            with torch.no_grad():
+                lo = None
+                hi = None
+
+                if self.clamp_min_real is not None:
+                    lo = torch.floor(
+                        torch.tensor(
+                            self.clamp_min_real,
+                            device=x.device,
+                            dtype=torch.float32
+                        ) / act_scaling_factor
+                    )
+
+                if self.clamp_max_real is not None:
+                    hi = torch.ceil(
+                        torch.tensor(
+                            self.clamp_max_real,
+                            device=x.device,
+                            dtype=torch.float32
+                        ) / act_scaling_factor
+                    )
+
+            if lo is not None and hi is not None:
+                x_int = torch.clamp(x_int, lo.item(), hi.item())
+            elif lo is not None:
+                x_int = torch.max(x_int, lo.item())
+            elif hi is not None:
+                x_int = torch.min(x_int, hi.item())
+
+        # Integer exp approximation.
+        exp_int, exp_scale = self.int_exp_shift(x_int, act_scaling_factor)
+
+        # Optional output clipping.
+        if self.output_bit is not None:
+            max_int = 2 ** (self.output_bit - 1) - 1
+            exp_int = torch.clamp(exp_int, 0, max_int)
+
+        self.act_scaling_factor = exp_scale
+
+        return exp_int * exp_scale, exp_scale
