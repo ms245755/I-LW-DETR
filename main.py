@@ -562,6 +562,9 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
+        if args.calib or args.qat:
+            print("Freezing quantization observers for standalone evaluation.")
+            freeze_model(model)
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args)
         if args.output_dir:
