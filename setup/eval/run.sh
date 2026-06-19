@@ -12,7 +12,13 @@ Usage:
 
 Options:
   --model-size <tiny|small|medium|all>   Model size to evaluate. Default: tiny
-  --variant <original|qr|ptq|qat|all>    Checkpoint variant to evaluate. Default: all
+  --variant <original|qr|ptq|qat|all>    Checkpoint variant to evaluate:
+                                          original = float model
+                                          qr       = easy-quantized model
+                                          ptq      = calibrated PTQ model
+                                          qat      = QAT-trained quantized model
+                                          all      = evaluate every variant
+                                        Default: all
   --checkpoint-root <path>               Checkpoint root. Default: pretrain_weights
   --checkpoint <path>                    Evaluate one explicit checkpoint file. Requires one model size and one variant
   --output-root <path>                   Output root. Default: output/eval
@@ -20,6 +26,8 @@ Options:
   --nproc-per-node <N>                   Number of GPU processes. Default: size-specific common.sh value
   --master-port <PORT>                   Distributed master port. Default: 29500
   --batch-size <N>                       Eval batch size. Default: size-specific common.sh value
+  --dataset-file <coco|custom_coco>       Dataset metadata type. Default: coco
+  --num-classes <N>                      Optional head-size override
   --device <cuda|cpu>                    Device passed to main.py. Default: cuda
   -h, --help                             Show this help
 
@@ -27,8 +35,11 @@ Examples:
   bash setup/eval/run.sh --model-size all --variant all --coco-path ../../data/COCO
   bash setup/eval/run.sh --model-size small --variant ptq --coco-path ../../data/COCO
   bash setup/eval/run.sh --model-size medium --variant qat --checkpoint /path/to/checkpoint.pth --coco-path ../../data/COCO
+  bash setup/eval/run.sh --model-size tiny --variant original --dataset-file custom_coco --coco-path /path/to/VisDrone-coco --output-root output/eval_visdrone_float
+  bash setup/eval/run.sh --model-size tiny --variant ptq --dataset-file custom_coco --coco-path /path/to/VisDrone-coco --output-root output/eval_visdrone_ptq
 
 COCO path should be the COCO root, containing val2017/ and annotations/instances_val2017.json.
+Converted datasets such as VisDrone are supported when they use this COCO layout.
 The script writes summary.csv and summary.xlsx under --output-root.
 EOF
 }
@@ -44,6 +55,8 @@ master_port="${MASTER_PORT:-29500}"
 device="${DEVICE:-cuda}"
 nproc_override=""
 batch_size_override=""
+requested_num_classes=""
+requested_dataset_file="coco"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -87,6 +100,14 @@ while [[ $# -gt 0 ]]; do
       batch_size_override="$2"
       shift 2
       ;;
+    --dataset-file)
+      requested_dataset_file="$2"
+      shift 2
+      ;;
+    --num-classes)
+      requested_num_classes="$2"
+      shift 2
+      ;;
     --device)
       device="$2"
       shift 2
@@ -122,6 +143,15 @@ case "$requested_variant" in
   original|qr|ptq|qat|all) ;;
   *)
     echo "Unsupported --variant: $requested_variant" >&2
+    usage
+    exit 2
+    ;;
+esac
+
+case "$requested_dataset_file" in
+  coco|custom_coco) ;;
+  *)
+    echo "Unsupported --dataset-file: $requested_dataset_file" >&2
     usage
     exit 2
     ;;
@@ -380,6 +410,14 @@ run_eval() {
   configure_model_size
   local current_batch_size="${batch_size_override:-$batch_size}"
   local current_nproc="${nproc_override:-$nproc_per_node}"
+  local num_classes_args=()
+  if [[ -n "$requested_num_classes" ]]; then
+    num_classes_args=(--num_classes "$requested_num_classes")
+    export NUM_CLASSES="$requested_num_classes"
+  else
+    unset NUM_CLASSES || true
+  fi
+  export DATASET_FILE="$requested_dataset_file"
 
   window_block_args=()
   out_feature_args=()
@@ -403,8 +441,9 @@ run_eval() {
     --lite_refpoint_refine
     --num_queries "$num_queries"
     --num_select "$num_select"
-    --dataset_file coco
+    --dataset_file "$requested_dataset_file"
     --coco_path "$coco_path"
+    "${num_classes_args[@]}"
     --square_resize_div_64
   )
 

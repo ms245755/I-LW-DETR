@@ -10,6 +10,8 @@ Usage: bash $script_name <coco_path> <checkpoint_path_or_dir>
 
 Optional environment variables:
   MODEL_SIZE=tiny|small|medium  Default: tiny
+  DATASET_FILE=coco|custom_coco Dataset metadata type. Default: coco
+  NUM_CLASSES                  Optional classification-head size override
   OUTPUT_ROOT=output            Default output root
   ENCODER_QUANT_BLOCKS          ViT block indexes to quantize, or all
   ENCODER_QUANT_COMPONENTS      Ops quantized inside ViT blocks
@@ -38,6 +40,7 @@ EOF
 
 configure_model_size() {
   model_size="${MODEL_SIZE:-tiny}"
+  dataset_file="${DATASET_FILE:-coco}"
 
   case "$model_size" in
     tiny)
@@ -240,6 +243,10 @@ make_quant_block_args() {
 }
 
 prepare_common_args() {
+  num_classes_args=()
+  if [[ -n "${NUM_CLASSES:-}" ]]; then
+    num_classes_args=(--num_classes "$NUM_CLASSES")
+  fi
   split_args "$quant_model_components" quant_model_component_args
   split_args "$backbone_quant_components" backbone_quant_component_args
   split_args "$encoder_quant_components" encoder_quant_component_args
@@ -287,8 +294,9 @@ build_common_model_args() {
     --lite_refpoint_refine
     --num_queries "$num_queries"
     --num_select "$num_select"
-    --dataset_file coco
+    --dataset_file "$dataset_file"
     --coco_path "$coco_path"
+    "${num_classes_args[@]}"
     --square_resize_div_64
     --easy_quantize
   )

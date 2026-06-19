@@ -286,38 +286,38 @@ output/ptq_decoder_block_sweep/<model_size>
 output/ptq_single_component_sweep/<model_size>
 ```
 
-## Slurm Wrappers
+## Legacy Slurm scripts
 
-The `scripts/slurm/` directory has cluster-specific wrappers. The newer quantization wrappers call the same `setup/ptq` and `setup/qat` entrypoints, so the same environment variables work.
+The model-specific files under `scripts/slurm/` are retained only for older
+experiments. New finetune, evaluation, PTQ, and QAT jobs should use the generic
+`setup/slurm/run.sh` dispatcher below.
 
-Fully quantized tiny PTQ + QAT:
+## Local and Slurm workflow entry points
 
-```bash
-OUTPUT_DIR=output/lwdetr_tiny_qat_fully_quantized \
-PTQ_OUTPUT_DIR=output/lwdetr_tiny_ptq_fully_quantized \
-QAT_FREEZE_OBSERVERS=true \
-sbatch scripts/slurm/lwdetr_tiny_coco_qat_fully_quantized.sh /path/to/coco /path/to/checkpoint.pth
-```
-
-Fully quantized small PTQ + QAT:
+The workflow scripts under `setup/` run directly on a local machine:
 
 ```bash
-OUTPUT_DIR=output/lwdetr_small_qat_fully_quantized \
-PTQ_OUTPUT_DIR=output/lwdetr_small_ptq_fully_quantized \
-sbatch scripts/slurm/lwdetr_small_coco_qat_fully_quantized.sh /path/to/coco /path/to/checkpoint.pth
+bash setup/finetune/run.sh tiny /path/to/custom-coco
+bash setup/eval/run.sh --model-size tiny --variant original --coco-path /path/to/coco
+bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoint.pth
+bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint.pth
 ```
 
-Resume interrupted QAT under Slurm:
+On Factory AI/Slurm, use the single dispatcher:
 
 ```bash
-QAT_RESUME=/path/to/qat_output/checkpoint.pth \
-RESUME_OPTIMIZER=true \
-OUTPUT_DIR=/path/to/qat_output \
-EPOCHS=20 \
-sbatch scripts/slurm/lwdetr_tiny_coco_qat_fully_quantized.sh /path/to/coco /path/to/original_checkpoint.pth
+sbatch setup/slurm/run.sh finetune tiny /path/to/custom-coco
+sbatch setup/slurm/run.sh eval --model-size tiny --variant original --coco-path /path/to/coco
+sbatch setup/slurm/run.sh ptq fully_quantized /path/to/coco /path/to/checkpoint.pth
+sbatch setup/slurm/run.sh qat fully_quantized /path/to/coco /path/to/checkpoint.pth
 ```
 
-The fully-quantized Slurm wrappers run a PTQ phase before QAT. For a pure QAT resume, either use a QAT-only wrapper such as `scripts/slurm/lwdetr_tiny_coco_qat_vit_proj.sh`, or adjust the wrapper to skip PTQ when your calibrated checkpoint already exists.
+Override allocation resources with normal `sbatch` flags:
 
-Older Slurm files that call `main.py` directly are useful examples, but they do not expose the full component-selection interface as cleanly as the `setup/` wrappers.
+```bash
+sbatch --partition=gpu80G --gres=gpu:8 setup/slurm/run.sh ...
+```
 
+The Slurm wrapper activates `CONDA_ENV` (default `lwdetr2`), derives
+`NPROC_PER_NODE` from the allocated GPUs, and forwards all workflow arguments.
+Set `FACTORY_SETUP=/path/to/site_setup.sh` for optional Factory-specific setup.
