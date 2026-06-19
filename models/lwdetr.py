@@ -586,9 +586,8 @@ def build(args):
     # you should pass `num_classes` to be 2 (max_obj_id + 1).
     # For more details on this, check the following discussion
     # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
-    num_classes = 20 if args.dataset_file != 'coco' else 91
-    if args.dataset_file == "o365":
-        num_classes = 366
+    from datasets import resolve_num_classes
+    num_classes = resolve_num_classes(args)
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
