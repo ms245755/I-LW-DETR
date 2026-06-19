@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import GradScaler
 
-from datasets import build_dataset, get_coco_api_from_dataset
+from datasets import build_dataset, get_coco_api_from_dataset, resolve_num_classes
 from engine import (
     evaluate,
     make_random_calib_loader,
@@ -106,10 +106,39 @@ def print_load_state(prefix, load_state):
         print(f"{prefix}: first unexpected keys: {unexpected[:20]}")
 
 
+def is_classification_head_parameter(name):
+    return (
+        name.startswith("class_embed.")
+        or name.startswith("transformer.enc_out_class_embed.")
+    )
+
+
+def report_class_head_only_training(model):
+    head_tensors = 0
+    frozen_tensors = 0
+    for name, parameter in model.named_parameters():
+        is_head = is_classification_head_parameter(name)
+        if is_head:
+            head_tensors += 1
+        elif parameter.requires_grad:
+            frozen_tensors += 1
+    print(
+        "Class-head warm-up enabled: "
+        f"updating {head_tensors} classification tensors; "
+        f"suppressing updates for {frozen_tensors} other tensors."
+    )
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_encoder', default=1.5e-4, type=float)
+    parser.add_argument('--lr_class_head', default=None, type=float,
+                        help='Learning rate for class_embed and two-stage encoder '
+                             'classification heads. Defaults to --lr.')
+    parser.add_argument('--class_head_warmup_epochs', default=0, type=int,
+                        help='Train only classification heads for the first N epochs, '
+                             'then automatically unfreeze the full detector.')
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=12, type=int)
@@ -308,8 +337,14 @@ def get_args_parser():
     parser.add_argument('--ia_bce_loss', action='store_true')
 
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
+    parser.add_argument('--dataset_file', default='coco',
+                        choices=('coco', 'custom_coco', 'o365'),
+                        help='Dataset loader/metadata type. custom_coco infers the '
+                             'classification head from COCO-format categories.')
     parser.add_argument('--coco_path', type=str)
+    parser.add_argument('--num_classes', default=None, type=int,
+                        help='Optional classification head override. Normally inferred '
+                             'from --dataset_file metadata.')
     parser.add_argument('--square_resize_div_64', action='store_true')
 
     parser.add_argument('--output_dir', default='output',
@@ -402,6 +437,11 @@ def get_args_parser():
 def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
+    args.num_classes = resolve_num_classes(args)
+    print(
+        f"Dataset: {args.dataset_file}; classification head size: "
+        f"{args.num_classes}"
+    )
     print(args)
 
     device = torch.device(args.device)
@@ -693,6 +733,12 @@ def main(args):
     
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
+    class_head_warmup_active = (
+        args.class_head_warmup_epochs > 0
+        and args.start_epoch < args.class_head_warmup_epochs
+    )
+    if class_head_warmup_active:
+        report_class_head_only_training(model_without_ddp)
     if args.qat and args.qat_calib_batches > 0 and args.start_epoch == 0:
         qat_calib_loader = make_random_calib_loader(
             dataset_val,
@@ -729,6 +775,9 @@ def main(args):
         freeze_model(model)
 
     for epoch in range(args.start_epoch, args.epochs):
+        if class_head_warmup_active and epoch >= args.class_head_warmup_epochs:
+            print("Class-head warm-up complete: updating the full detector.")
+            class_head_warmup_active = False
         if args.qat and not args.qat_freeze_observers:
             unfreeze_model(model)
         epoch_start_time = time.time()

@@ -56,10 +56,31 @@ def get_param_dict(args, model_without_ddp: nn.Module):
         for param in decoder_params
     ]
 
+    class_head_lr = (
+        args.lr if getattr(args, "lr_class_head", None) is None
+        else args.lr_class_head
+    )
+    class_head_params = [
+        p
+        for n, p in model_without_ddp.named_parameters()
+        if (
+            n.startswith("class_embed.")
+            or n.startswith("transformer.enc_out_class_embed.")
+        ) and p.requires_grad
+    ]
+    class_head_param_lr_pairs = [
+        {"params": param, "lr": class_head_lr}
+        for param in class_head_params
+    ]
+
     other_params = [
         p
         for n, p in model_without_ddp.named_parameters() if (
-            n not in backbone_named_param_lr_pairs and decoder_key not in n and p.requires_grad)
+            n not in backbone_named_param_lr_pairs
+            and decoder_key not in n
+            and not n.startswith("class_embed.")
+            and not n.startswith("transformer.enc_out_class_embed.")
+            and p.requires_grad)
     ]
     other_param_dicts = [
         {"params": param, "lr": args.lr} 
@@ -67,7 +88,18 @@ def get_param_dict(args, model_without_ddp: nn.Module):
     ]
     
     final_param_dicts = (
-        other_param_dicts + backbone_param_lr_pairs + decoder_param_lr_pairs
+        other_param_dicts
+        + backbone_param_lr_pairs
+        + decoder_param_lr_pairs
+        + class_head_param_lr_pairs
+    )
+
+    print(
+        "Optimizer learning rates: "
+        f"base={args.lr}, encoder={args.lr_encoder}, "
+        f"decoder={args.lr * args.lr_component_decay}, "
+        f"class_head={class_head_lr} "
+        f"({len(class_head_params)} tensors)"
     )
 
     return final_param_dicts

@@ -80,6 +80,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         optimizer.zero_grad()
         losses.backward()
+        if (
+            args is not None
+            and epoch < getattr(args, "class_head_warmup_epochs", 0)
+        ):
+            for name, parameter in model.named_parameters():
+                normalized_name = name.removeprefix("module.")
+                is_class_head = (
+                    normalized_name.startswith("class_embed.")
+                    or normalized_name.startswith(
+                        "transformer.enc_out_class_embed."
+                    )
+                )
+                if not is_class_head:
+                    parameter.grad = None
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             
