@@ -85,7 +85,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             and epoch < getattr(args, "class_head_warmup_epochs", 0)
         ):
             for name, parameter in model.named_parameters():
-                normalized_name = name.removeprefix("module.")
+                normalized_name = (
+                    name[len("module."):]
+                    if name.startswith("module.")
+                    else name
+                )
                 is_class_head = (
                     normalized_name.startswith("class_embed.")
                     or normalized_name.startswith(
