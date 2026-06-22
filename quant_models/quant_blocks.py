@@ -500,7 +500,6 @@ class IBlock(nn.Module):
         x, act_scaling_factor = self.attn(x=x, act_scaling_factor=act_scaling_factor)
         save_tensor_from_pathname(x=x, component_path=self.block_name+"1_attn", observe_stat=self.observe_stat)
         
-        # Cong: do i need to requantize after multiply?
         if self.use_cae:
             if act_scaling_factor is None:
                 x = x * self.gamma_1

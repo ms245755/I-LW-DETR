@@ -321,7 +321,6 @@ def gen_sineembed_for_position(pos_tensor, dim=128):
     return pos
 
 
-# Cong: this also hard to quantize
 def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, unsigmoid=True):
     """
     Input:
@@ -364,7 +363,6 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
 
     # bbox_reparam = False
     if unsigmoid:
-        # Cong: quantize the log function also
         output_proposals = torch.log(output_proposals / (1 - output_proposals)) # unsigmoid
         if memory_padding_mask is not None:
             output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float('inf'))
@@ -533,7 +531,6 @@ class Transformer(nn.Module):
         for m in self.modules():
             if isinstance(m, (MSDeformAttn, IMSDeformAttn)):
                 m._reset_parameters()
-    # Cong: keep this as float for now
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
         valid_H = torch.sum(~mask[:, :, 0], 1)

@@ -15,6 +15,9 @@ Environment variables:
   OUTPUT_DIR                    Default: output/lwdetr_<size>_<dataset>_finetune
   EPOCHS                        Default: 40
   LR_DROP                       Default: 80% of EPOCHS
+  LR_SCHEDULER                  step or delayed_cosine. Default: step
+  LR_DECAY_START_EPOCH          Delayed cosine start epoch. Default: 25% of EPOCHS
+  LR_MIN_FACTOR                 Final LR ratio for cosine. Default: 0.01
   LR                            Pretrained detector LR. Default: 1e-5
   LR_ENCODER                    Encoder LR. Default: 1.5e-5
   LR_CLASS_HEAD                 New classification-head LR. Default: 1e-4
@@ -80,6 +83,9 @@ configure_model_size
 
 epochs="$requested_epochs"
 lr_drop="${requested_lr_drop:-$((epochs * 4 / 5))}"
+lr_scheduler="${LR_SCHEDULER:-step}"
+lr_decay_start_epoch="${LR_DECAY_START_EPOCH:-$((epochs / 4))}"
+lr_min_factor="${LR_MIN_FACTOR:-0.01}"
 lr="${LR:-1e-5}"
 lr_encoder="${LR_ENCODER:-1.5e-5}"
 lr_class_head="${LR_CLASS_HEAD:-1e-4}"
@@ -121,6 +127,9 @@ train_command=(
   --weight_decay 1e-4
   --epochs "$epochs"
   --lr_drop "$lr_drop"
+  --lr_scheduler "$lr_scheduler"
+  --lr_decay_start_epoch "$lr_decay_start_epoch"
+  --lr_min_factor "$lr_min_factor"
   --lr_vit_layer_decay "$lr_vit_layer_decay"
   --lr_component_decay "$lr_component_decay"
   --encoder "$encoder"
@@ -160,6 +169,9 @@ echo "nproc_per_node=$nproc_per_node"
 echo "batch_size=$batch_size"
 echo "epochs=$epochs"
 echo "lr_drop=$lr_drop"
+echo "lr_scheduler=$lr_scheduler"
+echo "lr_decay_start_epoch=$lr_decay_start_epoch"
+echo "lr_min_factor=$lr_min_factor"
 echo "lr=$lr"
 echo "lr_encoder=$lr_encoder"
 echo "lr_class_head=$lr_class_head"

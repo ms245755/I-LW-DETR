@@ -21,6 +21,7 @@ import time
 import ast
 import copy
 import fnmatch
+import math
 from pathlib import Path
 
 import numpy as np
@@ -129,6 +130,24 @@ def report_class_head_only_training(model):
     )
 
 
+def build_lr_scheduler(optimizer, args):
+    if args.lr_scheduler == "step":
+        return torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+
+    decay_start = args.lr_decay_start_epoch
+    decay_steps = max(1, args.epochs - decay_start - 1)
+    min_factor = args.lr_min_factor
+
+    def delayed_cosine(epoch):
+        if epoch <= decay_start:
+            return 1.0
+        progress = min(1.0, (epoch - decay_start) / decay_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, delayed_cosine)
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
@@ -143,6 +162,12 @@ def get_args_parser():
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=12, type=int)
     parser.add_argument('--lr_drop', default=11, type=int)
+    parser.add_argument('--lr_scheduler', default='step',
+                        choices=('step', 'delayed_cosine'))
+    parser.add_argument('--lr_decay_start_epoch', default=0, type=int,
+                        help='Epoch where delayed cosine decay begins.')
+    parser.add_argument('--lr_min_factor', default=0.01, type=float,
+                        help='Final LR as a fraction of each parameter group LR.')
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
     parser.add_argument('--lr_vit_layer_decay', default=0.8, type=float)
@@ -498,7 +523,7 @@ def main(args):
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, 
                                 weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    lr_scheduler = build_lr_scheduler(optimizer, args)
     # scaler = GradScaler('cuda') if torch.cuda.is_available() else None
 
     dataset_train = build_dataset(image_set='train', args=args)
@@ -522,7 +547,6 @@ def main(args):
 
     base_ds = get_coco_api_from_dataset(dataset_val)
 
-    # Cong: We need to modify the pretrain key in script to match with the key name of quantize blocks
     if args.pretrain_weights is not None:
         checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
         # if args.qat or args.calib:
@@ -594,11 +618,18 @@ def main(args):
         resume_training_state = not args.eval and args.resume_optimizer
         if resume_training_state and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             checkpoint['optimizer']["param_groups"] = optimizer.state_dict()["param_groups"]
-            checkpoint['lr_scheduler'].pop("step_size", None)
-            checkpoint['lr_scheduler'].pop("_last_lr", None)
-            
             optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            checkpoint_args = checkpoint.get('args')
+            checkpoint_scheduler = getattr(
+                checkpoint_args, 'lr_scheduler', 'step'
+            )
+            if checkpoint_scheduler == args.lr_scheduler:
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            else:
+                print(
+                    "Skipping LR scheduler state because scheduler changed: "
+                    f"{checkpoint_scheduler} -> {args.lr_scheduler}"
+                )
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
@@ -796,7 +827,14 @@ def main(args):
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every `checkpoint_interval` epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % args.checkpoint_interval == 0:
+            scheduler_event = (
+                args.lr_scheduler == "step"
+                and (epoch + 1) % args.lr_drop == 0
+            ) or (
+                args.lr_scheduler == "delayed_cosine"
+                and (epoch + 1) == args.lr_decay_start_epoch
+            )
+            if scheduler_event or (epoch + 1) % args.checkpoint_interval == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 weights = {

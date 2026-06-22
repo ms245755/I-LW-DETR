@@ -60,7 +60,6 @@ def build_backbone(args):
             projector_scale=args.projector_scale,
             observe_stat=args.observe_stat
         )
-    # Congpro
     elif 'dinov2' in args.encoder:
         args_dict = vars(args)
         backbone = BackboneDinoV2(
