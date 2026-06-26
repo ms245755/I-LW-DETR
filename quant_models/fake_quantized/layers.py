@@ -1343,57 +1343,174 @@ class IViTSoftmax(nn.Module):
 
         return exp_int
 
-    def _rowwise_power2_input_quant(self, x, act_scaling_factor):
+    def forward(self, x, act_scaling_factor, dynamic_input_scale=False):
+        self._sync_m_from_calibration()
+
+        if torch.is_tensor(act_scaling_factor) and act_scaling_factor.numel() > 1:
+            scale = act_scaling_factor.reshape(-1)
+            if scale.numel() == x.shape[-1]:
+                scale = scale.reshape(*([1] * (x.dim() - 1)), x.shape[-1])
+                x = round_ste.apply(x / scale) * scale
+                act_scaling_factor = scale.max()
+            elif x.dim() >= 2 and scale.numel() == x.shape[-2] * x.shape[-1]:
+                scale = scale.reshape(*([1] * (x.dim() - 2)), x.shape[-2], x.shape[-1])
+                x = round_ste.apply(x / scale) * scale
+                act_scaling_factor = scale.max(dim=-1, keepdim=True).values
+            else:
+                act_scaling_factor = scale.max()
+
         x_int = round_ste.apply(x / act_scaling_factor)
+        x_int_max, _ = x_int.max(dim=-1, keepdim=True)
+        x_int = x_int - x_int_max
+
+        exp_int = self.int_exp_shift(x_int, act_scaling_factor)
+        exp_int_sum = exp_int.sum(dim=-1, keepdim=True)
+        m = self._update_m_calibration(exp_int_sum)
+
+        # exp_int_sum.clamp_max_(2**self.m - 1)
+        factor = floor_ste.apply((2.0**m - 1) / exp_int_sum)
+        exp_int = floor_ste.apply(exp_int * factor / (2.0 ** (m - self.output_bit + 1)))
+
+        return exp_int * self.act_scaling_factor, self.act_scaling_factor
+
+
+class IViTSoftmaxV2(IViTSoftmax):
+    """
+    Shiftmax variant that caps M for 32-bit hardware and right-shifts Iexp.
+
+    Calibration represents a large normalization range as (M, R). M is capped
+    at hardware_m_max, while Iexp is shifted right by R before its denominator
+    sum is accumulated.
+    """
+
+    def __init__(self, *args, hardware_m_max=31, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hardware_m_max = int(hardware_m_max)
+        self._init_kwargs["hardware_m_max"] = self.hardware_m_max
+        # V2 fixes denominator M to the hardware-safe value. Calibration only
+        # observes the extra logical range as R and exp_clamp_m.
+        self.m = self.hardware_m_max
+        self.calibrated_m.fill_(self.hardware_m_max)
+        self.r = 0
+        self.register_buffer("calibrated_r", torch.tensor(0, dtype=torch.long))
+        self.exp_clamp_m = self.hardware_m_max
+        self.register_buffer(
+            "calibrated_exp_clamp_m",
+            torch.tensor(self.exp_clamp_m, dtype=torch.long),
+        )
+
+    def _set_fixed_hardware_m(self):
+        self.m = self.hardware_m_max
+        self.calibrated_m.fill_(self.hardware_m_max)
+
+    def fix(self):
+        self._set_fixed_hardware_m()
+        if self.calibrate_m and self.max_exp_int_sum.item() > 0:
+            self.r = int(self.calibrated_r.item())
+            self.exp_clamp_m = int(self.calibrated_exp_clamp_m.item())
+        self.running_stat = False
+
+    def reset_m_calibration(self):
+        super().reset_m_calibration()
+        self._set_fixed_hardware_m()
+        self.calibrated_r.zero_()
+        self.calibrated_exp_clamp_m.fill_(self.hardware_m_max)
+        self.r = 0
+        self.exp_clamp_m = self.hardware_m_max
+
+    def _sync_m_from_calibration(self):
+        self._set_fixed_hardware_m()
+        if self.calibrate_m and self.max_exp_int_sum.item() > 0:
+            self.r = int(self.calibrated_r.item())
+            self.exp_clamp_m = int(self.calibrated_exp_clamp_m.item())
+        return self.m, self.r, self.exp_clamp_m
+
+    def _update_m_calibration(self, exp_int_sum):
+        if not self.calibrate_m or not self.running_stat:
+            return self.m, self.r
 
         with torch.no_grad():
-            target = 2.0 ** (self.input_bit - 1) - 1
-            row_abs_max = x_int.detach().abs().amax(dim=-1, keepdim=True)
+            exp_values = exp_int_sum.detach().float().reshape(-1)
+            observed_max = exp_values.amax()
+            self.max_exp_int_sum.copy_(torch.maximum(self.max_exp_int_sum, observed_max))
 
-            shift_factor = torch.ones_like(row_abs_max)
-            for _ in range(self.m):
-                needs_shift = row_abs_max > target * shift_factor
-                shift_factor = torch.where(needs_shift, shift_factor * 2, shift_factor)
+            if self.m_calib_mode == "percentile":
+                q = min(max(self.m_percentile / 100.0, 0.0), 1.0)
+                observed_ref = torch.quantile(exp_values, q)
+                self.percentile_exp_int_sum.copy_(
+                    torch.maximum(self.percentile_exp_int_sum, observed_ref)
+                )
+                calib_ref = self.percentile_exp_int_sum
+            elif self.m_calib_mode == "ema_percentile":
+                q = min(max(self.m_percentile / 100.0, 0.0), 1.0)
+                observed_ref = torch.quantile(exp_values, q)
+                self.percentile_exp_int_sum.copy_(
+                    torch.maximum(self.percentile_exp_int_sum, observed_ref)
+                )
+                if self.m_calib_batches.item() == 0:
+                    self.ema_exp_int_sum.copy_(observed_ref)
+                else:
+                    self.ema_exp_int_sum.copy_(
+                        self.ema_exp_int_sum * self.m_ema_momentum
+                        + observed_ref * (1.0 - self.m_ema_momentum)
+                    )
+                calib_ref = self.ema_exp_int_sum
+            elif self.m_calib_mode == "max":
+                calib_ref = self.max_exp_int_sum
+            else:
+                raise ValueError(f"unknown softmax m calibration mode: {self.m_calib_mode}")
 
-        x_int = round_ste.apply(x_int / shift_factor)
-        act_scaling_factor = act_scaling_factor * shift_factor
-        x = x_int * act_scaling_factor
+            sum_bits = torch.ceil(torch.log2(calib_ref.clamp_min(1.0))).long()
+            required_m = torch.clamp(
+                sum_bits + self.m_guard_bits,
+                min=self.hardware_m_max,
+                max=self.m_max,
+            )
+            # M is fixed to the hardware-safe denominator width. R carries only
+            # the extra logical range needed beyond that fixed M.
+            calibrated_r = torch.clamp(
+                required_m - self.hardware_m_max,
+                min=0,
+            )
+            self.calibrated_m.fill_(self.hardware_m_max)
+            self.calibrated_r.copy_(calibrated_r)
+            self.calibrated_exp_clamp_m.copy_(required_m)
+            self.m_calib_batches += 1
 
-        return x, act_scaling_factor
-    # def _rowwise_power2_input_quant(self, x, act_scaling_factor):
-    #     x_int = round_ste.apply(x / act_scaling_factor)
+        return int(self.calibrated_m.item()), int(self.calibrated_r.item())
 
-    #     with torch.no_grad():
-    #         target = 2.0 ** (self.input_bit - 1) - 1
-    #         row_abs_max = x_int.detach().abs().amax(dim=-1, keepdim=True)
+    def int_exp_shift(self, x_int, scaling_factor):
+        scaled_floor = floor_ste.apply(x_int / 2)
+        scaled_exp_floor = floor_ste.apply(x_int / 16)
+        x_int = x_int + scaled_floor - scaled_exp_floor
 
-    #         ratio = torch.clamp(row_abs_max / target, min=1.0)
-
-    #         shift_floor = 2.0 ** torch.floor(torch.log2(ratio))
-    #         shift_ceil = 2.0 ** torch.ceil(torch.log2(ratio))
-
-    #         # floor may overflow, so measure clipped reconstruction
-    #         x_floor = torch.clamp(round_ste.apply(x_int / shift_floor), -target, target) * shift_floor
-    #         x_ceil = round_ste.apply(x_int / shift_ceil) * shift_ceil
-
-    #         err_floor = (x_int - x_floor).abs().mean(dim=-1, keepdim=True)
-    #         err_ceil = (x_int - x_ceil).abs().mean(dim=-1, keepdim=True)
-
-    #         shift_factor = torch.where(err_floor <= err_ceil, shift_floor, shift_ceil)
-
-    #     x_int = torch.clamp(round_ste.apply(x_int / shift_factor), -target, target)
-    #     act_scaling_factor = act_scaling_factor * shift_factor
-    #     x = x_int * act_scaling_factor
-
-    #     return x, act_scaling_factor
-
-
-    def _rowwise_input_quant(self, x):
         with torch.no_grad():
-            target = 2.0 ** (self.input_bit - 1) - 1
-            max_abs = x.detach().abs().amax(dim=-1, keepdim=True)
-            scale = torch.clamp(max_abs / target, min=torch.finfo(x.dtype).eps)
-        return x, scale
+            x0_int = torch.ceil(1.0 / scaling_factor)
+
+        # During calibration, use the observed logical/high-M clamp to estimate
+        # the V1-equivalent exponent range and derive R. During fixed inference,
+        # use the hardware clamp: the integer exp path must not require values
+        # below -2^31 on 32-bit hardware.
+        clamp_m = (
+            self.exp_clamp_m
+            if self.calibrate_m and self.running_stat
+            else self.hardware_m_max
+        )
+        min_x_int = torch.clamp(
+            self.n * self.lambda_scaler * (-x0_int),
+            min=-(2.0**clamp_m),
+        )
+        x_int = torch.maximum(x_int, min_x_int)
+
+        q = floor_ste.apply(x_int / (-x0_int))
+        r = -(x_int - q * (-x0_int))
+
+        exp_int = floor_ste.apply((-r) / 2)
+        exp_int += x0_int
+        exp_int = exp_int * 2.0 ** (self.n - q)
+        exp_int = torch.clamp(exp_int, min=0)
+
+        return exp_int
 
     def forward(self, x, act_scaling_factor, dynamic_input_scale=False):
         self._sync_m_from_calibration()
@@ -1411,21 +1528,42 @@ class IViTSoftmax(nn.Module):
             else:
                 act_scaling_factor = scale.max()
 
-        # if dynamic_input_scale:
-        #     x, act_scaling_factor = self._rowwise_power2_input_quant(x, act_scaling_factor)
-        #     # x, act_scaling_factor = self._rowwise_input_quant(x)
-
         x_int = round_ste.apply(x / act_scaling_factor)
         x_int_max, _ = x_int.max(dim=-1, keepdim=True)
         x_int = x_int - x_int_max
 
         exp_int = self.int_exp_shift(x_int, act_scaling_factor)
-        exp_int_sum = exp_int.sum(dim=-1, keepdim=True)
-        m = self._update_m_calibration(exp_int_sum)
+        if self.calibrate_m and self.running_stat:
+            raw_exp_int_sum = exp_int.sum(dim=-1, keepdim=True)
+            m, r = self._update_m_calibration(raw_exp_int_sum)
+        else:
+            m, r = self.m, self.r
 
-        # exp_int_sum.clamp_max_(2**self.m - 1)
-        factor = floor_ste.apply((2.0**m - 1) / exp_int_sum)
-        exp_int = floor_ste.apply(exp_int * factor / (2.0 ** (m - self.output_bit + 1)))
+        if r > 0:
+            divisor = 2.0 ** r
+            # Float64 preserves the integer low bits used by the remainder.
+            # The fake-quant tensors are otherwise float32, which cannot
+            # represent every integer once Iexp exceeds 2^24.
+            exp_int_for_sum = exp_int.to(torch.float64)
+            exp_int_quotient = floor_ste.apply(exp_int_for_sum / divisor)
+            exp_int_remainder = (
+                exp_int_for_sum - exp_int_quotient * divisor
+            )
+            exp_int_sum = exp_int_quotient.sum(dim=-1, keepdim=True)
+            exp_int_sum = exp_int_sum + floor_ste.apply(
+                exp_int_remainder.sum(dim=-1, keepdim=True) / divisor
+            )
+        else:
+            exp_int_sum = exp_int.to(torch.float64).sum(dim=-1, keepdim=True)
+
+        exp_int_sum = exp_int_sum.clamp(min=1, max=2.0**m - 1)
+        factor = floor_ste.apply((2.0**m - 1) / exp_int_sum.clamp_min(1))
+        factor = factor.to(exp_int.dtype)
+        exp_int = floor_ste.apply(
+            exp_int
+            * factor
+            / (2.0 ** (m - self.output_bit + 1 + r))
+        )
 
         return exp_int * self.act_scaling_factor, self.act_scaling_factor
 

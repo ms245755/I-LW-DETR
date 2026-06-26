@@ -44,21 +44,30 @@ def configure_softmax_m_calibration(
 
 
 def get_softmax_m_summary(model):
-    softmax_ms = [m.m for m in model.modules() if isinstance(m, IViTSoftmax)]
-    if not softmax_ms:
+    softmax_modules = [m for m in model.modules() if isinstance(m, IViTSoftmax)]
+    if not softmax_modules:
         return None
+    softmax_ms = [m.m for m in softmax_modules]
+    softmax_rs = [getattr(m, "r", 0) for m in softmax_modules]
     return {
         "count": len(softmax_ms),
         "min": min(softmax_ms),
         "max": max(softmax_ms),
+        "r_min": min(softmax_rs),
+        "r_max": max(softmax_rs),
     }
 
 def print_softmax_m(model):
     for name, module in model.named_modules():
         if isinstance(module, IViTSoftmax):
             print(
-                f"{name}: m={module.m}, "
+                f"{name}: type={module.__class__.__name__}, "
+                f"m={module.m}, "
                 f"calibrated_m={int(module.calibrated_m.item())}, "
+                f"r={getattr(module, 'r', 0)}, "
+                f"calibrated_r={int(module.calibrated_r.item()) if hasattr(module, 'calibrated_r') else 0}, "
+                f"exp_clamp_m={getattr(module, 'exp_clamp_m', module.m)}, "
+                f"calibrated_exp_clamp_m={int(module.calibrated_exp_clamp_m.item()) if hasattr(module, 'calibrated_exp_clamp_m') else module.m}, "
                 f"m_calib_mode={module.m_calib_mode}, "
                 f"m_percentile={module.m_percentile:.4g}, "
                 f"m_ema_momentum={module.m_ema_momentum:.4g}, "

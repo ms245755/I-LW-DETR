@@ -263,7 +263,7 @@ class IAttention(nn.Module):
 
         # Quantized matmul + softmax
         self.matmul = IViTMatMul()
-        self.softmax = IViTSoftmax(output_bit=16, dim=-1, m=21)
+        self.softmax = IViTSoftmaxV2(output_bit=16, dim=-1, m=21)
 
         # Quantized activations
         self.qact_qkv = IViTAct(activation_bit=num_bits)
@@ -749,7 +749,7 @@ class IMSDeformAttn(nn.Module):
         self.attention_weights = IViTLinear(d_model, n_heads * n_levels * n_points)
         self.value_proj        = IViTLinear(d_model, d_model)
         self.output_proj       = IViTLinear(d_model, d_model)
-        self.softmax           = IViTSoftmax(output_bit=16, dim=-1, m=27)
+        self.softmax           = IViTSoftmaxV2(output_bit=16, dim=-1, m=27)
 
         # ── quantized activations ──────────────────────────────────────
         # one per linear output — each produces its own scale

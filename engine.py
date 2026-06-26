@@ -257,10 +257,12 @@ def calibrate(
     softmax_m_summary = get_softmax_m_summary(model)
     if softmax_m_summary is not None:
         print(
-            "Calibrated IViTSoftmax m: "
+            "Calibrated IViTSoftmax M/R: "
             f"count={softmax_m_summary['count']}, "
             f"min={softmax_m_summary['min']}, "
-            f"max={softmax_m_summary['max']}"
+            f"max={softmax_m_summary['max']}, "
+            f"r_min={softmax_m_summary['r_min']}, "
+            f"r_max={softmax_m_summary['r_max']}"
         )
     print_softmax_m(model)
 

@@ -1012,7 +1012,7 @@ class QuantDecoderSelfAttention(nn.Module):
         self.qact_out = IViTAct()
         self.qact_proj_drop = IViTAct()
         self.matmul = IViTMatMul() if self.quant_matmul else ScaleMatMul()
-        self.softmax = IViTSoftmax(output_bit=16, dim=-1, m=27) if self.quant_softmax else ScaleSoftmax(dim=-1)
+        self.softmax = IViTSoftmaxV2(output_bit=16, dim=-1, m=27) if self.quant_softmax else ScaleSoftmax(dim=-1)
 
     def forward(self, tgt, tgt_scale, query_pos, query_pos_scale):
         qk_input, qk_scale = _add_tensor_scale(tgt, tgt_scale, query_pos, query_pos_scale)
