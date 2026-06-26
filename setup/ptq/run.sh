@@ -22,6 +22,7 @@ build_common_model_args
 
 checkpoint="${RESUME:-$(resolve_path "$checkpoint_root" "$resume_name" "resume checkpoint")}"
 master_port="${MASTER_PORT:-29500}"
+device="${DEVICE:-cuda}"
 act_observer="${ACT_OBSERVER:-mean}"
 act_percentile="${ACT_PERCENTILE:-99}"
 calib_batches="${CALIB_BATCHES:-500}"
@@ -142,6 +143,7 @@ if [[ "$has_quant_components" == "false" ]]; then
 	    --master_port "$master_port" \
 	    --use_env \
     main.py \
+    --device "$device" \
     --batch_size "$batch_size" \
     "${common_model_args[@]}" \
     --eval \
@@ -155,6 +157,7 @@ fi
 	  --master_port "$master_port" \
 	  --use_env \
   main.py \
+  --device "$device" \
   --batch_size "$batch_size" \
   "${common_model_args[@]}" \
   --act_observer "$act_observer" \

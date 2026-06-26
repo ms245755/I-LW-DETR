@@ -22,6 +22,7 @@ Environment variables:
   LR_ENCODER                    Encoder LR. Default: 1.5e-5
   LR_CLASS_HEAD                 New classification-head LR. Default: 1e-4
   CLASS_HEAD_WARMUP_EPOCHS      Head-only training epochs. Default: 3
+  EASY_QUANTIZE                 true to use quantization-friendly float ops
   BATCH_SIZE                    Per-process batch size. Default: size-specific
   NPROC_PER_NODE                GPU process count. Default: size-specific
   MASTER_PORT                   Default: 29500
@@ -90,9 +91,18 @@ lr="${LR:-1e-5}"
 lr_encoder="${LR_ENCODER:-1.5e-5}"
 lr_class_head="${LR_CLASS_HEAD:-1e-4}"
 class_head_warmup_epochs="${CLASS_HEAD_WARMUP_EPOCHS:-3}"
+easy_quantize="${EASY_QUANTIZE:-false}"
 master_port="${MASTER_PORT:-29500}"
 device="${DEVICE:-cuda}"
 output_dir="${OUTPUT_DIR:-output/lwdetr_${model_size}_${dataset_file}_finetune}"
+
+case "$easy_quantize" in
+  true|false) ;;
+  *)
+    echo "EASY_QUANTIZE must be true or false, got: $easy_quantize" >&2
+    exit 2
+    ;;
+esac
 
 if [[ -z "$checkpoint" ]]; then
   checkpoint="pretrain_weights/$model_size/$resume_name"
@@ -111,6 +121,11 @@ if [[ "${KEEP_CLASS_HEAD:-false}" != "true" ]]; then
     'class_embed.*'
     'transformer.enc_out_class_embed.*'
   )
+fi
+
+easy_quantize_args=()
+if [[ "$easy_quantize" == "true" ]]; then
+  easy_quantize_args=(--easy_quantize)
 fi
 
 train_command=(
@@ -146,6 +161,7 @@ train_command=(
   --dec_n_points 2
   --bbox_reparam
   --lite_refpoint_refine
+  "${easy_quantize_args[@]}"
   --num_queries "$num_queries"
   --num_select "$num_select"
   --ia_bce_loss
@@ -176,6 +192,7 @@ echo "lr=$lr"
 echo "lr_encoder=$lr_encoder"
 echo "lr_class_head=$lr_class_head"
 echo "class_head_warmup_epochs=$class_head_warmup_epochs"
+echo "easy_quantize=$easy_quantize"
 
 cd "$repo_root"
 mkdir -p "$output_dir"

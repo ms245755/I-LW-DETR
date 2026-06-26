@@ -139,12 +139,44 @@ Common overrides:
 | `LR_ENCODER` | `1.5e-5` | Encoder learning rate |
 | `LR_CLASS_HEAD` | `1e-4` | New classification-head learning rate |
 | `CLASS_HEAD_WARMUP_EPOCHS` | `3` | Head-only epochs for a new class set |
+| `EASY_QUANTIZE` | `false` | Use quantization-friendly float operations |
 | `LR_SCHEDULER` | `step` | `step` or `delayed_cosine` |
 | `LR_DROP` | 80% of epochs | Step-scheduler decay epoch |
 | `LR_DECAY_START_EPOCH` | 25% of epochs | Start of delayed cosine decay |
 | `LR_MIN_FACTOR` | `0.01` | Final LR / initial LR for cosine |
 | `KEEP_CLASS_HEAD` | `false` | Keep heads when checkpoint classes match |
 | `DRY_RUN` | `false` | Print the generated command only |
+
+### Fine-tune an existing checkpoint for easy quantization
+
+Easy quantization is float fine-tuning with quantization-friendly operations:
+learned decoder reference-position encoding and nearest-neighbor deformable
+sampling. It is normally done before PTQ or QAT.
+
+When the checkpoint already uses the target dataset classes, keep its
+classification heads and disable head-only warm-up:
+
+```bash
+DATASET_FILE=custom_coco \
+EASY_QUANTIZE=true \
+KEEP_CLASS_HEAD=true \
+CLASS_HEAD_WARMUP_EPOCHS=0 \
+OUTPUT_DIR=output/visdrone_small_easy_quant \
+EPOCHS=60 \
+LR_SCHEDULER=delayed_cosine \
+LR_DECAY_START_EPOCH=10 \
+LR_MIN_FACTOR=0.01 \
+LR=5e-5 \
+LR_ENCODER=1e-5 \
+BATCH_SIZE=1 \
+bash setup/finetune/run.sh \
+  small \
+  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
+```
+
+The existing classification and box heads are loaded. The newly introduced
+decoder reference-position MLP is initialized and learned during this run.
 
 ## 3. Run through Slurm
 
