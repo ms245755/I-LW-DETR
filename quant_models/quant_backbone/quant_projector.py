@@ -165,6 +165,15 @@ class IConvX(nn.Module):
                 for _ in (split_input_channels or [])
             ]
         )
+        split_count = len(split_input_channels or [])
+        self.qact_split_output_bridges = nn.ModuleList(
+            [
+                IViTAct(observer_mode="percentile", percentile=99.9)
+                for _ in range(split_count)
+            ]
+        )
+        self.register_buffer("split_branch_output_scaling_factors", torch.ones(split_count))
+        self.register_buffer("split_out_scaling_factor", torch.tensor(1.0))
         self.qact_post_conv = IViTAct(
             observer_mode="percentile",
             percentile=99.9,
@@ -249,11 +258,21 @@ class IConvX(nn.Module):
                 self.conv.groups,
             )
             partial_scale = conv_scaling_factor * scale
-            partials.append(y_int * partial_scale.view(1, -1, 1, 1))
+            partial = y_int * partial_scale.view(1, -1, 1, 1)
+            if input_idx < len(self.qact_split_output_bridges):
+                partial, partial_scale = self.qact_split_output_bridges[input_idx](
+                    partial,
+                    partial_scale,
+                )
+                partial_scale = partial_scale.reshape(-1).max()
+                if input_idx < self.split_branch_output_scaling_factors.numel():
+                    self.split_branch_output_scaling_factors[input_idx].copy_(partial_scale.detach())
+            partials.append(partial)
             partial_scales.append(partial_scale)
             start = end
 
         out_scale = torch.stack([scale.max() for scale in partial_scales]).max()
+        self.split_out_scaling_factor.copy_(out_scale.detach())
         out_int = sum(round_ste.apply(partial / out_scale) for partial in partials)
         if self.conv.bias is not None:
             bias_int = round_ste.apply(self.conv.bias / out_scale)
