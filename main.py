@@ -273,7 +273,7 @@ def get_args_parser():
     parser.add_argument('--lwdetr_quant_components',
                         default=['linear'],
                         type=str, nargs='+',
-                        choices=('linear', 'none'),
+                        choices=('linear', 'exp', 'none'),
                         help='Operation families to quantize inside LW-DETR prediction heads.')
     parser.add_argument('--transformer_exp_mode', default='ivit', type=str,
                         choices=('float', 'ivit'),

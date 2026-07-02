@@ -18,7 +18,7 @@ Default cases:
   projector:conv2d projector:silu projector:layernorm
   transformer:linear transformer:matmul transformer:softmax transformer:layernorm
   transformer_two_stage:float_exp transformer_two_stage:ivit_exp
-  lwdetr:linear lwdetr_linear:float_exp lwdetr_linear:ivit_exp
+  lwdetr:linear lwdetr:ivit_exp lwdetr_linear:float_exp lwdetr_linear:ivit_exp
 
 Extra fine-grained transformer cases are also supported:
   transformer_self_attn:linear|matmul|softmax
@@ -28,6 +28,7 @@ Extra fine-grained transformer cases are also supported:
   transformer_two_stage:proposal|enc_output|enc_output_norm|class_head|bbox_head|bbox_reparam|selected_inputs
   transformer_output_norm:layernorm|output_qact
   transformer_two_stage:float_exp|ivit_exp
+  lwdetr:linear|ivit_exp
   lwdetr_linear:float_exp|ivit_exp
 
 Optional environment variables:
@@ -52,7 +53,7 @@ model_size="${MODEL_SIZE:-tiny}"
 sweep_root="${SWEEP_OUTPUT_ROOT:-output/ptq_single_component_sweep}/${model_size}"
 csv_path="${SWEEP_CSV:-$sweep_root/summary.csv}"
 summary_log="${SWEEP_LOG:-$sweep_root/summary.log}"
-cases="${CASES:-vit:linear vit:conv2d vit:matmul vit:softmax vit:gelu vit:layernorm projector:conv2d projector:silu projector:layernorm transformer:linear transformer:matmul transformer:softmax transformer:layernorm transformer_two_stage:float_exp transformer_two_stage:ivit_exp lwdetr:linear lwdetr_linear:float_exp lwdetr_linear:ivit_exp}"
+cases="${CASES:-vit:linear vit:conv2d vit:matmul vit:softmax vit:gelu vit:layernorm projector:conv2d projector:silu projector:layernorm transformer:linear transformer:matmul transformer:softmax transformer:layernorm transformer_two_stage:float_exp transformer_two_stage:ivit_exp lwdetr:linear lwdetr:ivit_exp lwdetr_linear:float_exp lwdetr_linear:ivit_exp}"
 ap_pattern="Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ]"
 
 mkdir -p "$sweep_root/logs"
@@ -113,7 +114,7 @@ reset_quant_env() {
   export DECODER_OUTPUT_NORM_QUANT_COMPONENTS="none"
   export LWDETR_QUANT_COMPONENTS="none"
   export TRANSFORMER_EXP_MODE="ivit"
-  export LWDETR_EXP_MODE="ivit"
+  export LWDETR_EXP_MODE="float"
 }
 
 enable_transformer_linear_family() {
@@ -198,6 +199,13 @@ configure_case() {
       export QUANT_MODEL_COMPONENTS="transformer"
       export TRANSFORMER_QUANT_COMPONENTS="none"
       export LWDETR_QUANT_COMPONENTS="linear"
+      export LWDETR_EXP_MODE="float"
+      ;;
+    lwdetr:ivit_exp)
+      export QUANT_MODEL_COMPONENTS="transformer"
+      export TRANSFORMER_QUANT_COMPONENTS="none"
+      export LWDETR_QUANT_COMPONENTS="exp"
+      export LWDETR_EXP_MODE="ivit"
       ;;
     lwdetr_linear:float_exp|lwdetr_linear:ivit_exp)
       export QUANT_MODEL_COMPONENTS="transformer"

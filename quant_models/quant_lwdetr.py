@@ -97,7 +97,7 @@ class ILWDETR(nn.Module):
         self.qact_hs_enc = IViTAct()
         self.qact_bbox_delta_xy = IViTAct()
         self.qact_bbox_delta_wh = IViTAct(activation_bit=16)
-        self.int_exp = IViTExp()
+        self.int_exp = IViTExp(output_bit=16)
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
         self.backbone = backbone
@@ -165,6 +165,13 @@ class ILWDETR(nn.Module):
         delta_wh = outputs_coord_delta[..., 2:]
 
         if outputs_coord_delta_scale is None:
+            if "exp" in self.quant_components and self.exp_mode == "ivit":
+                delta_wh, delta_wh_scale = self._qact_channel_last(
+                    self.qact_bbox_delta_wh,
+                    delta_wh,
+                    None,
+                )
+                return delta_xy, None, delta_wh, delta_wh_scale
             return delta_xy, None, delta_wh, None
 
         delta_xy, delta_xy_scale = self._qact_channel_last(
