@@ -23,6 +23,7 @@ Environment variables:
   LR_CLASS_HEAD                 New classification-head LR. Default: 1e-4
   CLASS_HEAD_WARMUP_EPOCHS      Head-only training epochs. Default: 3
   EASY_QUANTIZE                 true to use quantization-friendly float ops
+  RESUME                        true to continue from a training checkpoint
   BATCH_SIZE                    Per-process batch size. Default: size-specific
   NPROC_PER_NODE                GPU process count. Default: size-specific
   MASTER_PORT                   Default: 29500
@@ -35,6 +36,9 @@ Examples:
 
   EPOCHS=40 CLASS_HEAD_WARMUP_EPOCHS=5 \
   bash setup/finetune/run.sh small /path/to/custom-coco /path/to/checkpoint.pth
+
+  RESUME=true OUTPUT_DIR=output/my_run \
+  bash setup/finetune/run.sh medium /path/to/custom-coco
 EOF
 }
 
@@ -92,6 +96,7 @@ lr_encoder="${LR_ENCODER:-1.5e-5}"
 lr_class_head="${LR_CLASS_HEAD:-1e-4}"
 class_head_warmup_epochs="${CLASS_HEAD_WARMUP_EPOCHS:-3}"
 easy_quantize="${EASY_QUANTIZE:-false}"
+resume_training="${RESUME:-false}"
 master_port="${MASTER_PORT:-29500}"
 device="${DEVICE:-cuda}"
 output_dir="${OUTPUT_DIR:-output/lwdetr_${model_size}_${dataset_file}_finetune}"
@@ -104,8 +109,22 @@ case "$easy_quantize" in
     ;;
 esac
 
-if [[ -z "$checkpoint" ]]; then
-  checkpoint="pretrain_weights/$model_size/$resume_name"
+case "$resume_training" in
+  true|false) ;;
+  *)
+    echo "RESUME must be true or false, got: $resume_training" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$resume_training" == "true" ]]; then
+  if [[ -z "$checkpoint" ]]; then
+    checkpoint="$output_dir/checkpoint.pth"
+  fi
+else
+  if [[ -z "$checkpoint" ]]; then
+    checkpoint="pretrain_weights/$model_size/$resume_name"
+  fi
 fi
 checkpoint="$(absolute_existing_path "$checkpoint")"
 
@@ -126,6 +145,19 @@ fi
 easy_quantize_args=()
 if [[ "$easy_quantize" == "true" ]]; then
   easy_quantize_args=(--easy_quantize)
+fi
+
+checkpoint_args=()
+if [[ "$resume_training" == "true" ]]; then
+  checkpoint_args=(
+    --resume "$checkpoint"
+    --resume_optimizer
+  )
+else
+  checkpoint_args=(
+    --pretrain_weights "$checkpoint"
+    "${class_head_args[@]}"
+  )
 fi
 
 train_command=(
@@ -170,8 +202,7 @@ train_command=(
   --coco_path "$data_path"
   --square_resize_div_64
   --use_ema
-  --pretrain_weights "$checkpoint"
-  "${class_head_args[@]}"
+  "${checkpoint_args[@]}"
   --output_dir "$output_dir"
   --device "$device"
 )
@@ -193,6 +224,7 @@ echo "lr_encoder=$lr_encoder"
 echo "lr_class_head=$lr_class_head"
 echo "class_head_warmup_epochs=$class_head_warmup_epochs"
 echo "easy_quantize=$easy_quantize"
+echo "resume=$resume_training"
 
 cd "$repo_root"
 mkdir -p "$output_dir"
