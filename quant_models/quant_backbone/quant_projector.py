@@ -265,8 +265,8 @@ class IConvX(nn.Module):
                     partial_scale,
                 )
                 partial_scale = partial_scale.reshape(-1).max()
-                if input_idx < self.split_branch_output_scaling_factors.numel():
-                    self.split_branch_output_scaling_factors[input_idx].copy_(partial_scale.detach())
+                # if input_idx < self.split_branch_output_scaling_factors.numel():
+                    # self.split_branch_output_scaling_factors[input_idx].copy_(partial_scale.detach())
             partials.append(partial)
             partial_scales.append(partial_scale)
             start = end
