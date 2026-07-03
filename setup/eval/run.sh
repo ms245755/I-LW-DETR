@@ -475,11 +475,11 @@ run_eval() {
       ;;
     ptq)
       model_args=("${common_model_args[@]}")
-      variant_args+=(--calib)
+      variant_args+=(--quant)
       ;;
     qat)
       model_args=("${common_model_args[@]}")
-      variant_args+=(--qat --qat_freeze_observers --ia_bce_loss --cls_loss_coef 1 --find_unused_parameters)
+      variant_args+=(--quant --ia_bce_loss --cls_loss_coef 1 --find_unused_parameters)
       ;;
   esac
 

@@ -140,6 +140,7 @@ fi
   --softmax_m_ema_momentum "$softmax_m_ema_momentum" \
   "${softmax_calibrate_m_args[@]}" \
   --calib_batches "$calib_batches" \
+  --quant \
   --calib \
   "${observe_stat_args[@]}" \
   "${calib_eval_args[@]}" \

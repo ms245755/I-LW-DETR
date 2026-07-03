@@ -113,10 +113,10 @@ def get_args_parser():
     parser.add_argument('--out_feature_indexes', default=[-1], type=int, nargs='+', help='only for vit now')
     parser.add_argument('--quant_model_components', default=None, type=str, nargs='+',
                         choices=('backbone', 'transformer'),
-                        help='Top-level model components to quantize when --calib/--qat is used.')
+                        help='Top-level model components to quantize when a quantized model is used.')
     parser.add_argument('--backbone_quant_components', default=['vit', 'projector'], type=str, nargs='+',
                         choices=('vit', 'projector'),
-                        help='Backbone components to quantize when --calib/--qat is used.')
+                        help='Backbone components to quantize when a quantized model is used.')
     parser.add_argument('--encoder_quant_blocks', default=None, type=int, nargs='+',
                         help='ViT encoder block indexes to quantize. Default: all blocks.')
     parser.add_argument('--encoder_quant_components',
@@ -286,6 +286,8 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--use_ema', action='store_true')
+    parser.add_argument('--quant', action='store_true',
+                        help='Build the quantized model without selecting a calibration or QAT workflow.')
     parser.add_argument('--calib', action='store_true')
     parser.add_argument('--calib_batches', default=500, type=int,
                         help='Number of images/batches used for activation calibration.')
@@ -295,8 +297,6 @@ def get_args_parser():
                         help='Skip saving the calibrated checkpoint.')
     parser.set_defaults(calib_eval=True, calib_save=True)
     parser.add_argument('--qat', action='store_true')
-    parser.add_argument('--qat_calib_batches', default=0, type=int,
-                        help='Run PTQ-style activation calibration for this many batches before QAT training. 0 disables.')
     parser.add_argument('--qat_freeze_observers', action='store_true',
                         help='Keep quantization activation/softmax observers frozen during QAT. Useful when resuming from a calibrated PTQ checkpoint.')
     parser.add_argument('--ema_decay', default=0.9997, type=float)
@@ -390,7 +390,7 @@ def main(args):
     )
 
     if args.eval:
-        if args.calib or args.qat:
+        if args.quant or args.calib or args.qat:
             print("Freezing quantization observers for standalone evaluation.")
             freeze_model(model)
         test_stats, coco_evaluator = evaluate(
@@ -469,37 +469,6 @@ def main(args):
     )
     if class_head_warmup_active:
         report_class_head_only_training(model_without_ddp)
-    if args.qat and args.qat_calib_batches > 0 and args.start_epoch == 0:
-        qat_calib_loader = make_random_calib_loader(
-            dataset_val,
-            batch_size=1,
-            seed=seed,
-            n_samples=args.qat_calib_batches,
-            collate_fn=utils.collate_fn,
-            num_workers=0
-        )
-        calibrate(
-            model,
-            qat_calib_loader,
-            device,
-            args=args,
-            calib_batches=args.qat_calib_batches,
-        )
-        qat_calib_stats, qat_calib_coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args
-        )
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps({
-                    "phase": "pre_qat_calib",
-                    "qat_calib_batches": args.qat_calib_batches,
-                    **{f"pre_qat_calib_{k}": v for k, v in qat_calib_stats.items()},
-                }) + "\n")
-            if qat_calib_coco_evaluator is not None:
-                utils.save_on_master(
-                    qat_calib_coco_evaluator.coco_eval["bbox"].eval,
-                    output_dir / "eval_qat_calib.pth",
-                )
     if args.qat and args.qat_freeze_observers:
         print("QAT observers are frozen; training weights with fixed quantization ranges.")
         freeze_model(model)

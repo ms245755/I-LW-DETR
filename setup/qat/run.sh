@@ -51,7 +51,6 @@ weight_decay="${WEIGHT_DECAY:-1e-4}"
 master_port="${MASTER_PORT:-29500}"
 act_observer="${ACT_OBSERVER:-ema_minmax}"
 act_percentile="${ACT_PERCENTILE:-99.9}"
-qat_calib_batches="${QAT_CALIB_BATCHES:-0}"
 qat_freeze_observers="${QAT_FREEZE_OBSERVERS:-false}"
 output_root="${OUTPUT_ROOT:-output}"
 output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_qat_${scenario_label}_${model_size}}"
@@ -140,7 +139,6 @@ python -u -m torch.distributed.launch \
   "${common_model_args[@]}" \
   --act_observer "$act_observer" \
   --act_percentile "$act_percentile" \
-  --qat_calib_batches "$qat_calib_batches" \
   --ia_bce_loss \
   --cls_loss_coef 1 \
   "${pretrain_args[@]}" \

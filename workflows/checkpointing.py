@@ -15,8 +15,6 @@ def load_pretrain_weights(args, model_without_ddp, ema_m):
         return ema_m
 
     checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
-    # if args.qat or args.calib:
-    #     checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
     # add support to exclude_keys
     # e.g., when load object365 pretrain, do not load `class_embed.[weight, bias]`
     if args.pretrain_exclude_keys is not None:
@@ -67,7 +65,7 @@ def load_resume_checkpoint(
     quant_model_components = set(args.quant_model_components or [])
     backbone_quant_components = set(args.backbone_quant_components or [])
     if (
-        (args.qat or args.calib)
+        (args.quant or args.qat or args.calib)
         and 'backbone' in quant_model_components
         and 'projector' in backbone_quant_components
     ):

@@ -285,6 +285,10 @@ sbatch setup/slurm/run.sh eval \
 Variants are `original`, `qr`, `ptq`, and `qat`. An explicit `--checkpoint`
 requires one explicit model size and one explicit variant.
 
+The `ptq` and `qat` variants are quantized-checkpoint evaluation only. They
+build the quantized model with `--quant` and do not run PTQ calibration or QAT
+training.
+
 Each run writes per-model `eval.log` and `eval.pth` files, plus
 `summary.csv` and `summary.xlsx` under the output root. Metrics are ordered:
 
@@ -335,6 +339,20 @@ Set `MODEL_SIZE=tiny|small|medium` to select the model. The default is `tiny`.
 
 COCO is the default dataset. Set `DATASET_FILE=custom_coco` for VisDrone or
 another COCO-format dataset with a different class set.
+
+The Python flags now separate model type from workflow:
+
+```text
+--eval             evaluate the float model
+--eval --quant     evaluate a quantized checkpoint
+--quant --calib    run PTQ calibration and optional evaluation
+--qat              run QAT training with the quantized model
+```
+
+`--calib` and `--qat` imply quantized model construction internally, but the
+setup scripts pass `--quant --calib` for PTQ to keep the intent explicit. QAT
+does not run a pre-training calibration pass; run PTQ first and resume from
+`checkpoint_calibrated.pth` when fixed calibrated ranges are desired.
 
 ### COCO PTQ example
 
@@ -563,7 +581,6 @@ LR_ENCODER=2e-5
 WEIGHT_DECAY=1e-4
 EPOCHS=20
 LR_DROP=25
-QAT_CALIB_BATCHES=0
 QAT_FREEZE_OBSERVERS=true
 ACT_OBSERVER=ema_minmax
 ACT_PERCENTILE=99.9

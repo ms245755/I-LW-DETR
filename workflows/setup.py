@@ -16,7 +16,7 @@ from workflows.common import build_lr_scheduler
 
 
 def build_model_components(args, device):
-    if args.calib or args.qat:
+    if args.quant or args.calib or args.qat:
         model, criterion, postprocessors = build_model_quant(args)
         softmax_count = configure_softmax_m_calibration(
             model,
