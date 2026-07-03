@@ -142,13 +142,25 @@ class IViTAct(nn.Module):
 
     _default_observer_mode = "ema_minmax"
     _default_percentile = 99.9
+    _default_use_dyadic_scale = False
+    _default_dyadic_scale_bits = 31
 
     @classmethod
-    def configure_defaults(cls, observer_mode=None, percentile=None):
+    def configure_defaults(
+        cls,
+        observer_mode=None,
+        percentile=None,
+        use_dyadic_scale=None,
+        dyadic_scale_bits=None,
+    ):
         if observer_mode is not None:
             cls._default_observer_mode = observer_mode
         if percentile is not None:
             cls._default_percentile = percentile
+        if use_dyadic_scale is not None:
+            cls._default_use_dyadic_scale = use_dyadic_scale
+        if dyadic_scale_bits is not None:
+            cls._default_dyadic_scale_bits = dyadic_scale_bits
 
     def __init__(
         self,
@@ -159,6 +171,8 @@ class IViTAct(nn.Module):
         quant_mode="symmetric",
         observer_mode=None,
         percentile=None,
+        use_dyadic_scale=True,
+        dyadic_scale_bits=16,
     ):
         super(IViTAct, self).__init__()
 
@@ -169,9 +183,21 @@ class IViTAct(nn.Module):
         self.per_channel = per_channel
         self.observer_mode = observer_mode or self._default_observer_mode
         self.percentile = self._default_percentile if percentile is None else percentile
+        self.use_dyadic_scale = (
+            self._default_use_dyadic_scale
+            if use_dyadic_scale is None
+            else use_dyadic_scale
+        )
+        self.dyadic_scale_bits = (
+            self._default_dyadic_scale_bits
+            if dyadic_scale_bits is None
+            else dyadic_scale_bits
+        )
 
         self.register_buffer("act_scaling_factor", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("out_scaling_factor", nn.Parameter(torch.tensor(1.0)))
+        self.register_buffer("act_scale_mantissa", torch.ones(1, dtype=torch.int32))
+        self.register_buffer("act_scale_shift", torch.zeros(1, dtype=torch.int32))
         self.register_buffer("min_val", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("max_val", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("n_batches", torch.tensor(0, dtype=torch.long))
@@ -202,6 +228,29 @@ class IViTAct(nn.Module):
                 max_val,
             )
         )
+
+    def _snap_scale_to_dyadic(self, scale):
+        mantissa, shift = batch_frexp(scale.detach().float(), max_bit=self.dyadic_scale_bits)
+        dyadic_scale = mantissa.to(device=scale.device, dtype=scale.dtype) / (
+            2.0 ** shift.to(device=scale.device, dtype=scale.dtype)
+        )
+        dyadic_scale = dyadic_scale.view_as(scale)
+
+        self.act_scale_mantissa = mantissa.to(device=scale.device, dtype=torch.int32)
+        self.act_scale_shift = shift.to(device=scale.device, dtype=torch.int32)
+
+        return dyadic_scale
+
+    def set_dyadic_scale(self, mantissa, shift):
+        mantissa = torch.as_tensor(mantissa, device=self.act_scaling_factor.device)
+        shift = torch.as_tensor(shift, device=self.act_scaling_factor.device)
+
+        self.act_scale_mantissa = mantissa.to(dtype=torch.int32)
+        self.act_scale_shift = shift.to(dtype=torch.int32)
+        self.act_scaling_factor = self.act_scale_mantissa.to(
+            dtype=self.act_scaling_factor.dtype
+        ) / (2.0 ** self.act_scale_shift.to(dtype=self.act_scaling_factor.dtype))
+        self.use_dyadic_scale = True
 
     def fix(self):
         """
@@ -281,6 +330,8 @@ class IViTAct(nn.Module):
             self.act_scaling_factor = symmetric_linear_quantization_params(
                 self.activation_bit, self.min_val, self.max_val
             )
+            if self.use_dyadic_scale:
+                self.act_scaling_factor = self._snap_scale_to_dyadic(self.act_scaling_factor)
 
         if act_scaling_factor is None:
             # this is for the x quantization
