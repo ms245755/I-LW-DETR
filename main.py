@@ -19,7 +19,6 @@ import json
 import random
 import time
 import ast
-import copy
 import fnmatch
 from pathlib import Path
 
@@ -34,8 +33,6 @@ from engine import (
     make_random_calib_loader,
     train_one_epoch,
     calibrate,
-    reconstruct_ptq,
-    reconstruct_output_distill,
 )
 from models import build_model
 from quant_models import build_model_quant
@@ -56,14 +53,6 @@ from workflows.common import (
     print_load_state,
     report_class_head_only_training,
 )
-
-
-def sync_model_state_from_main(model):
-    if not utils.is_dist_avail_and_initialized():
-        return
-    for tensor in model.state_dict().values():
-        torch.distributed.broadcast(tensor, src=0)
-
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
@@ -314,28 +303,6 @@ def get_args_parser():
                         help='Run PTQ-style activation calibration for this many batches before QAT training. 0 disables.')
     parser.add_argument('--qat_freeze_observers', action='store_true',
                         help='Keep quantization activation/softmax observers frozen during QAT. Useful when resuming from a calibrated PTQ checkpoint.')
-    parser.add_argument('--ptq_reconstruct', action='store_true',
-                        help='After PTQ calibration, run unlabeled block-wise reconstruction against a float teacher.')
-    parser.add_argument('--ptq_reconstruct_modules', default=['auto'], type=str, nargs='+',
-                        help='Module name glob patterns to reconstruct. Default auto targets ViT blocks, projector stages, and transformer decoder layers.')
-    parser.add_argument('--ptq_reconstruct_batches', default=16, type=int,
-                        help='Calibration batches used per reconstructed module.')
-    parser.add_argument('--ptq_reconstruct_lr', default=1e-5, type=float,
-                        help='Learning rate for PTQ reconstruction.')
-    parser.add_argument('--ptq_reconstruct_weight_decay', default=0.0, type=float,
-                        help='Weight decay for PTQ reconstruction.')
-    parser.add_argument('--ptq_reconstruct_clip_max_norm', default=0.1, type=float,
-                        help='Gradient clipping max norm for PTQ reconstruction.')
-    parser.add_argument('--ptq_output_distill_batches', default=16, type=int,
-                        help='Extra final-output distillation batches after block reconstruction. Set 0 to disable.')
-    parser.add_argument('--ptq_output_distill_lr', default=1e-6, type=float,
-                        help='Learning rate for final-output PTQ distillation.')
-    parser.add_argument('--ptq_output_distill_logit_weight', default=1.0, type=float,
-                        help='Logit KL weight for final-output PTQ distillation.')
-    parser.add_argument('--ptq_output_distill_box_weight', default=5.0, type=float,
-                        help='Box L1 weight for final-output PTQ distillation.')
-    parser.add_argument('--ptq_output_distill_temperature', default=2.0, type=float,
-                        help='Logit distillation temperature.')
     parser.add_argument('--ema_decay', default=0.9997, type=float)
     parser.add_argument('--num_workers', default=2, type=int)
 
@@ -418,7 +385,6 @@ def main(args):
     else:
         model, criterion, postprocessors = build_model(args)
     model.to(device)
-    teacher_checkpoint_state = None
 
     if args.use_ema:
         ema_m = ModelEma(model, decay=args.ema_decay)
@@ -493,7 +459,6 @@ def main(args):
                     model_without_ddp.state_dict()[modify_key_to_load],
                     checkpoint['model'][modify_key_to_load]
                 )
-        teacher_checkpoint_state = dict(checkpoint['model'])
         checkpoint['model'] = adapt_checkpoint_keys_for_model(checkpoint['model'], model_without_ddp)
         stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         print_load_state("pretrain load", stat)
@@ -512,7 +477,6 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        teacher_checkpoint_state = dict(checkpoint['model'])
         quant_model_components = set(args.quant_model_components or [])
         backbone_quant_components = set(args.backbone_quant_components or [])
         if (
@@ -578,69 +542,9 @@ def main(args):
             calib_batches=num_calib_batch,
         )
 
-        if args.ptq_reconstruct:
-            if teacher_checkpoint_state is None:
-                raise RuntimeError("--ptq_reconstruct requires --resume or --pretrain_weights so the float teacher can be initialized.")
-            teacher_args = copy.deepcopy(args)
-            teacher_args.calib = False
-            teacher_args.qat = False
-            teacher_args.observe_stat = False
-            teacher_model, _, _ = build_model(teacher_args)
-            teacher_model.to(device)
-            teacher_state = adapt_checkpoint_keys_for_model(teacher_checkpoint_state, teacher_model)
-            teacher_stat = teacher_model.load_state_dict(teacher_state, strict=False)
-            print_load_state("ptq teacher load", teacher_stat)
-            recon_samples = args.ptq_reconstruct_batches * max(1, len(args.ptq_reconstruct_modules))
-            if args.ptq_reconstruct_modules == ["auto"]:
-                recon_samples = args.ptq_reconstruct_batches * max(1, args.vit_encoder_num_layers + len(args.projector_scale) + args.dec_layers)
-            recon_loader = make_random_calib_loader(
-                dataset_val,
-                batch_size=1,
-                seed=seed + 1009,
-                n_samples=recon_samples,
-                collate_fn=utils.collate_fn,
-                num_workers=0
-            )
-            reconstruct_ptq(
-                model_without_ddp,
-                teacher_model,
-                recon_loader,
-                device,
-                args=args,
-                module_patterns=args.ptq_reconstruct_modules,
-                batches_per_module=args.ptq_reconstruct_batches,
-                lr=args.ptq_reconstruct_lr,
-                weight_decay=args.ptq_reconstruct_weight_decay,
-                max_norm=args.ptq_reconstruct_clip_max_norm,
-            )
-            if args.ptq_output_distill_batches > 0:
-                output_distill_loader = make_random_calib_loader(
-                    dataset_val,
-                    batch_size=1,
-                    seed=seed + 2027,
-                    n_samples=args.ptq_output_distill_batches,
-                    collate_fn=utils.collate_fn,
-                    num_workers=0
-                )
-                reconstruct_output_distill(
-                    model_without_ddp,
-                    teacher_model,
-                    output_distill_loader,
-                    device,
-                    batches=args.ptq_output_distill_batches,
-                    lr=args.ptq_output_distill_lr,
-                    weight_decay=args.ptq_reconstruct_weight_decay,
-                    max_norm=args.ptq_reconstruct_clip_max_norm,
-                    logit_weight=args.ptq_output_distill_logit_weight,
-                    box_weight=args.ptq_output_distill_box_weight,
-                    temperature=args.ptq_output_distill_temperature,
-                )
-            sync_model_state_from_main(model_without_ddp)
-            del teacher_model
-
         # 2) (optional) save calibrated quant checkpoint
         if args.output_dir and utils.is_main_process() and getattr(args, "calib_save", True):
-            calib_path = output_dir / ("checkpoint_reconstructed.pth" if args.ptq_reconstruct else "checkpoint_calibrated.pth")
+            calib_path = output_dir / "checkpoint_calibrated.pth"
             utils.save_on_master(
                 {
                     "model": model_without_ddp.state_dict(),

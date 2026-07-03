@@ -319,7 +319,7 @@ figures; `0.3` is useful for inspecting weak detections.
 
 The quantization directories contain the recommended entry points:
 
-- `setup/ptq/` runs PTQ calibration and optional PTQ reconstruction.
+- `setup/ptq/` runs PTQ calibration.
 - `setup/qat/` runs QAT training.
 - `setup/common.sh` owns shared model-size, scenario, and component settings.
 - Root-level quantization scripts are compatibility wrappers. Prefer
@@ -542,18 +542,6 @@ Skip evaluation after calibration:
 ```bash
 CALIB_EVAL=false bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoints
 ```
-
-Run PTQ reconstruction:
-
-```bash
-PTQ_RECONSTRUCT=true \
-PTQ_RECONSTRUCT_MODULES=auto \
-PTQ_RECONSTRUCT_BATCHES=16 \
-PTQ_RECONSTRUCT_LR=1e-5 \
-bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoints
-```
-
-When reconstruction is enabled, the saved file is `checkpoint_reconstructed.pth`.
 
 ### QAT
 
