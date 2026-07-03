@@ -81,7 +81,12 @@ def load_resume_checkpoint(
         else:
             del ema_m
             ema_m = ModelEma(model)
-    resume_training_state = not args.eval and args.resume_optimizer
+    resume_training_state = (
+        not args.eval
+        and args.resume_optimizer
+        and optimizer is not None
+        and lr_scheduler is not None
+    )
     if resume_training_state and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
         checkpoint['optimizer']["param_groups"] = optimizer.state_dict()["param_groups"]
         optimizer.load_state_dict(checkpoint['optimizer'])

@@ -28,26 +28,24 @@ from torch.amp import GradScaler
 from datasets import resolve_num_classes
 from engine import (
     evaluate,
-    make_random_calib_loader,
     train_one_epoch,
-    calibrate,
 )
 from quant_models.fake_quantized.model_utils import (
     freeze_model,
     unfreeze_model,
 )
-from util.drop_scheduler import drop_scheduler
 import util.misc as utils
-from util.utils import BestMetricHolder
 from util.benchmark import benchmark
 from workflows.checkpointing import load_pretrain_weights, load_resume_checkpoint
-from workflows.common import report_class_head_only_training
+from workflows.evaluation import run_eval
+from workflows.quantization import run_ptq_calibration
 from workflows.setup import (
     build_model_components,
     build_optimizer_and_scheduler,
     build_train_loader,
     build_val_loader,
 )
+from workflows.training import build_training_schedules, initialize_training_state
 
 
 def get_args_parser():
@@ -360,7 +358,6 @@ def main(args):
     model, model_without_ddp, criterion, postprocessors, ema_m, n_parameters = (
         build_model_components(args, device)
     )
-    optimizer, lr_scheduler = build_optimizer_and_scheduler(args, model_without_ddp)
     # scaler = GradScaler('cuda') if torch.cuda.is_available() else None
 
     dataset_val, data_loader_val, base_ds = build_val_loader(args)
@@ -380,6 +377,55 @@ def main(args):
     #     print(json.dumps(bm, indent=2))
     #     del benchmark_model
 
+    if args.eval:
+        ema_m = load_resume_checkpoint(
+            args,
+            model,
+            model_without_ddp,
+            None,
+            None,
+            ema_m,
+        )
+        run_eval(
+            args,
+            model,
+            criterion,
+            postprocessors,
+            data_loader_val,
+            base_ds,
+            device,
+            output_dir,
+        )
+        return
+    
+    if args.calib:
+        ema_m = load_resume_checkpoint(
+            args,
+            model,
+            model_without_ddp,
+            None,
+            None,
+            ema_m,
+        )
+        run_ptq_calibration(
+            args,
+            model,
+            model_without_ddp,
+            criterion,
+            postprocessors,
+            dataset_val,
+            data_loader_val,
+            base_ds,
+            device,
+            output_dir,
+            seed,
+        )
+        return
+        
+    
+    dataset_train, sampler_train, data_loader_train = build_train_loader(args)
+    optimizer, lr_scheduler = build_optimizer_and_scheduler(args, model_without_ddp)
+
     ema_m = load_resume_checkpoint(
         args,
         model,
@@ -389,89 +435,14 @@ def main(args):
         ema_m,
     )
 
-    if args.eval:
-        if args.quant or args.calib or args.qat:
-            print("Freezing quantization observers for standalone evaluation.")
-            freeze_model(model)
-        test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args)
-        if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
-        return
-    
-    if args.calib:
-        # 1) calibrate using val set (or train set). val is usually fine.
-        num_calib_batch = args.calib_batches
-        calib_loader = make_random_calib_loader(
-            dataset_val,
-            batch_size=1,
-            seed=seed,                  # <--- fixed seed for reproducibility!
-            n_samples=num_calib_batch * 1,
-            collate_fn=utils.collate_fn,
-            num_workers=0
-        )
-        calibrate(
-            model,
-            calib_loader,
-            device,
-            args=args,
-            calib_batches=num_calib_batch,
-        )
-
-        # 2) (optional) save calibrated quant checkpoint
-        if args.output_dir and utils.is_main_process() and getattr(args, "calib_save", True):
-            calib_path = output_dir / "checkpoint_calibrated.pth"
-            utils.save_on_master(
-                {
-                    "model": model_without_ddp.state_dict(),
-                    "args": args,
-                },
-                calib_path,
-            )
-            print("Saved calibrated checkpoint to:", calib_path)
-
-        # 3) (optional) evaluate immediately after calibration
-        if getattr(args, "calib_eval", True):
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args
-            )
-            if args.output_dir and utils.is_main_process():
-                utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval_calib.pth")
-
-        return
-        
-    
-    dataset_train, sampler_train, data_loader_train = build_train_loader(args)
-
-    # for drop
-    total_batch_size = args.batch_size * utils.get_world_size()
-    num_training_steps_per_epoch = (len(dataset_train) + total_batch_size - 1) // total_batch_size
-    schedules = {}
-    if args.dropout > 0:
-        schedules['do'] = drop_scheduler(
-            args.dropout, args.epochs, num_training_steps_per_epoch,
-            args.cutoff_epoch, args.drop_mode, args.drop_schedule)
-        print("Min DO = %.7f, Max DO = %.7f" % (min(schedules['do']), max(schedules['do'])))
-
-    if args.drop_path > 0:
-        schedules['dp'] = drop_scheduler(
-            args.drop_path, args.epochs, num_training_steps_per_epoch,
-            args.cutoff_epoch, args.drop_mode, args.drop_schedule)
-        print("Min DP = %.7f, Max DP = %.7f" % (min(schedules['dp']), max(schedules['dp'])))
+    num_training_steps_per_epoch, schedules = build_training_schedules(args, dataset_train)
 
     print("Start training")
     
     start_time = time.time()
-    best_map_holder = BestMetricHolder(use_ema=args.use_ema)
-    class_head_warmup_active = (
-        args.class_head_warmup_epochs > 0
-        and args.start_epoch < args.class_head_warmup_epochs
+    best_map_holder, class_head_warmup_active = (
+        initialize_training_state(args, model, model_without_ddp)
     )
-    if class_head_warmup_active:
-        report_class_head_only_training(model_without_ddp)
-    if args.qat and args.qat_freeze_observers:
-        print("QAT observers are frozen; training weights with fixed quantization ranges.")
-        freeze_model(model)
 
     for epoch in range(args.start_epoch, args.epochs):
         if class_head_warmup_active and epoch >= args.class_head_warmup_epochs:
