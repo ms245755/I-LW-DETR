@@ -12,12 +12,15 @@ Run all commands from the repository root.
 | --- | --- | --- |
 | Float fine-tuning | `setup/finetune/run.sh` | `setup/slurm/run.sh finetune` |
 | Float/QR/PTQ/QAT evaluation | `setup/eval/run.sh` | `setup/slurm/run.sh eval` |
+| ONNX/TensorRT export | `setup/export/run.sh` | - |
 | PTQ | `setup/ptq/<scenario>.sh` | `setup/slurm/run.sh ptq <scenario>` |
 | QAT | `setup/qat/<scenario>.sh` | `setup/slurm/run.sh qat <scenario>` |
 
 Model size is always one of `tiny`, `small`, or `medium`. COCO is the primary
 dataset and uses `DATASET_FILE=coco`. Other COCO-format datasets use
 `DATASET_FILE=custom_coco`.
+
+Export additionally supports the upstream `large` and `xlarge` model sizes.
 
 ## 1. Prepare the dataset
 
@@ -178,7 +181,36 @@ bash setup/finetune/run.sh \
 The existing classification and box heads are loaded. The newly introduced
 decoder reference-position MLP is initialized and learned during this run.
 
-## 3. Run through Slurm
+## 3. Export ONNX or TensorRT
+
+Use the generic export wrapper instead of the model-specific scripts:
+
+```bash
+bash setup/export/run.sh \
+  tiny \
+  ../../data/COCO \
+  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
+```
+
+Pass normal `export_model` options after the checkpoint:
+
+```bash
+bash setup/export/run.sh small ../../data/COCO /path/to/checkpoint.pth --simplify
+bash setup/export/run.sh medium ../../data/COCO /path/to/checkpoint.pth --simplify --trt
+```
+
+For checkpoints trained with easy quantization, export with the same model
+variant:
+
+```bash
+EASY_QUANTIZE=true \
+bash setup/export/run.sh tiny ../../data/COCO /path/to/checkpoint_easy_quant.pth --simplify
+```
+
+The default output is `output/lwdetr_<size>_<dataset>/inference_model.onnx`.
+Set `OUTPUT_DIR=/path/to/export_dir` to choose a different destination.
+
+## 4. Run through Slurm
 
 The Slurm wrapper dispatches the same local workflows. Create the parent
 directory used by `sbatch -o` before submitting.
