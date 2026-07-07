@@ -6,7 +6,7 @@ def freeze_model(model):
     freeze the activation range. Resursively invokes layer.fix()
     """
     for m in model.modules():
-        if isinstance(m, (IViTAct, IViTSoftmax)):
+        if isinstance(m, (IViTAct, IViTSoftmaxV2)):
             m.fix()
 
 
@@ -15,7 +15,7 @@ def unfreeze_model(model):
     unfreeze the activation range. Resursively invokes layer.unfix()
     """
     for m in model.modules():
-        if isinstance(m, (IViTAct, IViTSoftmax)):
+        if isinstance(m, (IViTAct, IViTSoftmaxV2)):
             m.unfix()
 
 
@@ -29,7 +29,7 @@ def configure_softmax_m_calibration(
 ):
     count = 0
     for module in model.modules():
-        if isinstance(module, IViTSoftmax):
+        if isinstance(module, IViTSoftmaxV2):
             module.calibrate_m = calibrate_m
             if m_guard_bits is not None:
                 module.m_guard_bits = int(m_guard_bits)
@@ -44,7 +44,7 @@ def configure_softmax_m_calibration(
 
 
 def get_softmax_m_summary(model):
-    softmax_modules = [m for m in model.modules() if isinstance(m, IViTSoftmax)]
+    softmax_modules = [m for m in model.modules() if isinstance(m, IViTSoftmaxV2)]
     if not softmax_modules:
         return None
     softmax_ms = [m.m for m in softmax_modules]
@@ -59,7 +59,7 @@ def get_softmax_m_summary(model):
 
 def print_softmax_m(model):
     for name, module in model.named_modules():
-        if isinstance(module, IViTSoftmax):
+        if isinstance(module, IViTSoftmaxV2):
             print(
                 f"{name}: type={module.__class__.__name__}, "
                 f"m={module.m}, "

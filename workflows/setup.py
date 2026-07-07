@@ -27,7 +27,7 @@ def build_model_components(args, device):
             m_ema_momentum=args.softmax_m_ema_momentum,
         )
         print(
-            "Configured IViTSoftmax m calibration: "
+            "Configured IViTSoftmaxV2 m calibration: "
             f"count={softmax_count}, "
             f"calibrate_m={args.softmax_calibrate_m}, "
             f"safe_guard={args.softmax_m_safe_guard}, "

@@ -1264,113 +1264,24 @@ class IViTSoftmax(nn.Module):
     Class to quantize given Softmax layer
     """
 
-    def __init__(
-        self,
-        output_bit=8,
-        n=15,
-        lambda_scaler=1,
-        input_bit=8,
-        m=31,
-        calibrate_m=True,
-        m_guard_bits=4,
-        m_calib_mode="ema_percentile",
-        m_percentile=99.9,
-        m_ema_momentum=0.95,
-        m_max=63,
-        **kwargs,
-    ):
+    def __init__(self, output_bit=8, **kwargs):
         super(IViTSoftmax, self).__init__()
         self.output_bit = output_bit
-        self.input_bit = input_bit
 
-        self.n = n  # sufficiently large integer
-        self.lambda_scaler = lambda_scaler
-        self.m = int(m)
-        # if calibrate_m:
-        #     self.m = 21
-        # else:
-        #     self.m = 31
-        self.calibrate_m = calibrate_m
-        self.m_guard_bits = int(m_guard_bits)
-        self.m_calib_mode = str(m_calib_mode)
-        self.m_percentile = float(m_percentile)
-        self.m_ema_momentum = float(m_ema_momentum)
-        self.m_max = int(m_max)
-        self.running_stat = True
+        self.n = 15  # sufficiently large integer
+        self.m = 31
         # The minimum value for ensuring accuracy (varies depending on models)
 
         self.register_buffer(
             "act_scaling_factor",
             nn.Parameter(torch.Tensor([1 / 2.0 ** (self.output_bit - 1)])),
         )
-        self.register_buffer("max_exp_int_sum", torch.tensor(0.0))
-        self.register_buffer("percentile_exp_int_sum", torch.tensor(0.0))
-        self.register_buffer("ema_exp_int_sum", torch.tensor(0.0))
-        self.register_buffer("calibrated_m", torch.tensor(self.m, dtype=torch.long))
-        self.register_buffer("m_calib_batches", torch.tensor(0, dtype=torch.long))
 
     def fix(self):
-        if self.calibrate_m and self.max_exp_int_sum.item() > 0:
-            self.m = int(self.calibrated_m.item())
-        self.running_stat = False
+        pass
 
     def unfix(self):
-        self.running_stat = True
-
-    def reset_m_calibration(self):
-        self.max_exp_int_sum.zero_()
-        self.percentile_exp_int_sum.zero_()
-        self.ema_exp_int_sum.zero_()
-        self.calibrated_m.fill_(self.m)
-        self.m_calib_batches.zero_()
-
-    def _sync_m_from_calibration(self):
-        if self.calibrate_m and self.max_exp_int_sum.item() > 0:
-            self.m = max(self.m, int(self.calibrated_m.item()))
-        return self.m
-
-    def _update_m_calibration(self, exp_int_sum):
-        if not self.calibrate_m or not self.running_stat:
-            return self.m
-
-        with torch.no_grad():
-            exp_values = exp_int_sum.detach().float().reshape(-1)
-            observed_max = exp_values.amax()
-            self.max_exp_int_sum.copy_(torch.maximum(self.max_exp_int_sum, observed_max))
-
-            if self.m_calib_mode == "percentile":
-                q = min(max(self.m_percentile / 100.0, 0.0), 1.0)
-                observed_ref = torch.quantile(exp_values, q)
-                self.percentile_exp_int_sum.copy_(
-                    torch.maximum(self.percentile_exp_int_sum, observed_ref)
-                )
-                calib_ref = self.percentile_exp_int_sum
-            elif self.m_calib_mode == "ema_percentile":
-                q = min(max(self.m_percentile / 100.0, 0.0), 1.0)
-                observed_ref = torch.quantile(exp_values, q)
-                self.percentile_exp_int_sum.copy_(
-                    torch.maximum(self.percentile_exp_int_sum, observed_ref)
-                )
-                if self.m_calib_batches.item() == 0:
-                    self.ema_exp_int_sum.copy_(observed_ref)
-                else:
-                    self.ema_exp_int_sum.copy_(
-                        self.ema_exp_int_sum * self.m_ema_momentum
-                        + observed_ref * (1.0 - self.m_ema_momentum)
-                    )
-                calib_ref = self.ema_exp_int_sum
-            elif self.m_calib_mode == "max":
-                calib_ref = self.max_exp_int_sum
-            else:
-                raise ValueError(f"unknown softmax m calibration mode: {self.m_calib_mode}")
-
-            required_m = torch.ceil(torch.log2(calib_ref.clamp_min(1.0))).long()
-            required_m = required_m + self.m_guard_bits
-            required_m = torch.clamp(required_m, min=self.m, max=self.m_max)
-            self.calibrated_m.copy_(required_m)
-            self.m_calib_batches += 1
-
-        return int(self.calibrated_m.item())
+        pass
 
     def int_exp_shift(self, x_int, scaling_factor):
         scaled_floor = floor_ste.apply(x_int / 2)
@@ -1380,7 +1291,7 @@ class IViTSoftmax(nn.Module):
         with torch.no_grad():
             x0_int = torch.ceil(1.0 / scaling_factor)
 
-        min_x_int = torch.clamp(self.n * self.lambda_scaler * (-x0_int), min=-(2.0**self.m))
+        min_x_int = torch.clamp(self.n * (-x0_int), min=-(2.0**self.m))
         x_int = torch.maximum(x_int, min_x_int)
 
         q = floor_ste.apply(x_int / (-x0_int))
@@ -1395,37 +1306,22 @@ class IViTSoftmax(nn.Module):
         return exp_int
 
     def forward(self, x, act_scaling_factor, dynamic_input_scale=False):
-        self._sync_m_from_calibration()
-
-        if torch.is_tensor(act_scaling_factor) and act_scaling_factor.numel() > 1:
-            scale = act_scaling_factor.reshape(-1)
-            if scale.numel() == x.shape[-1]:
-                scale = scale.reshape(*([1] * (x.dim() - 1)), x.shape[-1])
-                x = round_ste.apply(x / scale) * scale
-                act_scaling_factor = scale.max()
-            elif x.dim() >= 2 and scale.numel() == x.shape[-2] * x.shape[-1]:
-                scale = scale.reshape(*([1] * (x.dim() - 2)), x.shape[-2], x.shape[-1])
-                x = round_ste.apply(x / scale) * scale
-                act_scaling_factor = scale.max(dim=-1, keepdim=True).values
-            else:
-                act_scaling_factor = scale.max()
-
         x_int = round_ste.apply(x / act_scaling_factor)
         x_int_max, _ = x_int.max(dim=-1, keepdim=True)
         x_int = x_int - x_int_max
 
         exp_int = self.int_exp_shift(x_int, act_scaling_factor)
         exp_int_sum = exp_int.sum(dim=-1, keepdim=True)
-        m = self._update_m_calibration(exp_int_sum)
 
-        # exp_int_sum.clamp_max_(2**self.m - 1)
-        factor = floor_ste.apply((2.0**m - 1) / exp_int_sum)
-        exp_int = floor_ste.apply(exp_int * factor / (2.0 ** (m - self.output_bit + 1)))
+        exp_int_sum.clamp_max_(2**self.m - 1)
+        factor = floor_ste.apply((2.0**self.m - 1) / exp_int_sum)
+        exp_int = floor_ste.apply(exp_int * factor / (2.0 ** (self.m - self.output_bit + 1)))
 
         return exp_int * self.act_scaling_factor, self.act_scaling_factor
 
 
-class IViTSoftmaxV2(IViTSoftmax):
+@track_init_args
+class IViTSoftmaxV2(nn.Module):
     """
     Shiftmax variant that caps M for 32-bit hardware and right-shifts Iexp.
 
@@ -1434,15 +1330,47 @@ class IViTSoftmaxV2(IViTSoftmax):
     sum is accumulated.
     """
 
-    def __init__(self, *args, hardware_m_max=31, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        output_bit=8,
+        n=15,
+        lambda_scaler=1,
+        input_bit=8,
+        calibrate_m=True,
+        m_guard_bits=4,
+        m_calib_mode="ema_percentile",
+        m_percentile=99.9,
+        m_ema_momentum=0.95,
+        m_max=63,
+        hardware_m_max=31,
+        **kwargs,
+    ):
+        super(IViTSoftmaxV2, self).__init__()
+        self.output_bit = output_bit
+        self.input_bit = input_bit
+        self.n = n
+        self.lambda_scaler = lambda_scaler
+        self.calibrate_m = calibrate_m
+        self.m_guard_bits = int(m_guard_bits)
+        self.m_calib_mode = str(m_calib_mode)
+        self.m_percentile = float(m_percentile)
+        self.m_ema_momentum = float(m_ema_momentum)
+        self.m_max = int(m_max)
+        self.running_stat = True
         self.hardware_m_max = int(hardware_m_max)
-        self._init_kwargs["hardware_m_max"] = self.hardware_m_max
+        self.register_buffer(
+            "act_scaling_factor",
+            nn.Parameter(torch.Tensor([1 / 2.0 ** (self.output_bit - 1)])),
+        )
         # V2 fixes denominator M to the hardware-safe value. Calibration only
         # observes the extra logical range as R and exp_clamp_m.
         self.m = self.hardware_m_max
-        self.calibrated_m.fill_(self.hardware_m_max)
         self.r = 0
+        self.register_buffer("max_exp_int_sum", torch.tensor(0.0))
+        self.register_buffer("percentile_exp_int_sum", torch.tensor(0.0))
+        self.register_buffer("ema_exp_int_sum", torch.tensor(0.0))
+        self.register_buffer("calibrated_m", torch.tensor(self.hardware_m_max, dtype=torch.long))
+        self.register_buffer("m_calib_batches", torch.tensor(0, dtype=torch.long))
         self.register_buffer("calibrated_r", torch.tensor(0, dtype=torch.long))
         self.exp_clamp_m = self.hardware_m_max
         self.register_buffer(
@@ -1461,8 +1389,14 @@ class IViTSoftmaxV2(IViTSoftmax):
             self.exp_clamp_m = int(self.calibrated_exp_clamp_m.item())
         self.running_stat = False
 
+    def unfix(self):
+        self.running_stat = True
+
     def reset_m_calibration(self):
-        super().reset_m_calibration()
+        self.max_exp_int_sum.zero_()
+        self.percentile_exp_int_sum.zero_()
+        self.ema_exp_int_sum.zero_()
+        self.m_calib_batches.zero_()
         self._set_fixed_hardware_m()
         self.calibrated_r.zero_()
         self.calibrated_exp_clamp_m.fill_(self.hardware_m_max)
