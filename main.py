@@ -23,7 +23,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.amp import GradScaler
 
 from datasets import resolve_num_classes
 from engine import (
@@ -44,6 +43,10 @@ from workflows.setup import (
     build_optimizer_and_scheduler,
     build_train_loader,
     build_val_loader,
+)
+from workflows.tensorboard import (
+    build_tensorboard_writer,
+    write_tensorboard_stats,
 )
 from workflows.training import build_training_schedules, initialize_training_state
 
@@ -274,6 +277,10 @@ def get_args_parser():
 
     parser.add_argument('--output_dir', default='output',
                         help='path where to save, empty for no saving')
+    parser.add_argument('--tensorboard', action='store_true',
+                        help='Write TensorBoard event files with train/eval scalars.')
+    parser.add_argument('--tensorboard_dir', default=None,
+                        help='TensorBoard log directory. Defaults to <output_dir>/tensorboard.')
     parser.add_argument('--checkpoint_interval', default=10, type=int,
                         help='epoch interval to save checkpoint')
     parser.add_argument('--seed', default=42, type=int)
@@ -358,16 +365,16 @@ def main(args):
     model, model_without_ddp, criterion, postprocessors, ema_m, n_parameters = (
         build_model_components(args, device)
     )
-    # scaler = GradScaler('cuda') if torch.cuda.is_available() else None
 
+    output_dir = Path(args.output_dir)
     dataset_val, data_loader_val, base_ds = build_val_loader(args)
+    tensorboard_writer = build_tensorboard_writer(args, output_dir)
 
     ema_m = load_pretrain_weights(
         args,
         model_without_ddp,
         ema_m,
     )
-    output_dir = Path(args.output_dir)
     
     #### this took a lot of gpu resource
     # if  utils.is_main_process():
@@ -548,6 +555,7 @@ def main(args):
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+            write_tensorboard_stats(tensorboard_writer, log_stats, epoch)
 
             # for evaluation logs
             if coco_evaluator is not None:
@@ -563,6 +571,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('LWDETR training and evaluation script', parents=[get_args_parser()])

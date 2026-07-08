@@ -59,6 +59,8 @@ decoder_cross_attn_float="${DECODER_CROSS_ATTN_FLOAT:-false}"
 decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-false}"
 decoder_two_stage_float="${DECODER_TWO_STAGE_FLOAT:-false}"
 decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
+tensorboard="${TENSORBOARD:-false}"
+tensorboard_dir="${TENSORBOARD_DIR:-}"
 
 resume_optimizer_args=()
 if [[ "$resume_optimizer" == "1" || "$resume_optimizer" == "true" || "$resume_optimizer" == "yes" ]]; then
@@ -88,6 +90,14 @@ fi
 decoder_norm_output_qact_args=()
 if [[ "$decoder_norm_output_qact" == "1" || "$decoder_norm_output_qact" == "true" || "$decoder_norm_output_qact" == "yes" ]]; then
   decoder_norm_output_qact_args=(--decoder_norm_output_qact)
+fi
+
+tensorboard_args=()
+if [[ "$tensorboard" == "1" || "$tensorboard" == "true" || "$tensorboard" == "yes" ]]; then
+  tensorboard_args=(--tensorboard)
+  if [[ -n "$tensorboard_dir" ]]; then
+    tensorboard_args+=(--tensorboard_dir "$tensorboard_dir")
+  fi
 fi
 
 pretrain_keys_modify_to_load=(
@@ -151,5 +161,6 @@ python -u -m torch.distributed.launch \
   "${decoder_cross_attn_value_per_channel_args[@]}" \
   "${decoder_two_stage_float_args[@]}" \
   "${decoder_norm_output_qact_args[@]}" \
+  "${tensorboard_args[@]}" \
   --pretrain_keys_modify_to_load "${pretrain_keys_modify_to_load[@]}" \
   --output_dir "$output_dir"
