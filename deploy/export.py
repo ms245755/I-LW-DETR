@@ -23,6 +23,13 @@ from PIL import Image
 import util.misc as utils
 import datasets.transforms as T
 from models import build_model
+from quant_models import build_model_quant
+from quant_models.fake_quantized.model_utils import configure_softmax_m_calibration
+from workflows.common import (
+    adapt_checkpoint_keys_for_model,
+    fuse_bn_into_conv_in_state_dict,
+    print_load_state,
+)
 from main import get_args_parser
 from deploy._onnx import OnnxOptimizer
 
@@ -63,7 +70,10 @@ def export_onnx(model, args, input_names, input_tensors, output_names, dynamic_a
     output_file = os.path.join(args.output_dir, f"{export_name}.onnx")
     
     # dry_run
-    model.export()
+    if args.aidge_export and hasattr(model, "aidge_export"):
+        model.aidge_export()
+    else:
+        model.export()
     # outputs = model(input_tensors)
 
     torch.onnx.export(
@@ -83,9 +93,9 @@ def export_onnx(model, args, input_names, input_tensors, output_names, dynamic_a
     return output_file
 
 
-def onnx_simplify(onnx_dir:str, input_names, input_tensors):
+def onnx_simplify(onnx_dir:str, input_names, input_tensors, force=False):
     sim_onnx_dir = onnx_dir.replace(".onnx", ".sim.onnx")
-    if os.path.isfile(sim_onnx_dir) and not args.force:
+    if os.path.isfile(sim_onnx_dir) and not force:
         return sim_onnx_dir
     
     if isinstance(input_tensors, torch.Tensor):
@@ -130,6 +140,112 @@ def trtexec(onnx_dir:str, args) -> None:
     return engine_dir
 
 
+def build_export_model(args):
+    if args.quant or args.calib or args.qat:
+        model, criterion, postprocessors = build_model_quant(args)
+        softmax_count = configure_softmax_m_calibration(
+            model,
+            calibrate_m=args.softmax_calibrate_m,
+            m_guard_bits=args.softmax_m_safe_guard,
+            m_calib_mode=args.softmax_m_calib_mode,
+            m_percentile=args.softmax_m_percentile,
+            m_ema_momentum=args.softmax_m_ema_momentum,
+        )
+        print(
+            "Configured quantized export model: "
+            f"softmax_count={softmax_count}, "
+            f"softmax_calibrate_m={args.softmax_calibrate_m}"
+        )
+        return model, criterion, postprocessors
+
+    return build_model(args)
+
+
+def load_export_checkpoint(model, args):
+    checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+
+    quant_model_components = set(args.quant_model_components or [])
+    backbone_quant_components = set(args.backbone_quant_components or [])
+    if (
+        (args.quant or args.qat or args.calib)
+        and 'backbone' in quant_model_components
+        and 'projector' in backbone_quant_components
+    ):
+        state_dict = fuse_bn_into_conv_in_state_dict(state_dict)
+
+    state_dict = adapt_checkpoint_keys_for_model(state_dict, model)
+    resize_model_buffers_for_checkpoint(model, state_dict)
+    state_dict = reshape_compatible_checkpoint_tensors(state_dict, model)
+    load_state = model.load_state_dict(state_dict, strict=False)
+    print_load_state("export checkpoint load", load_state)
+    print(f"load checkpoints {args.resume}")
+
+
+def resize_model_buffers_for_checkpoint(model, state_dict):
+    resizable_suffixes = (
+        "act_scaling_factor",
+        "out_scaling_factor",
+        "act_scale_mantissa",
+        "act_scale_shift",
+        "min_val",
+        "max_val",
+    )
+    modules = dict(model.named_modules())
+    resized = []
+
+    for key, tensor in state_dict.items():
+        if not key.endswith(resizable_suffixes) or not hasattr(tensor, "shape"):
+            continue
+
+        module_name, sep, buffer_name = key.rpartition(".")
+        if not sep:
+            continue
+        module = modules.get(module_name)
+        if module is None or buffer_name not in module._buffers:
+            continue
+
+        current = module._buffers[buffer_name]
+        if current is None or current.shape == tensor.shape:
+            continue
+        if current.numel() == 1 and tensor.numel() > 1:
+            module._buffers[buffer_name] = current.new_empty(tensor.shape)
+            resized.append((key, tuple(current.shape), tuple(tensor.shape)))
+
+    if resized:
+        print(
+            "Resized export model quant buffers from checkpoint: "
+            f"{len(resized)} buffer(s)."
+        )
+        print(f"First resized buffers: {resized[:20]}")
+
+
+def reshape_compatible_checkpoint_tensors(state_dict, model):
+    model_state = model.state_dict()
+    reshaped = {}
+    changed = []
+    for key, tensor in state_dict.items():
+        target = model_state.get(key)
+        if (
+            target is not None
+            and hasattr(tensor, "shape")
+            and tensor.shape != target.shape
+            and tensor.numel() == target.numel()
+        ):
+            tensor = tensor.reshape(target.shape)
+            changed.append((key, tuple(tensor.shape)))
+        reshaped[key] = tensor
+
+    if changed:
+        print(
+            "Reshaped compatible checkpoint tensors: "
+            f"{len(changed)} scalar/vector buffer(s)."
+        )
+        print(f"First reshaped tensors: {changed[:20]}")
+
+    return reshaped
+
+
 def main(args):
     print("git:\n  {}\n".format(utils.get_sha()))
     print(args)
@@ -153,12 +269,10 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
 
-    model, criterion, postprocessors = build_model(args)
+    model, criterion, postprocessors = build_export_model(args)
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(checkpoint['model'], strict=True)
-        print(f"load checkpoints {args.resume}")
+        load_export_checkpoint(model, args)
 
     model.to(device)
 

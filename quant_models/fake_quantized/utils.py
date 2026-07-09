@@ -146,7 +146,8 @@ class round_ste(Function):
 
 def batch_frexp(inputs, max_bit=31):
     """
-    Decompose the scaling factor into mantissa and twos exponent.
+    Decompose the scaling factor into mantissa and twos exponent without
+    torch.frexp, which PyTorch cannot export to ONNX.
     Parameters:
     ----------
     inputs: scaling factor
@@ -158,8 +159,9 @@ def batch_frexp(inputs, max_bit=31):
     # trans the input to be a 1-d tensor
     inputs = inputs.view(-1)
 
-    # Get mantissa and exponent with torch.frexp
-    mantissa, exponent = torch.frexp(inputs)
+    eps = torch.finfo(inputs.dtype).eps
+    exponent = torch.floor(torch.log2(inputs.abs().clamp_min(eps))).long()
+    mantissa = inputs / (2.0 ** exponent.to(dtype=inputs.dtype))
 
     # Scale mantissa by 2^max_bit and round it
     max_bit_factor = 2.0**max_bit

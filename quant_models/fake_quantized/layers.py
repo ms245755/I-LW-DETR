@@ -201,6 +201,7 @@ class IViTAct(nn.Module):
         self.register_buffer("min_val", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("max_val", nn.Parameter(torch.tensor(1.0)))
         self.register_buffer("n_batches", torch.tensor(0, dtype=torch.long))
+        self._export = False
 
         self.quant_mode = quant_mode
         self.per_channel = per_channel
@@ -240,6 +241,25 @@ class IViTAct(nn.Module):
         self.act_scale_shift = shift.to(device=scale.device, dtype=torch.int32)
 
         return dyadic_scale
+
+    def _dyadic_scale_from_buffers(self, dtype=None, device=None):
+        mantissa = self.act_scale_mantissa
+        shift = self.act_scale_shift
+        if device is not None:
+            mantissa = mantissa.to(device=device)
+            shift = shift.to(device=device)
+        if dtype is None:
+            dtype = self.act_scaling_factor.dtype
+        return mantissa.to(dtype=dtype) / (2.0 ** shift.to(dtype=dtype))
+
+    def export(self):
+        self._export = True
+        self.fix()
+        if self.use_dyadic_scale:
+            self.act_scaling_factor = self._dyadic_scale_from_buffers(
+                dtype=self.act_scaling_factor.dtype,
+                device=self.act_scaling_factor.device,
+            )
 
     def set_dyadic_scale(self, mantissa, shift):
         mantissa = torch.as_tensor(mantissa, device=self.act_scaling_factor.device)
@@ -288,50 +308,62 @@ class IViTAct(nn.Module):
     def forward(self, x, act_scaling_factor=None, x_2=None, act_scaling_factor_2=None):
         # collect runnng stats
         with torch.no_grad():
-            x_act = x if x_2 is None else x_2 + x
-            collect_current_stat = self.running_stat or self.n_batches.item() == 0
-            if collect_current_stat:
-                if len(x_act.shape) == 4:
-                    x_act = x_act.permute(0, 2, 3, 1)
-                v = x_act.reshape(-1, x_act.shape[-1])
-                v = v.transpose(0, 1)
-
-                if self.observer_mode == "percentile":
-                    upper_q = min(max(self.percentile / 100.0, 0.0), 1.0)
-                    lower_q = min(max(1.0 - upper_q, 0.0), 1.0)
-                    v_float = v.float()
-                    cur_min = torch.quantile(v_float, lower_q, dim=1).to(v.dtype)
-                    cur_max = torch.quantile(v_float, upper_q, dim=1).to(v.dtype)
-                elif self.observer_mode in ("ema_minmax", "mean"):
-                    cur_min = v.min(dim=1).values
-                    cur_max = v.max(dim=1).values
-                else:
-                    raise ValueError("unknown observer_mode: {}".format(self.observer_mode))
-                if not self.per_channel:
-                    cur_min = cur_min.min()
-                    cur_max = cur_max.max()
-                if self.n_batches.item() == 0:
-                    self.min_val = cur_min
-                    self.max_val = cur_max
-                elif self.observer_mode == "mean":
-                    batch_count = self.n_batches.to(dtype=cur_min.dtype, device=cur_min.device) + 1
-                    self.min_val = self.min_val + (cur_min - self.min_val) / batch_count
-                    self.max_val = self.max_val + (cur_max - self.max_val) / batch_count
-                else:
-                    self.min_val = self.min_val * self.act_range_momentum + cur_min * (
-                        1 - self.act_range_momentum
+            if self._export:
+                if self.use_dyadic_scale:
+                    self.act_scaling_factor = self._dyadic_scale_from_buffers(
+                        dtype=x.dtype,
+                        device=x.device,
                     )
-                    self.max_val = self.max_val * self.act_range_momentum + cur_max * (
-                        1 - self.act_range_momentum
+                else:
+                    self.act_scaling_factor = self.act_scaling_factor.to(
+                        dtype=x.dtype,
+                        device=x.device,
                     )
-                if self.running_stat:
-                    self.n_batches += 1
+            else:
+                x_act = x if x_2 is None else x_2 + x
+                collect_current_stat = self.running_stat or self.n_batches.item() == 0
+                if collect_current_stat:
+                    if len(x_act.shape) == 4:
+                        x_act = x_act.permute(0, 2, 3, 1)
+                    v = x_act.reshape(-1, x_act.shape[-1])
+                    v = v.transpose(0, 1)
 
-            self.act_scaling_factor = symmetric_linear_quantization_params(
-                self.activation_bit, self.min_val, self.max_val
-            )
-            if self.use_dyadic_scale:
-                self.act_scaling_factor = self._snap_scale_to_dyadic(self.act_scaling_factor)
+                    if self.observer_mode == "percentile":
+                        upper_q = min(max(self.percentile / 100.0, 0.0), 1.0)
+                        lower_q = min(max(1.0 - upper_q, 0.0), 1.0)
+                        v_float = v.float()
+                        cur_min = torch.quantile(v_float, lower_q, dim=1).to(v.dtype)
+                        cur_max = torch.quantile(v_float, upper_q, dim=1).to(v.dtype)
+                    elif self.observer_mode in ("ema_minmax", "mean"):
+                        cur_min = v.min(dim=1).values
+                        cur_max = v.max(dim=1).values
+                    else:
+                        raise ValueError("unknown observer_mode: {}".format(self.observer_mode))
+                    if not self.per_channel:
+                        cur_min = cur_min.min()
+                        cur_max = cur_max.max()
+                    if self.n_batches.item() == 0:
+                        self.min_val = cur_min
+                        self.max_val = cur_max
+                    elif self.observer_mode == "mean":
+                        batch_count = self.n_batches.to(dtype=cur_min.dtype, device=cur_min.device) + 1
+                        self.min_val = self.min_val + (cur_min - self.min_val) / batch_count
+                        self.max_val = self.max_val + (cur_max - self.max_val) / batch_count
+                    else:
+                        self.min_val = self.min_val * self.act_range_momentum + cur_min * (
+                            1 - self.act_range_momentum
+                        )
+                        self.max_val = self.max_val * self.act_range_momentum + cur_max * (
+                            1 - self.act_range_momentum
+                        )
+                    if self.running_stat:
+                        self.n_batches += 1
+
+                self.act_scaling_factor = symmetric_linear_quantization_params(
+                    self.activation_bit, self.min_val, self.max_val
+                )
+                if self.use_dyadic_scale:
+                    self.act_scaling_factor = self._snap_scale_to_dyadic(self.act_scaling_factor)
 
         if act_scaling_factor is None:
             # this is for the x quantization

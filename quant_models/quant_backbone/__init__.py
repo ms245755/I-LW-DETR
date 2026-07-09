@@ -34,7 +34,8 @@ class Joiner(nn.Sequential):
         feats, masks = self[0](inputs)
         poss = []
         for feat, mask in zip(feats, masks):
-            poss.append(self[1](mask, align_dim_orders=False).to(feat.dtype))
+            tensor = feat[0] if isinstance(feat, tuple) else feat
+            poss.append(self[1](mask, align_dim_orders=False).to(tensor.dtype))
         return feats, None, poss
 
 

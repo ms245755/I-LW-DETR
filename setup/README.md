@@ -207,6 +207,32 @@ EASY_QUANTIZE=true \
 bash setup/export/run.sh tiny ../../data/COCO /path/to/checkpoint_easy_quant.pth --simplify
 ```
 
+For fully quantized checkpoints, use the quant export wrapper:
+
+```bash
+EASY_QUANTIZE=true \
+bash setup/export/fully_quantized.sh \
+  tiny \
+  ../../data/COCO \
+  /path/to/checkpoint_quantized.pth \
+  --simplify
+```
+
+You can also drive the same path through `run.sh`:
+
+```bash
+QUANT=true \
+EASY_QUANTIZE=true \
+bash setup/export/run.sh tiny ../../data/COCO /path/to/checkpoint_quantized.pth --simplify
+```
+
+The fully quantized defaults are backbone + transformer + LW-DETR prediction
+heads. Checkpoint-specific override variables are still accepted, including
+`ENCODER_QUANT_COMPONENTS`, `PROJECTOR_QUANT_COMPONENTS`,
+`TRANSFORMER_QUANT_COMPONENTS`, `LWDETR_QUANT_COMPONENTS`,
+`DECODER_CROSS_ATTN_FLOAT`, `DECODER_TWO_STAGE_FLOAT`, and
+`DECODER_NORM_OUTPUT_QACT`.
+
 The default output is `output/lwdetr_<size>_<dataset>/inference_model.onnx`.
 Set `OUTPUT_DIR=/path/to/export_dir` to choose a different destination.
 

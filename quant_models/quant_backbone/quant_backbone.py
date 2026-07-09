@@ -169,15 +169,22 @@ class Backbone(BackboneBase):
         if not self.quantize_projector:
             feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
-        if self.quantize_projector:
-            feats = [feat for (feat, scale) in feats]
         out_feats = []
         out_masks = []
-        for feat in feats:
+        for item in feats:
+            if isinstance(item, tuple):
+                feat, scale = item
+            else:
+                feat, scale = item, None
+            if isinstance(feat, tuple):
+                feat = feat[0]
             # x: [(B, C, H, W)]
             b, _, h, w = feat.shape
             out_masks.append(torch.zeros((b, h, w), dtype=torch.bool, device=feat.device))
-            out_feats.append(feat)
+            if self.return_quant_scales:
+                out_feats.append((feat, scale))
+            else:
+                out_feats.append(feat)
         return out_feats, out_masks
 
     def get_named_param_lr_pairs(self, args, prefix:str = "backbone.0"):
