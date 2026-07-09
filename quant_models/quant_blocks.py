@@ -119,7 +119,7 @@ class IFeedForward(nn.Module):
         self.act_no_lambda = IViTGELU(output_bit=8)
         self.act_sign = ISignGELU(output_bit=8, n=gelu_n, lambda_scaler=gelu_lambda, channel_len=None)
         self.act = ISegGELU(output_bit=8, n=gelu_n, lambda_scaler=gelu_lambda, channel_len=None)
-        self.act_sign_no_lambda = ISignGELUNoLambda(output_bit=8, n=gelu_n, channel_len=None)
+        self.act_sign_no_lambda = ISDShiftGELU(output_bit=8, n=gelu_n, channel_len=None)
         self.act_sigmoid_range = IViTGELUWithSigmoidRange(output_bit=8, sigmoid_bound=6)
         if out_dim is None:
             out_dim = dim

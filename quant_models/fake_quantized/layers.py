@@ -1121,13 +1121,13 @@ class ISignGELU(nn.Module):
         return out, out_scaling_factor
 
 @track_init_args
-class ISignGELUNoLambda(nn.Module):
+class ISDShiftGELU(nn.Module):
     """
     ISignGELU variant without lambda scaling in the integer exp clamp.
     """
 
     def __init__(self, output_bit=8, n=23, temp=1.702, channel_len=None):
-        super(ISignGELUNoLambda, self).__init__()
+        super(ISDShiftGELU, self).__init__()
         self.output_bit = output_bit
 
         self.n = n  # sufficiently large integer
@@ -1173,20 +1173,7 @@ class ISignGELUNoLambda(nn.Module):
         pre_x_int = round_ste.apply(x / act_scaling_factor)
         scaling_factor_sig = act_scaling_factor * self.temp
 
-        A = 2.0
-        A_int = round_ste.apply(
-            torch.tensor(A, device=x.device, dtype=x.dtype) / act_scaling_factor
-        )
-
-        pos_mask = pre_x_int > 0
-
-        x_int_max_base = torch.clamp(pre_x_int, min=0)
-
-        x_int_max = torch.where(
-            pos_mask,
-            pre_x_int + A_int,
-            x_int_max_base
-        )
+        x_int_max = torch.clamp(pre_x_int, min=0)
 
         x_int = pre_x_int - x_int_max
 
