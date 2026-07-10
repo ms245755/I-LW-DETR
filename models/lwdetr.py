@@ -113,6 +113,16 @@ class LWDETR(nn.Module):
             if hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
                 m.export()
 
+    def aidge_export(self):
+        self._export = True
+        self._forward_origin = self.forward
+        self.forward = self.forward_export
+        for name, m in self.named_modules():
+            if hasattr(m, "aidge_export") and isinstance(m.aidge_export, Callable) and hasattr(m, "_export") and not m._export:
+                m.aidge_export()
+            elif hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
+                m.export()
+
     def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]

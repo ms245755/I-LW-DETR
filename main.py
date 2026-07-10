@@ -334,6 +334,8 @@ def get_args_parser():
     parser_export.add_argument('--verbose', type=ast.literal_eval, default=False, nargs="?", const=True)
     parser_export.add_argument('--opset_version', type=int, default=17)
     parser_export.add_argument('--simplify', action='store_true', help="Simplify onnx model")
+    parser_export.add_argument('--aidge_export', action='store_true',
+                               help="Export an Aidge-friendly ONNX graph for unsupported masking patterns")
     parser_export.add_argument('--tensorrt', '--trtexec', '--trt', action='store_true',
                                help="build tensorrt engine")
     parser_export.add_argument('--dry-run', '--test', '-t', action='store_true', help="just print command")

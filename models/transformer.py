@@ -69,7 +69,7 @@ def gen_sineembed_for_position(pos_tensor, dim=128):
     return pos
 
 
-def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, unsigmoid=True):
+def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, unsigmoid=True, aidge_export=False):
     """
     Input:
         - memory: bs, \sum{hw}, d_model
@@ -114,14 +114,24 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
             output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float('inf'))
         output_proposals = output_proposals.masked_fill(~output_proposals_valid, float('inf'))
     else:
-        if memory_padding_mask is not None:
-            output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
-        output_proposals = output_proposals.masked_fill(~output_proposals_valid, float(0))
+        if aidge_export:
+            if memory_padding_mask is not None:
+                output_proposals = output_proposals * (~memory_padding_mask).unsqueeze(-1).to(output_proposals.dtype)
+            output_proposals = output_proposals * output_proposals_valid.to(output_proposals.dtype)
+        else:
+            if memory_padding_mask is not None:
+                output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
+            output_proposals = output_proposals.masked_fill(~output_proposals_valid, float(0))
 
     output_memory = memory
-    if memory_padding_mask is not None:
-        output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
-    output_memory = output_memory.masked_fill(~output_proposals_valid, float(0))
+    if aidge_export:
+        if memory_padding_mask is not None:
+            output_memory = output_memory * (~memory_padding_mask).unsqueeze(-1).to(output_memory.dtype)
+        output_memory = output_memory * output_proposals_valid.to(output_memory.dtype)
+    else:
+        if memory_padding_mask is not None:
+            output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
+        output_memory = output_memory.masked_fill(~output_proposals_valid, float(0))
 
     return output_memory.to(memory.dtype), output_proposals.to(memory.dtype)
 
@@ -186,9 +196,14 @@ class Transformer(nn.Module):
         self.bbox_reparam = bbox_reparam
 
         self._export = False
+        self._aidge_export = False
     
     def export(self):
         self._export = True
+
+    def aidge_export(self):
+        self.export()
+        self._aidge_export = True
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -236,7 +251,8 @@ class Transformer(nn.Module):
         
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(
-                memory, mask_flatten, spatial_shapes, unsigmoid=not self.bbox_reparam)
+                memory, mask_flatten, spatial_shapes, unsigmoid=not self.bbox_reparam,
+                aidge_export=self._aidge_export)
             save_tensor_from_pathname(output_memory, self.block_name + "1_two_stage/0_output_memory", observe_stat=self.observe_stat)
             save_tensor_from_pathname(output_proposals, self.block_name + "1_two_stage/1_output_proposals", observe_stat=self.observe_stat)
             # group detr for first stage
@@ -268,16 +284,29 @@ class Transformer(nn.Module):
                         output_memory_gidx) + output_proposals # (bs, \sum{hw}, 4) unsigmoid
 
                 topk = self.num_queries
-                topk_proposals_gidx = torch.topk(enc_outputs_class_unselected_gidx.max(-1)[0], topk, dim=1)[1] # bs, nq
-                
-                refpoint_embed_gidx_undetach = torch.gather(
-                    enc_outputs_coord_unselected_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, 4)) # unsigmoid
+                if self._aidge_export:
+                    # Aidge CPU currently does not execute the Expand/Tile pattern
+                    # produced by repeat() in the batch-1 export graph. It also
+                    # mishandles Gather on the int64 TopK index output, so run
+                    # TopK after removing the fixed batch dimension.
+                    topk_scores = enc_outputs_class_unselected_gidx[0].max(-1)[0]
+                    topk_indices = torch.topk(topk_scores, topk, dim=0)[1]
+                    refpoint_embed_gidx_undetach = torch.index_select(
+                        enc_outputs_coord_unselected_gidx[0], 0, topk_indices).unsqueeze(0)
+                else:
+                    topk_proposals_gidx = torch.topk(enc_outputs_class_unselected_gidx.max(-1)[0], topk, dim=1)[1] # bs, nq
+                    refpoint_embed_gidx_undetach = torch.gather(
+                        enc_outputs_coord_unselected_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, 4)) # unsigmoid
                 # for decoder layer, detached as initial ones, (bs, nq, 4)
                 refpoint_embed_gidx = refpoint_embed_gidx_undetach.detach()
                 
                 # get memory tgt
-                tgt_undetach_gidx = torch.gather(
-                    output_memory_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, self.d_model))
+                if self._aidge_export:
+                    tgt_undetach_gidx = torch.index_select(
+                        output_memory_gidx[0], 0, topk_indices).unsqueeze(0)
+                else:
+                    tgt_undetach_gidx = torch.gather(
+                        output_memory_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, self.d_model))
                 
                 refpoint_embed_ts.append(refpoint_embed_gidx)
                 memory_ts.append(tgt_undetach_gidx)
