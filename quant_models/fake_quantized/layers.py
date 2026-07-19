@@ -173,6 +173,7 @@ class IViTAct(nn.Module):
         percentile=None,
         use_dyadic_scale=True,
         dyadic_scale_bits=16,
+        channel_len=None,
     ):
         super(IViTAct, self).__init__()
 
@@ -181,6 +182,7 @@ class IViTAct(nn.Module):
         self.running_stat = running_stat
         self.quant_mode = quant_mode
         self.per_channel = per_channel
+        self.channel_len = channel_len
         self.observer_mode = observer_mode or self._default_observer_mode
         self.percentile = self._default_percentile if percentile is None else percentile
         self.use_dyadic_scale = (
@@ -194,13 +196,14 @@ class IViTAct(nn.Module):
             else dyadic_scale_bits
         )
 
-        self.register_buffer("act_scaling_factor", nn.Parameter(torch.tensor(1.0)))
+        scale_shape = (channel_len,) if per_channel and channel_len is not None else ()
+        self.register_buffer("act_scaling_factor", nn.Parameter(torch.ones(scale_shape)))
         self.register_buffer("out_scaling_factor", nn.Parameter(torch.tensor(1.0)))
-        self.register_buffer("act_scale_mantissa", torch.ones(1, dtype=torch.int32))
-        self.register_buffer("act_scale_shift", torch.zeros(1, dtype=torch.int32))
-        self.register_buffer("min_val", nn.Parameter(torch.tensor(1.0)))
-        self.register_buffer("max_val", nn.Parameter(torch.tensor(1.0)))
-        self.register_buffer("n_batches", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("act_scale_mantissa", torch.ones(scale_shape, dtype=torch.int32))
+        self.register_buffer("act_scale_shift", torch.zeros(scale_shape, dtype=torch.int32))
+        self.register_buffer("min_val", nn.Parameter(torch.ones(scale_shape)))
+        self.register_buffer("max_val", nn.Parameter(torch.ones(scale_shape)))
+        self.register_buffer("n_batches", torch.tensor(0, dtype=torch.int32))
         self._export = False
 
         self.quant_mode = quant_mode
@@ -526,9 +529,8 @@ class IViTConv2d(nn.Conv2d):
         )
 
         act_scaling_factor = act_scaling_factor.view(1, -1, 1, 1)
-        x = round_ste.apply(x / act_scaling_factor)
         correct_output_scale = bias_scaling_factor.view(1, -1, 1, 1)
-
+        x = round_ste.apply(x / act_scaling_factor)
         x_out = F.conv2d(
             x,
             self.weight_integer,
@@ -740,7 +742,7 @@ class IViTLayerNorm(nn.LayerNorm):
         mean_int = round_ste.apply(x_int.sum(dim=dim, keepdim=True) / x_int.shape[dim])
 
         y_int = x_int - mean_int
-        y_sq_int = y_int**2
+        y_sq_int = y_int*y_int
         var_int = torch.sum(y_sq_int, axis=dim, keepdim=True)
 
         # Integer Iteration
@@ -1286,6 +1288,7 @@ class IViTSoftmax(nn.Module):
     def __init__(self, output_bit=8, **kwargs):
         super(IViTSoftmax, self).__init__()
         self.output_bit = output_bit
+        self.dim = kwargs.get("dim", -1)
 
         self.n = 15  # sufficiently large integer
         self.m = 31
@@ -1362,11 +1365,13 @@ class IViTSoftmaxV2(nn.Module):
         m_ema_momentum=0.95,
         m_max=63,
         hardware_m_max=31,
+        r = 0,
         **kwargs,
     ):
         super(IViTSoftmaxV2, self).__init__()
         self.output_bit = output_bit
         self.input_bit = input_bit
+        self.dim = kwargs.get("dim", -1)
         self.n = n
         self.lambda_scaler = lambda_scaler
         self.calibrate_m = calibrate_m
@@ -1384,17 +1389,17 @@ class IViTSoftmaxV2(nn.Module):
         # V2 fixes denominator M to the hardware-safe value. Calibration only
         # observes the extra logical range as R and exp_clamp_m.
         self.m = self.hardware_m_max
-        self.r = 0
+        self.r = r
         self.register_buffer("max_exp_int_sum", torch.tensor(0.0))
         self.register_buffer("percentile_exp_int_sum", torch.tensor(0.0))
         self.register_buffer("ema_exp_int_sum", torch.tensor(0.0))
-        self.register_buffer("calibrated_m", torch.tensor(self.hardware_m_max, dtype=torch.long))
-        self.register_buffer("m_calib_batches", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("calibrated_r", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("calibrated_m", torch.tensor(self.hardware_m_max, dtype=torch.int32))
+        self.register_buffer("m_calib_batches", torch.tensor(0, dtype=torch.int32))
+        self.register_buffer("calibrated_r", torch.tensor(0, dtype=torch.int32))
         self.exp_clamp_m = self.hardware_m_max
         self.register_buffer(
             "calibrated_exp_clamp_m",
-            torch.tensor(self.exp_clamp_m, dtype=torch.long),
+            torch.tensor(self.exp_clamp_m, dtype=torch.int32),
         )
 
     def _set_fixed_hardware_m(self):
@@ -1800,32 +1805,17 @@ class IViTExp(nn.Module):
         # Approximate I * log2(e)
         x_int = self._log2_input_shift(x_int)
 
-        # Branch according to I_p
-        pos_mask = x_int >= 0
+        pos_x_int = torch.clamp(x_int, min=0)
+        neg_x_int = torch.clamp(x_int, max=0)
 
-        exp_int = torch.empty_like(x_int)
+        pos_exp_int = self._int_exp_shift_positive(pos_x_int, scaling_factor)
+        neg_exp_int = self._int_exp_shift_negative(neg_x_int, scaling_factor)
 
-        if torch.any(pos_mask):
-            exp_int[pos_mask] = self._int_exp_shift_positive(
-                x_int[pos_mask],
-                scaling_factor
-            )
+        neg_exp_int = neg_exp_int / 2.0**self.n
 
-        if torch.any(~pos_mask):
-            neg_exp_int = self._int_exp_shift_negative(
-                x_int[~pos_mask],
-                scaling_factor
-            )
-
-            # Negative branch natural scale is S / 2^n.
-            # To return one common scale S, convert:
-            #
-            #   neg_exp_int * (S / 2^n)
-            # = (neg_exp_int / 2^n) * S
-            #
-            # This keeps the same real value, but the returned exp_int is
-            # not strictly integer-like for negative values.
-            exp_int[~pos_mask] = neg_exp_int / 2.0**self.n
+        pos_mask = x_int > - 1
+        pos_mask = pos_mask.to(x_int.dtype)
+        exp_int = pos_mask * pos_exp_int + (1.0 - pos_mask) * neg_exp_int
 
         # Common output scale.
         exp_scale = scaling_factor

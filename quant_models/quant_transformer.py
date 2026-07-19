@@ -168,6 +168,11 @@ def _exp_tensor_scale(exp_module, x, scale):
 
 
 def _sanitize_boxes(boxes):
+    # torch.nan_to_num exports to IsNaN/IsInf/Or/Where, which Aidge does not
+    # currently import as native boolean operators. The exported inference graph
+    # should already be finite, so keep the Aidge ONNX path simple.
+    if torch.onnx.is_in_onnx_export():
+        return boxes
     return torch.nan_to_num(boxes, nan=0.0, posinf=1.0, neginf=0.0)
 
 
@@ -339,11 +344,11 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
     for lvl, (H_, W_) in enumerate(spatial_shapes):
         if memory_padding_mask is not None:
             mask_flatten_ = memory_padding_mask[:, _cur:(_cur + H_ * W_)].view(N_, H_, W_, 1)
-            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
-            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
+            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1, dtype=torch.int32)
+            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1, dtype=torch.int32)
         else:
-            valid_H = torch.tensor([H_ for _ in range(N_)], device=memory.device)
-            valid_W = torch.tensor([W_ for _ in range(N_)], device=memory.device)
+            valid_H = torch.tensor([H_ for _ in range(N_)], dtype=torch.int32, device=memory.device)
+            valid_W = torch.tensor([W_ for _ in range(N_)], dtype=torch.int32, device=memory.device)
 
         grid_y, grid_x = torch.meshgrid(torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=memory.device),
                                         torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=memory.device))
@@ -533,8 +538,8 @@ class Transformer(nn.Module):
                 m._reset_parameters()
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
-        valid_H = torch.sum(~mask[:, :, 0], 1)
-        valid_W = torch.sum(~mask[:, 0, :], 1)
+        valid_H = torch.sum(~mask[:, :, 0], 1, dtype=torch.int32)
+        valid_W = torch.sum(~mask[:, 0, :], 1, dtype=torch.int32)
         valid_ratio_h = valid_H.float() / H
         valid_ratio_w = valid_W.float() / W
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)

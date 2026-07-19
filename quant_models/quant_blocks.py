@@ -755,12 +755,18 @@ class IMSDeformAttn(nn.Module):
         # one per linear output — each produces its own scale
         self.qact_input            = IViTAct()   # quantize input_flatten
         self.qact_query            = IViTAct()   # quantize query
-        self.qact_value            = IViTAct(per_channel=value_per_channel)   # after value_proj
+        self.qact_value            = IViTAct(
+            per_channel=value_per_channel,
+            channel_len=d_model if value_per_channel else None,
+        )   # after value_proj
         self.qact_reference_points = IViTAct(activation_bit=16)   # quantize reference point coordinates
         self.qact_sampling_offsets = IViTAct()   # after sampling_offsets
         self.qact_sampling_locs    = IViTAct()   # quantize sampling locations
         self.qact_attn_weights     = IViTAct(activation_bit=8)   # after attention_weights + softmax
-        self.qact_sampled_values   = IViTAct(per_channel=True)   # after grid sampling
+        self.qact_sampled_values   = IViTAct(
+            per_channel=True,
+            channel_len=n_heads,
+        )   # after grid sampling
         self.qact_output           = IViTAct()   # after ms_deform_attn_core
 
         self._reset_parameters()
@@ -1100,6 +1106,7 @@ def quant_grid_sample_nearest(value, value_scale, sampling_grid):
     x_idx = round_ste.apply(x)
     y_idx = round_ste.apply(y)
 
+    # valid = (x_idx > -1) & (x_idx < W) & (y_idx > -1) & (y_idx < H)
     valid = (x_idx >= 0) & (x_idx <= (W - 1)) & (y_idx >= 0) & (y_idx <= (H - 1))
 
     return quant_gather_nearest(value, value_scale, x_idx, y_idx, valid)
@@ -1142,6 +1149,7 @@ def quantized_nearest_indices(reference_points, sampling_offsets, value_spatial_
 
         x_idx = round_ste.apply(x_num / coord_scale)
         y_idx = round_ste.apply(y_num / coord_scale)
+        # valid = (x_idx > -1) & (x_idx < W) & (y_idx > -1) & (y_idx < H)
         valid = (x_idx >= 0) & (x_idx <= (W - 1)) & (y_idx >= 0) & (y_idx <= (H - 1))
 
         x_idx = x_idx.permute(0, 2, 1, 3).reshape(B * n_heads, Len_q, n_points)

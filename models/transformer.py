@@ -86,11 +86,11 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
     for lvl, (H_, W_) in enumerate(spatial_shapes):
         if memory_padding_mask is not None:
             mask_flatten_ = memory_padding_mask[:, _cur:(_cur + H_ * W_)].view(N_, H_, W_, 1)
-            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
-            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
+            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1, dtype=torch.int32)
+            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1, dtype=torch.int32)
         else:
-            valid_H = torch.tensor([H_ for _ in range(N_)], device=memory.device)
-            valid_W = torch.tensor([W_ for _ in range(N_)], device=memory.device)
+            valid_H = torch.tensor([H_ for _ in range(N_)], dtype=torch.int32, device=memory.device)
+            valid_W = torch.tensor([W_ for _ in range(N_)], dtype=torch.int32, device=memory.device)
 
         grid_y, grid_x = torch.meshgrid(torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=memory.device),
                                         torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=memory.device))
@@ -114,24 +114,14 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
             output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float('inf'))
         output_proposals = output_proposals.masked_fill(~output_proposals_valid, float('inf'))
     else:
-        if aidge_export:
-            if memory_padding_mask is not None:
-                output_proposals = output_proposals * (~memory_padding_mask).unsqueeze(-1).to(output_proposals.dtype)
-            output_proposals = output_proposals * output_proposals_valid.to(output_proposals.dtype)
-        else:
-            if memory_padding_mask is not None:
-                output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
-            output_proposals = output_proposals.masked_fill(~output_proposals_valid, float(0))
+        if memory_padding_mask is not None:
+            output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
+        output_proposals = output_proposals.masked_fill(~output_proposals_valid, float(0))
 
     output_memory = memory
-    if aidge_export:
-        if memory_padding_mask is not None:
-            output_memory = output_memory * (~memory_padding_mask).unsqueeze(-1).to(output_memory.dtype)
-        output_memory = output_memory * output_proposals_valid.to(output_memory.dtype)
-    else:
-        if memory_padding_mask is not None:
-            output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
-        output_memory = output_memory.masked_fill(~output_proposals_valid, float(0))
+    if memory_padding_mask is not None:
+        output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
+    output_memory = output_memory.masked_fill(~output_proposals_valid, float(0))
 
     return output_memory.to(memory.dtype), output_proposals.to(memory.dtype)
 
@@ -215,8 +205,8 @@ class Transformer(nn.Module):
     
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
-        valid_H = torch.sum(~mask[:, :, 0], 1)
-        valid_W = torch.sum(~mask[:, 0, :], 1)
+        valid_H = torch.sum(~mask[:, :, 0], 1, dtype=torch.int32)
+        valid_W = torch.sum(~mask[:, 0, :], 1, dtype=torch.int32)
         valid_ratio_h = valid_H.float() / H
         valid_ratio_w = valid_W.float() / W
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
@@ -246,7 +236,7 @@ class Transformer(nn.Module):
             mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
             valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # bs, \sum{hxw}, c 
-        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=memory.device)
+        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.int32, device=memory.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
         
         if self.two_stage:
@@ -284,29 +274,14 @@ class Transformer(nn.Module):
                         output_memory_gidx) + output_proposals # (bs, \sum{hw}, 4) unsigmoid
 
                 topk = self.num_queries
-                if self._aidge_export:
-                    # Aidge CPU currently does not execute the Expand/Tile pattern
-                    # produced by repeat() in the batch-1 export graph. It also
-                    # mishandles Gather on the int64 TopK index output, so run
-                    # TopK after removing the fixed batch dimension.
-                    topk_scores = enc_outputs_class_unselected_gidx[0].max(-1)[0]
-                    topk_indices = torch.topk(topk_scores, topk, dim=0)[1]
-                    refpoint_embed_gidx_undetach = torch.index_select(
-                        enc_outputs_coord_unselected_gidx[0], 0, topk_indices).unsqueeze(0)
-                else:
-                    topk_proposals_gidx = torch.topk(enc_outputs_class_unselected_gidx.max(-1)[0], topk, dim=1)[1] # bs, nq
-                    refpoint_embed_gidx_undetach = torch.gather(
-                        enc_outputs_coord_unselected_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, 4)) # unsigmoid
+                topk_proposals_gidx = torch.topk(enc_outputs_class_unselected_gidx.max(-1)[0], topk, dim=1)[1] # bs, nq
+                refpoint_embed_gidx_undetach = torch.gather(
+                    enc_outputs_coord_unselected_gidx, 1, topk_proposals_gidx.unsqueeze(-1).expand(-1, -1, 4)) # unsigmoid
                 # for decoder layer, detached as initial ones, (bs, nq, 4)
                 refpoint_embed_gidx = refpoint_embed_gidx_undetach.detach()
                 
-                # get memory tgt
-                if self._aidge_export:
-                    tgt_undetach_gidx = torch.index_select(
-                        output_memory_gidx[0], 0, topk_indices).unsqueeze(0)
-                else:
-                    tgt_undetach_gidx = torch.gather(
-                        output_memory_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, self.d_model))
+                tgt_undetach_gidx = torch.gather(
+                    output_memory_gidx, 1, topk_proposals_gidx.unsqueeze(-1).expand(-1, -1, self.d_model))
                 
                 refpoint_embed_ts.append(refpoint_embed_gidx)
                 memory_ts.append(tgt_undetach_gidx)
