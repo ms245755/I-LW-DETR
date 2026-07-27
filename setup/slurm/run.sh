@@ -39,11 +39,7 @@ Workflows:
   ptq <scenario>        Runs setup/ptq/<scenario>.sh
   qat <scenario>        Runs setup/qat/<scenario>.sh
 
-PTQ/QAT scenarios:
-  fully_quantized
-  vit_only
-  vit_projector
-  vit_projector_transformer_float_head
+PTQ/QAT supports only the fully_quantized scenario.
 
 Factory AI environment overrides:
   CONDA_SH              Conda initialization script
@@ -97,14 +93,11 @@ case "$workflow" in
     fi
     scenario="$1"
     shift
-    case "$scenario" in
-      fully_quantized|vit_only|vit_projector|vit_projector_transformer_float_head) ;;
-      *)
-        echo "Unsupported $workflow scenario: $scenario" >&2
-        usage
-        exit 2
-        ;;
-    esac
+    if [[ "$scenario" != "fully_quantized" ]]; then
+      echo "Unsupported $workflow scenario: $scenario (only fully_quantized is available)" >&2
+      usage
+      exit 2
+    fi
     command=(bash "setup/$workflow/$scenario.sh" "$@")
     ;;
   -h|--help)

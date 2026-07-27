@@ -112,78 +112,6 @@ def get_args_parser():
                         choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--out_feature_indexes', default=[-1], type=int, nargs='+', help='only for vit now')
-    parser.add_argument('--quant_model_components', default=None, type=str, nargs='+',
-                        choices=('backbone', 'transformer'),
-                        help='Top-level model components to quantize when a quantized model is used.')
-    parser.add_argument('--backbone_quant_components', default=['vit', 'projector'], type=str, nargs='+',
-                        choices=('vit', 'projector'),
-                        help='Backbone components to quantize when a quantized model is used.')
-    parser.add_argument('--encoder_quant_blocks', default=None, type=int, nargs='+',
-                        help='ViT encoder block indexes to quantize. Default: all blocks.')
-    parser.add_argument('--encoder_quant_components',
-                        default=['linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm'],
-                        type=str, nargs='+',
-                        choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm'),
-                        help='Operation families to quantize inside quantized ViT blocks.')
-    parser.add_argument('--projector_quant_components',
-                        default=['conv2d', 'gelu', 'layernorm'],
-                        type=str, nargs='+',
-                        choices=('linear', 'conv2d', 'matmul', 'softmax', 'gelu', 'layernorm', 'silu'),
-                        help='Operation families to quantize inside the projector. Only conv2d, gelu, and layernorm are used by the projector today.')
-    parser.add_argument('--transformer_quant_components',
-                        default=['self_attn', 'cross_attn', 'ffn', 'norm', 'refpoint', 'two_stage', 'decoder_output_norm'],
-                        type=str, nargs='+',
-                        choices=(
-                            'self_attn', 'cross_attn', 'ffn', 'norm', 'refpoint', 'two_stage', 'decoder_output_norm',
-                            'none'
-                        ),
-                        help='Large transformer decoder blocks to quantize.')
-    parser.add_argument('--decoder_quant_blocks', default=None, type=int, nargs='+',
-                        help='Decoder layer indexes to quantize. Default: all decoder layers.')
-    parser.add_argument('--decoder_quant_norms', default=None, type=str, nargs='+',
-                        choices=('norm1', 'norm2', 'norm3', 'none'),
-                        help='Decoder LayerNorm modules to quantize when transformer layernorm quantization is enabled. Default: all decoder norms.')
-    parser.add_argument('--decoder_self_attn_quant_components',
-                        default=None,
-                        type=str, nargs='+',
-                        choices=('linear', 'matmul', 'softmax', 'none'),
-                        help='Subcomponents to quantize inside decoder self-attention when self_attn is enabled.')
-    parser.add_argument('--decoder_cross_attn_quant_components',
-                        default=None,
-                        type=str, nargs='+',
-                        choices=('value_proj', 'sampling_offsets', 'attention_weights', 'softmax', 'grid_sample_core', 'weighted_sum', 'output_proj', 'core', 'all', 'none'),
-                        help='Subcomponents to quantize inside decoder deformable cross-attention when cross_attn is enabled.')
-    parser.add_argument('--decoder_ffn_quant_components',
-                        default=None,
-                        type=str, nargs='+',
-                        choices=('linear', 'none'),
-                        help='Subcomponents to quantize inside decoder FFN when ffn is enabled.')
-    parser.add_argument('--decoder_refpoint_quant_components',
-                        default=None,
-                        type=str, nargs='+',
-                        choices=('linear', 'sine_embed', 'coord_proj', 'none'),
-                        help='Subcomponents to quantize inside decoder reference-point/query-position path when refpoint is enabled.')
-    parser.add_argument('--decoder_two_stage_quant_components',
-                        default=None,
-                        type=str, nargs='+',
-                        choices=('proposal', 'enc_output', 'enc_output_norm', 'class_head', 'bbox_head', 'bbox_reparam', 'selected_inputs', 'none'),
-                        help='Subcomponents to quantize inside the optional two-stage decoder proposal path when two_stage is enabled.')
-    parser.add_argument('--decoder_output_norm_quant_components',
-                        default=None,
-                        type=str, nargs='+',
-                        choices=('layernorm', 'output_qact', 'none'),
-                        help='Subcomponents to quantize in the final decoder output norm when decoder_output_norm is enabled.')
-    parser.add_argument('--lwdetr_quant_components',
-                        default=['linear'],
-                        type=str, nargs='+',
-                        choices=('linear', 'exp', 'none'),
-                        help='Operation families to quantize inside LW-DETR prediction heads.')
-    parser.add_argument('--transformer_exp_mode', default='ivit', type=str,
-                        choices=('float', 'ivit'),
-                        help='Use float exp or IViTExp in quantized transformer bbox reparameterization paths.')
-    parser.add_argument('--lwdetr_exp_mode', default='ivit', type=str,
-                        choices=('float', 'ivit'),
-                        help='Use float exp or IViTExp in quantized LW-DETR bbox head reparameterization.')
     parser.add_argument('--act_observer', default='ema_minmax', type=str,
                         choices=('ema_minmax', 'percentile', 'mean'),
                         help='Activation observer used by IViTAct during calibration/QAT.')
@@ -230,16 +158,10 @@ def get_args_parser():
     parser.add_argument('--bbox_reparam', action='store_true')
     parser.add_argument('--easy_quantize', default=False, action='store_true',
                         help='use quantization-friendly float components: learned ref pos encoding and nearest deformable sampling')
-    parser.add_argument('--decoder_cross_attn_float', default=False, action='store_true',
-                        help='keep quantized decoder deformable cross-attention in a float fallback path')
     parser.add_argument('--decoder_cross_attn_value_per_channel', default=False, action='store_true',
                         help='use per-channel activation scaling for quantized decoder deformable-attention value projection')
-    parser.add_argument('--decoder_two_stage_float', default=False, action='store_true',
-                        help='keep two-stage proposal heads and top-k selection in float before requantizing selected decoder inputs')
     parser.add_argument('--decoder_norm_output_qact', default=False, action='store_true',
                         help='add an activation quantizer after the final quantized decoder norm')
-    parser.add_argument('--decoder_refpoint_head_float', default=False, action='store_true',
-                        help='keep decoder reference-point MLP heads in float even when transformer linear quantization is enabled')
 
     # * Matcher
     parser.add_argument('--set_cost_class', default=2, type=float,

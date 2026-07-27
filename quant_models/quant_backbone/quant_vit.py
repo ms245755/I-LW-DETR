@@ -25,7 +25,6 @@ from util.box_ops import box_cxcywh_to_xyxy
 from quant_models.fake_quantized.layers import *
 from util.utils import init_weights
 from quant_models.quant_blocks import *
-from quant_models.quant_blocks import _component_set
 from models.backbone.vit import Block
 from util.decorators import save_tensor_from_pathname
 
@@ -97,9 +96,6 @@ class IViT(nn.Module):
         num_bits: int =8,
         observe_stat = False,
         block_name = "",
-        quant_blocks=None,
-        quant_components=None,
-        quant_stem=True,
     ):
         """
         Args:
@@ -127,10 +123,6 @@ class IViT(nn.Module):
         """
         super().__init__()
         self.pretrain_use_cls_token = pretrain_use_cls_token
-        self.quant_stem = quant_stem
-        self.quant_blocks = set(range(depth)) if quant_blocks is None else set(quant_blocks)
-        self.quant_components = _component_set(quant_components)
-        self.block_is_quant = []
 
         self.patch_embed = IPatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -140,7 +132,6 @@ class IViT(nn.Module):
             num_bits=num_bits,
             observe_stat = observe_stat,
             block_name = block_name + "1_patchembed/",
-            quant_components=self.quant_components if self.quant_stem else [],
         )
 
         if use_abs_pos:
@@ -156,37 +147,21 @@ class IViT(nn.Module):
 
         self.blocks = nn.ModuleList()
         for i in range(depth):
-            if i in self.quant_blocks:
-                block = IBlock(
-                    dim=embed_dim,
-                    heads=num_heads,
-                    mlp_dim=int(mlp_ratio*embed_dim),
-                    drop_path=dpr[i],
-                    window=True if i in window_block_indexes else False,
-                    gelu_n=gelu_n,
-                    gelu_lambda=gelu_lambda,
-                    dropout= dropout,
-                    qkv_bias=qkv_bias,
-                    num_bits=num_bits,
-                    use_cae=use_cae,
-                    observe_stat = observe_stat,
-                    block_name = block_name + f"block{i}/",
-                    quant_components=self.quant_components,
-                )
-                self.block_is_quant.append(True)
-            else:
-                block = Block(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    drop_path=dpr[i],
-                    window=True if i in window_block_indexes else False,
-                    use_cae=use_cae,
-                    observe_stat=observe_stat,
-                    block_name=block_name + f"block{i}/",
-                )
-                self.block_is_quant.append(False)
+            block = IBlock(
+                dim=embed_dim,
+                heads=num_heads,
+                mlp_dim=int(mlp_ratio*embed_dim),
+                drop_path=dpr[i],
+                window=True if i in window_block_indexes else False,
+                gelu_n=gelu_n,
+                gelu_lambda=gelu_lambda,
+                dropout=dropout,
+                qkv_bias=qkv_bias,
+                num_bits=num_bits,
+                use_cae=use_cae,
+                observe_stat=observe_stat,
+                block_name=block_name + f"block{i}/",
+            )
             if use_act_checkpoint:
                 block = checkpoint_wrapper(block)
             self.blocks.append(block)
@@ -229,9 +204,7 @@ class IViT(nn.Module):
 
     def forward(self, x):
         save_tensor_from_pathname(x=x, component_path=self.block_name+"0_input", observe_stat=self.observe_stat)
-        act_scaling_factor = None
-        if self.quant_stem and getattr(self.patch_embed, "quant_conv", False):
-            x, act_scaling_factor = self.qact_input(x=x, act_scaling_factor=None)
+        x, act_scaling_factor = self.qact_input(x=x, act_scaling_factor=None)
 
         x, act_scaling_factor = self.patch_embed(x, act_scaling_factor)
 
@@ -239,13 +212,10 @@ class IViT(nn.Module):
             x_pos = get_abs_pos(
                     self.pos_embed, self.pretrain_use_cls_token, (x.shape[1], x.shape[2])
                 )
-            if act_scaling_factor is None:
-                x = x + x_pos
-            else:
-                x_pos, pos_scale = self.qact_pos(x_pos, act_scaling_factor=None)
-                x, act_scaling_factor = add_tensor_scale(
-                    x, act_scaling_factor, x_pos, pos_scale
-                )
+            x_pos, pos_scale = self.qact_pos(x_pos, act_scaling_factor=None)
+            x, act_scaling_factor = add_tensor_scale(
+                x, act_scaling_factor, x_pos, pos_scale
+            )
         B, H, W, C = x.shape
         assert (H % 4 == 0) and (W % 4 == 0)
         h, w = H // 4, W // 4
@@ -254,11 +224,7 @@ class IViT(nn.Module):
             0, 1, 3, 2, 4, 5).reshape(B * 16, h * w, C)
         out = []
         for idx, blk in enumerate(self.blocks):
-            if self.block_is_quant[idx]:
-                x, act_scaling_factor = blk(x, mask=None, act_scaling_factor=act_scaling_factor)
-            else:
-                x = blk(x, mask=None)
-                act_scaling_factor = None
+            x, act_scaling_factor = blk(x, mask=None, act_scaling_factor=act_scaling_factor)
             if self._out_features[idx]:
                 out.append((x.reshape(B, 4, 4, h, w, C).permute(
                     0, 5, 1, 3, 2, 4).reshape(B, C, H, W), act_scaling_factor))

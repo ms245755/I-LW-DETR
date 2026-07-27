@@ -33,17 +33,7 @@ from .fake_quantized.layers import *
 from .quant_backbone import build_backbone
 from .quant_transformer import build_transformer as build_quant_transformer
 from .quant_transformer import IMLP as TransformerIMLP
-from .quant_transformer import (
-    ScaleLinear,
-    _add_tensor_scale,
-    _component_set,
-    _concat_optional_tensor_scale,
-    _exp_tensor_scale,
-    _multiply_tensor_scale,
-)
 from models.matcher import build_matcher
-from models.lwdetr import LWDETR, MLP as FloatMLP
-from models.transformer import build_transformer as build_float_transformer
 
 class ILWDETR(nn.Module):
     """ This is the Group DETR v3 module that performs object detection """
@@ -57,8 +47,6 @@ class ILWDETR(nn.Module):
                  two_stage=False,
                  lite_refpoint_refine=False,
                  bbox_reparam=False,
-                 lwdetr_quant_components=None,
-                 exp_mode="ivit",
                  observe_stat=False,
                  block_name="observed_tensor/quant/lwdetr/"):
         """ Initializes the model.
@@ -73,19 +61,13 @@ class ILWDETR(nn.Module):
             lite_refpoint_refine: TODO
         """
         super().__init__()
-        self.quant_components = _component_set(lwdetr_quant_components)
-        if exp_mode not in {"float", "ivit"}:
-            raise ValueError(f"unknown LW-DETR exp_mode: {exp_mode}")
-        self.exp_mode = exp_mode
         self.num_queries = num_queries
         self.transformer = transformer
-        self.transformer_uses_quant_scales = self.transformer.__class__.__module__.startswith("quant_models.")
         self.observe_stat = observe_stat
         self.block_name = block_name
         hidden_dim = transformer.d_model
-        linear_cls = IViTLinear if "linear" in self.quant_components else ScaleLinear
-        self.class_embed = linear_cls(hidden_dim, num_classes)
-        self.bbox_embed = TransformerIMLP(hidden_dim, hidden_dim, 4, 3, quant_components=self.quant_components)
+        self.class_embed = IViTLinear(hidden_dim, num_classes)
+        self.bbox_embed = TransformerIMLP(hidden_dim, hidden_dim, 4, 3)
 
         query_dim=4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -94,7 +76,6 @@ class ILWDETR(nn.Module):
         self.qact_refpoint = IViTAct()
         self.qact_query_feat = IViTAct()
         self.qact_hs_head = IViTAct()
-        self.qact_hs_enc = IViTAct()
         self.qact_bbox_delta_xy = IViTAct()
         self.qact_bbox_delta_wh = IViTAct(activation_bit=16)
         self.int_exp = IViTExp(output_bit=16)
@@ -120,15 +101,8 @@ class ILWDETR(nn.Module):
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
 
-        if self.transformer_uses_quant_scales:
-            transformer_class_embed = self.class_embed
-            transformer_bbox_embed = self.bbox_embed
-        else:
-            transformer_class_embed = nn.Linear(hidden_dim, num_classes)
-            transformer_bbox_embed = FloatMLP(hidden_dim, hidden_dim, 4, 3)
-            transformer_class_embed.bias.data = torch.ones(num_classes) * bias_value
-            nn.init.constant_(transformer_bbox_embed.layers[-1].weight.data, 0)
-            nn.init.constant_(transformer_bbox_embed.layers[-1].bias.data, 0)
+        transformer_class_embed = self.class_embed
+        transformer_bbox_embed = self.bbox_embed
 
         if not self.lite_refpoint_refine:
             self.transformer.decoder.bbox_embed = transformer_bbox_embed
@@ -164,16 +138,6 @@ class ILWDETR(nn.Module):
         delta_xy = outputs_coord_delta[..., :2]
         delta_wh = outputs_coord_delta[..., 2:]
 
-        if outputs_coord_delta_scale is None:
-            if "exp" in self.quant_components and self.exp_mode == "ivit":
-                delta_wh, delta_wh_scale = self._qact_channel_last(
-                    self.qact_bbox_delta_wh,
-                    delta_wh,
-                    None,
-                )
-                return delta_xy, None, delta_wh, delta_wh_scale
-            return delta_xy, None, delta_wh, None
-
         delta_xy, delta_xy_scale = self._qact_channel_last(
             self.qact_bbox_delta_xy,
             delta_xy,
@@ -188,9 +152,7 @@ class ILWDETR(nn.Module):
         return delta_xy, delta_xy_scale, delta_wh, delta_wh_scale
 
     def _exp(self, x, scale):
-        if self.exp_mode == "float":
-            return x.clamp(min=-20.0, max=20.0).exp(), None
-        return _exp_tensor_scale(self.int_exp, x, scale)
+        return self.int_exp(x, scale)
 
     def _run_transformer(
         self,
@@ -202,25 +164,15 @@ class ILWDETR(nn.Module):
         query_feat_weight,
         query_scale,
     ):
-        if self.transformer_uses_quant_scales:
-            return self.transformer(
-                srcs,
-                masks,
-                poss,
-                refpoint_embed_weight,
-                refpoint_scale,
-                query_feat_weight,
-                query_scale,
-            )
-
-        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
+        return self.transformer(
             srcs,
             masks,
             poss,
             refpoint_embed_weight,
+            refpoint_scale,
             query_feat_weight,
+            query_scale,
         )
-        return hs, None, ref_unsigmoid, None, hs_enc, None, ref_enc
 
     def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
@@ -257,21 +209,15 @@ class ILWDETR(nn.Module):
             refpoint_embed_weight = self.refpoint_embed.weight[:self.num_queries]
             query_feat_weight = self.query_feat.weight[:self.num_queries]
 
-        refpoint_scale = None
-        query_scale = None
-        if self.transformer_uses_quant_scales:
-            refpoint_embed_weight, refpoint_scale = self.qact_refpoint(refpoint_embed_weight, None)
-            query_feat_weight, query_scale = self.qact_query_feat(query_feat_weight, None)
+        refpoint_embed_weight, refpoint_scale = self.qact_refpoint(refpoint_embed_weight, None)
+        query_feat_weight, query_scale = self.qact_query_feat(query_feat_weight, None)
 
         hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self._run_transformer(
             srcs, masks, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
         save_tensor_from_pathname(hs, self.block_name + "0_transformer_hs", observe_stat=self.observe_stat)
         save_tensor_from_pathname(ref_unsigmoid, self.block_name + "1_transformer_ref_unsigmoid", observe_stat=self.observe_stat)
 
-        if "linear" in self.quant_components:
-            hs_head, hs_head_scale = self.qact_hs_head(hs, hs_scale)
-        else:
-            hs_head, hs_head_scale = hs, None
+        hs_head, hs_head_scale = self.qact_hs_head(hs, hs_scale)
         save_tensor_from_pathname(hs_head, self.block_name + "2_head_input", observe_stat=self.observe_stat)
 
         if self.bbox_reparam:
@@ -280,13 +226,13 @@ class ILWDETR(nn.Module):
             outputs_coord_delta_xy, outputs_coord_delta_xy_scale, outputs_coord_delta_wh, outputs_coord_delta_wh_scale = (
                 self._split_bbox_delta_groups(outputs_coord_delta, outputs_coord_delta_scale)
             )
-            tmp, tmp_scale = _multiply_tensor_scale(
+            tmp, tmp_scale = multiply_tensor_scale(
                 outputs_coord_delta_xy,
                 outputs_coord_delta_xy_scale,
                 ref_unsigmoid[..., 2:],
                 ref_scale,
             )
-            outputs_coord_cxcy, outputs_coord_cxcy_scale = _add_tensor_scale(
+            outputs_coord_cxcy, outputs_coord_cxcy_scale = add_tensor_scale(
                 tmp,
                 tmp_scale,
                 ref_unsigmoid[..., :2],
@@ -294,20 +240,20 @@ class ILWDETR(nn.Module):
             )
             # outputs_coord_delta_scale = None
             tmp, tmp_scale = self._exp(outputs_coord_delta_wh, outputs_coord_delta_wh_scale)
-            outputs_coord_wh, outputs_coord_wh_scale = _multiply_tensor_scale(
+            outputs_coord_wh, outputs_coord_wh_scale = multiply_tensor_scale(
                 tmp,
                 tmp_scale,
                 ref_unsigmoid[..., 2:],
                 ref_scale,
             )
-            outputs_coord, _ = _concat_optional_tensor_scale(
+            outputs_coord, _ = concat_list_tensor_scale(
                 [(outputs_coord_cxcy, outputs_coord_cxcy_scale), (outputs_coord_wh, outputs_coord_wh_scale)],
                 dim=-1,
             )
         else:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
             save_tensor_from_pathname(outputs_coord_delta, self.block_name + "3_bbox_delta", observe_stat=self.observe_stat)
-            outputs_coord, _ = _add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
+            outputs_coord, _ = add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
             outputs_coord = outputs_coord.sigmoid()
         save_tensor_from_pathname(outputs_coord, self.block_name + "4_bbox_output", observe_stat=self.observe_stat)
 
@@ -321,17 +267,12 @@ class ILWDETR(nn.Module):
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
         if self.two_stage:
-            if self.transformer_uses_quant_scales and hs_enc_scale is None:
-                hs_enc, hs_enc_scale = self.qact_hs_enc(hs_enc, None)
             save_tensor_from_pathname(hs_enc, self.block_name + "8_encoder_head/0_hs_enc", observe_stat=self.observe_stat)
             hs_enc_list = hs_enc.split(self.num_queries, dim=1)
             cls_enc = []
             group_detr = self.group_detr if self.training else 1
             for g_idx in range(group_detr):
-                if self.transformer_uses_quant_scales:
-                    cls_enc_gidx = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx], hs_enc_scale)
-                else:
-                    cls_enc_gidx = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx])
+                cls_enc_gidx = self.transformer.enc_out_class_embed[g_idx](hs_enc_list[g_idx], hs_enc_scale)
                 if isinstance(cls_enc_gidx, tuple):
                     cls_enc_gidx = cls_enc_gidx[0]
                 cls_enc.append(cls_enc_gidx)
@@ -346,51 +287,45 @@ class ILWDETR(nn.Module):
         # only use one group in inference
         refpoint_embed_weight = self.refpoint_embed.weight[:self.num_queries]
         query_feat_weight = self.query_feat.weight[:self.num_queries]
-        refpoint_scale = None
-        query_scale = None
-        if self.transformer_uses_quant_scales:
-            refpoint_embed_weight, refpoint_scale = self.qact_refpoint(refpoint_embed_weight, None)
-            query_feat_weight, query_scale = self.qact_query_feat(query_feat_weight, None)
+        refpoint_embed_weight, refpoint_scale = self.qact_refpoint(refpoint_embed_weight, None)
+        query_feat_weight, query_scale = self.qact_query_feat(query_feat_weight, None)
 
         hs, hs_scale, ref_unsigmoid, ref_scale, hs_enc, hs_enc_scale, ref_enc = self._run_transformer(
             srcs, None, poss, refpoint_embed_weight, refpoint_scale, query_feat_weight, query_scale)
 
-        if "linear" in self.quant_components:
-            hs_head, hs_head_scale = self.qact_hs_head(hs, None)
-        else:
-            hs_head, hs_head_scale = hs, None
+        hs_head, hs_head_scale = self.qact_hs_head(hs, hs_scale)
 
         if self.bbox_reparam:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
             outputs_coord_delta_xy, outputs_coord_delta_xy_scale, outputs_coord_delta_wh, outputs_coord_delta_wh_scale = (
                 self._split_bbox_delta_groups(outputs_coord_delta, outputs_coord_delta_scale)
             )
-            tmp, tmp_scale = _multiply_tensor_scale(
+            tmp, tmp_scale = multiply_tensor_scale(
                 outputs_coord_delta_xy,
                 outputs_coord_delta_xy_scale,
                 ref_unsigmoid[..., 2:],
                 ref_scale,
             )
-            outputs_coord_cxcy, outputs_coord_cxcy_scale = _add_tensor_scale(
+            outputs_coord_cxcy, outputs_coord_cxcy_scale = add_tensor_scale(
                 tmp,
                 tmp_scale,
                 ref_unsigmoid[..., :2],
                 ref_scale,
             )
             tmp, tmp_scale = self._exp(outputs_coord_delta_wh, outputs_coord_delta_wh_scale)
-            outputs_coord_wh, outputs_coord_wh_scale = _multiply_tensor_scale(
+            outputs_coord_wh, outputs_coord_wh_scale = multiply_tensor_scale(
                 tmp,
                 tmp_scale,
                 ref_unsigmoid[..., 2:],
                 ref_scale,
             )
-            outputs_coord, _ = _concat_optional_tensor_scale(
+            outputs_coord, _ = concat_list_tensor_scale(
                 [(outputs_coord_cxcy, outputs_coord_cxcy_scale), (outputs_coord_wh, outputs_coord_wh_scale)],
                 dim=-1,
             )
         else:
             outputs_coord_delta, outputs_coord_delta_scale = self.bbox_embed(hs_head, hs_head_scale)
-            outputs_coord, _ = _add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
+            outputs_coord, _ = add_tensor_scale(outputs_coord_delta, outputs_coord_delta_scale, ref_unsigmoid, ref_scale)
             outputs_coord = outputs_coord.sigmoid()
         outputs_class, _ = self.class_embed(hs_head, hs_head_scale)
         return outputs_coord, outputs_class
@@ -758,30 +693,11 @@ def build(args):
     num_classes = resolve_num_classes(args)
     device = torch.device(args.device)
 
-    quant_model_components = set(getattr(args, "quant_model_components", ["backbone"]) or [])
-    transformer_quant_components = _component_set(getattr(args, "transformer_quant_components", None))
-    lwdetr_quant_components = _component_set(getattr(args, "lwdetr_quant_components", None))
-    quantize_transformer = "transformer" in quant_model_components and bool(transformer_quant_components)
-    quantize_lwdetr = bool(lwdetr_quant_components)
-
-    effective_quant_model_components = set(quant_model_components)
-    if not quantize_transformer:
-        effective_quant_model_components.discard("transformer")
-    args.quant_model_components = list(effective_quant_model_components)
-
     backbone = build_backbone(args)
 
     args.num_feature_levels = len(args.projector_scale)
-    transformer = build_quant_transformer(args) if quantize_transformer else build_float_transformer(args)
-    print(effective_quant_model_components)
-    model_cls = ILWDETR if (quantize_transformer or quantize_lwdetr) else LWDETR
-
-    model_kwargs = {}
-    model_kwargs["block_name"] = "observed_tensor/quant/lwdetr/"
-    if model_cls is ILWDETR:
-        model_kwargs["lwdetr_quant_components"] = getattr(args, "lwdetr_quant_components", None)
-        model_kwargs["exp_mode"] = getattr(args, "lwdetr_exp_mode", "ivit")
-    model = model_cls(
+    transformer = build_quant_transformer(args)
+    model = ILWDETR(
         backbone,
         transformer,
         num_classes=num_classes,
@@ -792,7 +708,7 @@ def build(args):
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
         observe_stat=getattr(args, "observe_stat", False),
-        **model_kwargs,
+        block_name="observed_tensor/quant/lwdetr/",
     )
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}

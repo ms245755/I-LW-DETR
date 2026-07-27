@@ -13,8 +13,8 @@ Run all commands from the repository root.
 | Float fine-tuning | `setup/finetune/run.sh` | `setup/slurm/run.sh finetune` |
 | Float/QR/PTQ/QAT evaluation | `setup/eval/run.sh` | `setup/slurm/run.sh eval` |
 | ONNX/TensorRT export | `setup/export/run.sh` | - |
-| PTQ | `setup/ptq/<scenario>.sh` | `setup/slurm/run.sh ptq <scenario>` |
-| QAT | `setup/qat/<scenario>.sh` | `setup/slurm/run.sh qat <scenario>` |
+| Fully quantized PTQ | `setup/ptq/fully_quantized.sh` | `setup/slurm/run.sh ptq fully_quantized` |
+| Fully quantized QAT | `setup/qat/fully_quantized.sh` | `setup/slurm/run.sh qat fully_quantized` |
 
 Model size is always one of `tiny`, `small`, or `medium`. COCO is the primary
 dataset and uses `DATASET_FILE=coco`. Other COCO-format datasets use
@@ -226,12 +226,9 @@ EASY_QUANTIZE=true \
 bash setup/export/run.sh tiny ../../data/COCO /path/to/checkpoint_quantized.pth --simplify
 ```
 
-The fully quantized defaults are backbone + transformer + LW-DETR prediction
-heads. Checkpoint-specific override variables are still accepted, including
-`ENCODER_QUANT_COMPONENTS`, `PROJECTOR_QUANT_COMPONENTS`,
-`TRANSFORMER_QUANT_COMPONENTS`, `LWDETR_QUANT_COMPONENTS`,
-`DECODER_CROSS_ATTN_FLOAT`, `DECODER_TWO_STAGE_FLOAT`, and
-`DECODER_NORM_OUTPUT_QACT`.
+The quantized export path quantizes the backbone, transformer, and LW-DETR
+prediction heads. Selecting individual blocks, layers, or operation families
+is not supported.
 
 The default output is `output/lwdetr_<size>_<dataset>/inference_model.onnx`.
 Set `OUTPUT_DIR=/path/to/export_dir` to choose a different destination.
@@ -377,20 +374,20 @@ Outputs default to `observation/visdrone_images/<model-size>/`. Use the same
 `--image-names` to select exact files. A threshold of `0.5` gives cleaner
 figures; `0.3` is useful for inspecting weak detections.
 
-## Quantization scenarios
+## Fully quantized PTQ and QAT
 
-The quantization directories contain the recommended entry points:
+The quantization directories contain one supported quantized model path:
 
 - `setup/ptq/` runs PTQ calibration.
 - `setup/qat/` runs QAT training.
-- `setup/common.sh` owns shared model-size, scenario, and component settings.
+- `setup/common.sh` owns shared model-size and workflow settings.
 - Root-level quantization scripts are compatibility wrappers. Prefer
-  `setup/ptq/<scenario>.sh` and `setup/qat/<scenario>.sh` for new runs.
+  `setup/ptq/fully_quantized.sh` and `setup/qat/fully_quantized.sh` for new runs.
 
-All scenario scripts use this form:
+The PTQ and QAT scripts use this form:
 
 ```bash
-bash setup/<ptq|qat>/<scenario>.sh /path/to/coco /path/to/checkpoint_or_checkpoint_dir
+bash setup/<ptq|qat>/fully_quantized.sh /path/to/coco /path/to/checkpoint_or_checkpoint_dir
 ```
 
 Set `MODEL_SIZE=tiny|small|medium` to select the model. The default is `tiny`.
@@ -538,16 +535,8 @@ sbatch \
   output/visdrone_small_ptq/checkpoint_calibrated.pth
 ```
 
-### Scenarios
-
-| Scenario | Script | Default quantized parts |
-| --- | --- | --- |
-| ViT only | `vit_only.sh` | Backbone ViT encoder |
-| ViT + projector | `vit_projector.sh` | Backbone ViT encoder and projector |
-| ViT + projector + transformer, float heads | `vit_projector_transformer_float_head.sh` | Backbone and transformer; LW-DETR prediction heads stay float |
-| Fully quantized | `fully_quantized.sh` | Backbone, transformer, and LW-DETR prediction heads |
-
-Scenario wrappers only set defaults. You can override almost every quantized component with environment variables.
+The quantized model always includes the ViT encoder, projector, transformer
+decoder, and LW-DETR prediction heads.
 
 ### Checkpoints
 
@@ -569,7 +558,7 @@ Override paths explicitly when needed:
 RESUME=/path/to/resume.pth \
 PRETRAINED_ENCODER=/path/to/caev2_tiny_300e_objects365.pth \
 PRETRAIN_WEIGHTS=/path/to/LWDETR_tiny_30e_objects365.pth \
-bash setup/qat/vit_projector.sh /path/to/coco /path/to/checkpoint_dir
+bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint_dir
 ```
 
 ### PTQ
@@ -580,12 +569,9 @@ PTQ loads a float/easy-quant checkpoint, calibrates observers, optionally evalua
 checkpoint_calibrated.pth
 ```
 
-Run common PTQ scenarios:
+Run PTQ:
 
 ```bash
-bash setup/ptq/vit_only.sh /path/to/coco /path/to/checkpoints
-bash setup/ptq/vit_projector.sh /path/to/coco /path/to/checkpoints
-bash setup/ptq/vit_projector_transformer_float_head.sh /path/to/coco /path/to/checkpoints
 bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoints
 ```
 
@@ -661,139 +647,20 @@ bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint_dir
 
 `EPOCHS` is the final total number of epochs, not the number of extra epochs. If the checkpoint saved `epoch=7`, `EPOCHS=20` resumes at epoch 8 and trains through epoch 19.
 
-### Component selection
-
-Use the scenario as a starting point, then override these variables to quantize only the parts you want.
-
-Top-level selection:
-
-| Variable | Values | Meaning |
-| --- | --- | --- |
-| `QUANT_MODEL_COMPONENTS` | `backbone transformer` | Top-level components to quantize |
-| `BACKBONE_QUANT_COMPONENTS` | `vit projector` | Backbone submodules to quantize |
-| `LWDETR_QUANT_COMPONENTS` | `linear` or `none` | Prediction head quantization |
-
-Backbone selection:
-
-| Variable | Values |
-| --- | --- |
-| `ENCODER_QUANT_BLOCKS` | `all` or block indexes such as `"0 2 4"` |
-| `ENCODER_QUANT_COMPONENTS` | `linear conv2d matmul softmax gelu layernorm` |
-| `PROJECTOR_QUANT_COMPONENTS` | `linear conv2d matmul softmax gelu layernorm silu` |
-
-Transformer selection:
-
-| Variable | Values |
-| --- | --- |
-| `TRANSFORMER_QUANT_COMPONENTS` | `self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm`, or `none` |
-| `DECODER_QUANT_BLOCKS` | `all` or decoder layer indexes such as `"0 2"` |
-| `DECODER_QUANT_NORMS` | `norm1 norm2 norm3`, or `none` |
-| `DECODER_SELF_ATTN_QUANT_COMPONENTS` | `linear matmul softmax`, or `none` |
-| `DECODER_CROSS_ATTN_QUANT_COMPONENTS` | `value_proj sampling_offsets attention_weights softmax grid_sample_core weighted_sum output_proj core all`, or `none` |
-| `DECODER_FFN_QUANT_COMPONENTS` | `linear`, or `none` |
-| `DECODER_REFPOINT_QUANT_COMPONENTS` | `linear sine_embed coord_proj`, or `none` |
-| `DECODER_TWO_STAGE_QUANT_COMPONENTS` | `proposal enc_output enc_output_norm class_head bbox_head bbox_reparam selected_inputs`, or `none` |
-| `DECODER_OUTPUT_NORM_QUANT_COMPONENTS` | `layernorm output_qact`, or `none` |
-
-Other quantization behavior:
-
-| Variable | Values | Meaning |
-| --- | --- | --- |
-| `TRANSFORMER_EXP_MODE` | `ivit` or `float` | Exponential path in transformer bbox reparameterization |
-| `LWDETR_EXP_MODE` | `ivit` or `float` | Exponential path in LW-DETR bbox heads |
-| `DECODER_CROSS_ATTN_FLOAT` | `true` or `false` | Keep deformable cross-attention on a float fallback path |
-| `DECODER_CROSS_ATTN_VALUE_PER_CHANNEL` | `true` or `false` | Use per-channel quantization for cross-attention value path |
-| `DECODER_TWO_STAGE_FLOAT` | `true` or `false` | Keep the two-stage proposal/top-k path float |
-| `DECODER_NORM_OUTPUT_QACT` | `true` or `false` | Add output activation quantization after decoder norms |
-| `DECODER_REFPOINT_HEAD_FLOAT` | `true` or `false` | PTQ-only runner flag to keep refpoint head float |
-
-Examples:
-
-Quantize only ViT linear and LayerNorm ops:
-
-```bash
-QUANT_MODEL_COMPONENTS=backbone \
-BACKBONE_QUANT_COMPONENTS=vit \
-ENCODER_QUANT_COMPONENTS="linear layernorm" \
-bash setup/ptq/vit_only.sh /path/to/coco /path/to/checkpoints
-```
-
-Quantize only selected ViT blocks:
-
-```bash
-ENCODER_QUANT_BLOCKS="0 3 5" \
-bash setup/ptq/vit_only.sh /path/to/coco /path/to/checkpoints
-```
-
-Quantize projector only:
-
-```bash
-QUANT_MODEL_COMPONENTS=backbone \
-BACKBONE_QUANT_COMPONENTS=projector \
-PROJECTOR_QUANT_COMPONENTS="conv2d silu layernorm" \
-bash setup/ptq/vit_projector.sh /path/to/coco /path/to/checkpoints
-```
-
-Quantize only transformer self-attention softmax:
-
-```bash
-QUANT_MODEL_COMPONENTS=transformer \
-TRANSFORMER_QUANT_COMPONENTS=self_attn \
-DECODER_SELF_ATTN_QUANT_COMPONENTS=softmax \
-LWDETR_QUANT_COMPONENTS=none \
-bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoints
-```
-
-Quantize transformer and keep prediction heads float:
-
-```bash
-TRANSFORMER_QUANT_COMPONENTS="self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm" \
-LWDETR_QUANT_COMPONENTS=none \
-bash setup/ptq/vit_projector_transformer_float_head.sh /path/to/coco /path/to/checkpoints
-```
-
-Run QAT with a narrower component set:
-
-```bash
-RESUME=/path/to/checkpoint_calibrated.pth \
-TRANSFORMER_QUANT_COMPONENTS="self_attn ffn norm" \
-DECODER_QUANT_BLOCKS="0 1" \
-LWDETR_QUANT_COMPONENTS=none \
-bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint_dir
-```
-
 ### Sweeps
 
-The PTQ sweep scripts run multiple PTQ jobs sequentially and write summaries.
-
-Sweep one ViT component at a time:
-
-```bash
-MODEL_SIZE=small \
-COMPONENTS="linear conv2d matmul softmax gelu layernorm" \
-bash setup/ptq/sweep_vit_components.sh /path/to/coco /path/to/checkpoints
-```
-
-Sweep one decoder block family at a time:
+The supported sweep compares fully quantized model sizes and implementation
+settings. It does not disable individual quantized components.
 
 ```bash
-BLOCKS="self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm" \
-bash setup/ptq/sweep_decoder_blocks.sh /path/to/coco /path/to/checkpoints
-```
-
-Sweep individual component families across ViT, projector, transformer, and heads:
-
-```bash
-CASES="vit:linear projector:conv2d transformer_self_attn:softmax lwdetr:linear" \
-bash setup/ptq/sweep_single_components.sh /path/to/coco /path/to/checkpoints
+CHECKPOINT_ROOT=/path/to/checkpoints \
+bash setup/ptq/sweep_fully_quantized_sizes.sh /path/to/coco
 ```
 
 Outputs default under:
 
 ```text
-output/ptq_vit_component_sweep/<model_size>
-output/ptq_decoder_block_sweep/<model_size>
-output/ptq_single_component_sweep/<model_size>
+output/cumulative_ptq/<case>/<model_size>/
 ```
 
 ## Legacy scripts

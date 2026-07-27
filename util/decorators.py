@@ -127,38 +127,6 @@ def is_integer_tensor(x: torch.Tensor, tol: float = 1e-6, label="Tensor") -> boo
     return True
 
 
-def quantize_input(enable_casting=False):
-    """
-    Decorator that checks if input/output tensors are integer-like *after*
-    dividing by act_scaling_factor, if provided.
-    """
-
-    def decorator(func):
-        def wrapper(self, x, *args, act_scaling_factor=None, **kwargs):
-            if enable_casting and hasattr(self, "pre_act_scaler"):
-                x, act_scaling_factor = self.pre_act_scaler(x=x, act_scaling_factor=None)
-            return func(self, x, *args, act_scaling_factor=act_scaling_factor, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-def with_pre_act_scaling(func):
-    """
-    Decorator that ensures pre_act_scaler is applied if act_scaling_factor is None.
-    Assumes the decorated method has the signature:
-        forward(self, x, act_scaling_factor=None, ...)
-    """
-
-    def wrapper(self, x, *args, act_scaling_factor=None, **kwargs):
-        if act_scaling_factor is None and hasattr(self, "pre_act_scaler"):
-            x, act_scaling_factor = self.pre_act_scaler(x, act_scaling_factor)
-        return func(self, x, *args, act_scaling_factor=act_scaling_factor, **kwargs)
-
-    return wrapper
-
-
 def plot_io_distribution(layer_name: str, save_dir: str = "./visuals/layer_distributions/"):
     """
     Decorator to plot input/output distributions of a ViT layer.

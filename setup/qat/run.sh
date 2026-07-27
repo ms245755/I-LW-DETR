@@ -12,7 +12,7 @@ fi
 
 if [[ $# -ne 2 ]]; then
   usage_common "setup/qat/run.sh"
-  echo "Set SCENARIO to one of: vit_only, vit_projector, vit_projector_transformer_float_head, fully_quantized" >&2
+  echo "Use setup/qat/fully_quantized.sh for QAT." >&2
   exit 2
 fi
 
@@ -55,9 +55,7 @@ qat_freeze_observers="${QAT_FREEZE_OBSERVERS:-false}"
 output_root="${OUTPUT_ROOT:-output}"
 output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_qat_${scenario_label}_${model_size}}"
 resume_optimizer="${RESUME_OPTIMIZER:-false}"
-decoder_cross_attn_float="${DECODER_CROSS_ATTN_FLOAT:-false}"
 decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-false}"
-decoder_two_stage_float="${DECODER_TWO_STAGE_FLOAT:-false}"
 decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
 tensorboard="${TENSORBOARD:-false}"
 tensorboard_dir="${TENSORBOARD_DIR:-}"
@@ -72,19 +70,9 @@ if [[ "$qat_freeze_observers" == "1" || "$qat_freeze_observers" == "true" || "$q
   qat_freeze_observer_args=(--qat_freeze_observers)
 fi
 
-decoder_cross_attn_float_args=()
-if [[ "$decoder_cross_attn_float" == "1" || "$decoder_cross_attn_float" == "true" || "$decoder_cross_attn_float" == "yes" ]]; then
-  decoder_cross_attn_float_args=(--decoder_cross_attn_float)
-fi
-
 decoder_cross_attn_value_per_channel_args=()
 if [[ "$decoder_cross_attn_value_per_channel" == "1" || "$decoder_cross_attn_value_per_channel" == "true" || "$decoder_cross_attn_value_per_channel" == "yes" ]]; then
   decoder_cross_attn_value_per_channel_args=(--decoder_cross_attn_value_per_channel)
-fi
-
-decoder_two_stage_float_args=()
-if [[ "$decoder_two_stage_float" == "1" || "$decoder_two_stage_float" == "true" || "$decoder_two_stage_float" == "yes" ]]; then
-  decoder_two_stage_float_args=(--decoder_two_stage_float)
 fi
 
 decoder_norm_output_qact_args=()
@@ -157,9 +145,7 @@ python -u -m torch.distributed.launch \
   --find_unused_parameters \
   "${resume_optimizer_args[@]}" \
   "${qat_freeze_observer_args[@]}" \
-  "${decoder_cross_attn_float_args[@]}" \
   "${decoder_cross_attn_value_per_channel_args[@]}" \
-  "${decoder_two_stage_float_args[@]}" \
   "${decoder_norm_output_qact_args[@]}" \
   "${tensorboard_args[@]}" \
   --pretrain_keys_modify_to_load "${pretrain_keys_modify_to_load[@]}" \

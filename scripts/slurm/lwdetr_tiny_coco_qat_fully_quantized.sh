@@ -44,14 +44,6 @@ export QAT_FREEZE_OBSERVERS="${QAT_FREEZE_OBSERVERS:-true}"
 qat_output_dir="${OUTPUT_DIR:-output/lwdetr_${MODEL_SIZE}_qat_${SCENARIO}}"
 ptq_output_dir="${PTQ_OUTPUT_DIR:-$qat_output_dir}"
 
-export QUANT_MODEL_COMPONENTS="${QUANT_MODEL_COMPONENTS:-backbone transformer}"
-export BACKBONE_QUANT_COMPONENTS="${BACKBONE_QUANT_COMPONENTS:-vit projector}"
-export ENCODER_QUANT_BLOCKS="${ENCODER_QUANT_BLOCKS:-all}"
-export ENCODER_QUANT_COMPONENTS="${ENCODER_QUANT_COMPONENTS:-linear conv2d matmul softmax gelu layernorm}"
-export PROJECTOR_QUANT_COMPONENTS="${PROJECTOR_QUANT_COMPONENTS:-conv2d gelu silu layernorm}"
-export TRANSFORMER_QUANT_COMPONENTS="${TRANSFORMER_QUANT_COMPONENTS:-self_attn cross_attn ffn norm refpoint two_stage decoder_output_norm}"
-export LWDETR_QUANT_COMPONENTS="${LWDETR_QUANT_COMPONENTS:-linear}"
-
 coco_path="${COCO_PATH:-${1:-../../../../../data/dataset/coco}}"
 checkpoint_path="${CHECKPOINT_PATH:-${2:-pretrain_weights/checkpoint_easy_quant.pth}}"
 if [[ -f "$checkpoint_path" ]]; then

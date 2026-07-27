@@ -62,13 +62,7 @@ def load_resume_checkpoint(
         return ema_m
 
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-    quant_model_components = set(args.quant_model_components or [])
-    backbone_quant_components = set(args.backbone_quant_components or [])
-    if (
-        (args.quant or args.qat or args.calib)
-        and 'backbone' in quant_model_components
-        and 'projector' in backbone_quant_components
-    ):
+    if args.quant or args.qat or args.calib:
         checkpoint['model'] = fuse_bn_into_conv_in_state_dict(checkpoint['model'])
     checkpoint['model'] = adapt_checkpoint_keys_for_model(checkpoint['model'], model_without_ddp)
     stat = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)

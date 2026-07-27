@@ -165,13 +165,7 @@ def load_export_checkpoint(model, args):
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
     state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
 
-    quant_model_components = set(args.quant_model_components or [])
-    backbone_quant_components = set(args.backbone_quant_components or [])
-    if (
-        (args.quant or args.qat or args.calib)
-        and 'backbone' in quant_model_components
-        and 'projector' in backbone_quant_components
-    ):
+    if args.quant or args.qat or args.calib:
         state_dict = fuse_bn_into_conv_in_state_dict(state_dict)
 
     state_dict = adapt_checkpoint_keys_for_model(state_dict, model)

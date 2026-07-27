@@ -733,11 +733,6 @@ class IViTLayerNorm(nn.LayerNorm):
     def forward(self, x, act_scaling_factor=None):
         # Normalization: computes mean and variance(std)
         dim = self._normalized_dim(x)
-        # if act_scaling_factor is None:
-        #     with torch.no_grad():
-        #         target = 2.0 ** 7 - 1
-        #         max_abs = x.detach().abs().amax(dim=dim, keepdim=True)
-        #         act_scaling_factor = torch.clamp(max_abs / target, min=torch.finfo(x.dtype).eps)
         x_int = round_ste.apply(x / act_scaling_factor)
         mean_int = round_ste.apply(x_int.sum(dim=dim, keepdim=True) / x_int.shape[dim])
 
@@ -990,22 +985,6 @@ class IViTSiLU(nn.Module):
 
         # For SiLU, sigmoid input scale is just act_scaling_factor (no 1.702 multiplier)
         scaling_factor_sig = act_scaling_factor
-
-        # A = 2.0
-        # A_int = round_ste.apply(
-        #     torch.tensor(A, device=x.device, dtype=x.dtype) / act_scaling_factor
-        # )
-
-        # pos_mask = pre_x_int > 0
-
-        # x_int_max_base = torch.clamp(pre_x_int, min=0)
-
-        # x_int_max = torch.where(
-        #     pos_mask,
-        #     pre_x_int + A_int,
-        #     x_int_max_base
-        # )
-
 
         x_int_max = torch.clamp(pre_x_int, min=0)
         x_int = pre_x_int - x_int_max

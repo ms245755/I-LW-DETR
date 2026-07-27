@@ -22,13 +22,6 @@ Optional environment variables:
   DEVICE                       Default: cuda
   OUTPUT_DIR                   Default: output/infer/<size>_<variant>
   CONFIDENCE_THRESHOLD         Default: 0.5
-  SCENARIO                     Default: fully_quantized (QAT only)
-  QUANT_MODEL_COMPONENTS       See setup/common.sh
-  BACKBONE_QUANT_COMPONENTS    See setup/common.sh
-  ENCODER_QUANT_COMPONENTS     See setup/common.sh
-  PROJECTOR_QUANT_COMPONENTS   See setup/common.sh
-  TRANSFORMER_QUANT_COMPONENTS See setup/common.sh
-  LWDETR_QUANT_COMPONENTS      See setup/common.sh
 
 Examples:
   bash setup/infer/run.sh tiny qr pretrain_weights/coco/tiny/checkpoint_easy_quant.pth demo/images/catdog.jpg
@@ -116,26 +109,6 @@ model_args=(
   --dataset_file "$dataset_file"
   --easy_quantize
 )
-
-if [[ "$variant" == "qat" ]]; then
-  model_args+=(
-    --quant_model_components "${quant_model_component_args[@]}"
-    --backbone_quant_components "${backbone_quant_component_args[@]}"
-    "${quant_block_args[@]}"
-    --encoder_quant_components "${encoder_quant_component_args[@]}"
-    --projector_quant_components "${projector_quant_component_args[@]}"
-    --transformer_quant_components "${transformer_quant_component_args[@]}"
-    "${decoder_quant_block_args[@]}"
-    "${decoder_quant_norm_args[@]}"
-    "${decoder_self_attn_quant_component_args[@]}"
-    "${decoder_cross_attn_quant_component_args[@]}"
-    "${decoder_ffn_quant_component_args[@]}"
-    "${decoder_refpoint_quant_component_args[@]}"
-    "${decoder_two_stage_quant_component_args[@]}"
-    "${decoder_output_norm_quant_component_args[@]}"
-    --lwdetr_quant_components "${lwdetr_quant_component_args[@]}"
-  )
-fi
 
 mkdir -p "$output_dir"
 filename="$(basename "$image_path")"

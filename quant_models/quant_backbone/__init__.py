@@ -62,11 +62,6 @@ def build_backbone(args):
             out_feature_indexes=args.out_feature_indexes,
             projector_scale=args.projector_scale,
             observe_stat=args.observe_stat,
-            quant_model_components=getattr(args, "quant_model_components", None),
-            backbone_quant_components=getattr(args, "backbone_quant_components", None),
-            encoder_quant_blocks=getattr(args, "encoder_quant_blocks", None),
-            encoder_quant_components=getattr(args, "encoder_quant_components", None),
-            projector_quant_components=getattr(args, "projector_quant_components", None),
         )
 
     model = Joiner(backbone, position_embedding)

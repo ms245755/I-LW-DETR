@@ -21,7 +21,6 @@ from torch import nn
 from util.misc import NestedTensor, is_main_process
 
 from .base import BackboneBase
-from models.backbone.projector import MultiScaleProjector
 from quant_models.quant_backbone.quant_vit import IViT
 from quant_models.quant_backbone.quant_projector import IMultiScaleProjector
 __all__ = ["Backbone"]
@@ -40,20 +39,9 @@ class Backbone(BackboneBase):
                  projector_scale: list=None,
                  observe_stat = False,
                  block_name = "observed_tensor/quant/backbone/",
-                 quant_model_components=None,
-                 backbone_quant_components=None,
-                 encoder_quant_blocks=None,
-                 encoder_quant_components=None,
-                 projector_quant_components=None,
                  ):
         super().__init__()
         self.name = name
-        self.backbone_quant_components = {"vit", "projector"} if backbone_quant_components is None else set(backbone_quant_components)
-        self.quant_model_components = {"backbone"} if quant_model_components is None else set(quant_model_components)
-        self.quantize_backbone = "backbone" in self.quant_model_components
-        self.quantize_vit = self.quantize_backbone and "vit" in self.backbone_quant_components
-        self.quantize_projector = self.quantize_backbone and "projector" in self.backbone_quant_components
-        self.return_quant_scales = "transformer" in self.quant_model_components
         if 'vit' in name:
             if name == 'vit_tiny':
                 img_size, embed_dim, depth, num_heads, dp = 1024, 192, 12, 12, 0.
@@ -86,9 +74,6 @@ class Backbone(BackboneBase):
                 use_cae=True,
                 observe_stat=observe_stat,
                 block_name=block_name+"vit/",
-                quant_blocks=encoder_quant_blocks if self.quantize_vit else [],
-                quant_components=encoder_quant_components,
-                quant_stem=self.quantize_vit,
             )
             # load pretrain model in main_process
             if pretrained_encoder is not None:
@@ -117,14 +102,12 @@ class Backbone(BackboneBase):
         )
         scale_factors = [level2scalefactor[lvl] for lvl in self.projector_scale]
 
-        projector_cls = IMultiScaleProjector if self.quantize_projector else MultiScaleProjector
-        self.projector = projector_cls(
+        self.projector = IMultiScaleProjector(
             in_channels=self.encoder._out_feature_channels,
             out_channels=out_channels,
             scale_factors=scale_factors,
             observe_stat=observe_stat,
             block_name=block_name+"projector/",
-            **({"quant_components": projector_quant_components} if self.quantize_projector else {})
         )
 
         self._export = False
@@ -141,10 +124,6 @@ class Backbone(BackboneBase):
         """
         # (H, W, B, C)
         feats = self.encoder(tensor_list.tensors)
-        if self.quantize_projector:
-            feats = [(feat, scale) for (feat, scale) in feats]
-        else:
-            feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
         # x: [(B, C, H, W)]
         out = []
@@ -158,16 +137,11 @@ class Backbone(BackboneBase):
             m = tensor_list.mask
             assert m is not None
             mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
-            if self.return_quant_scales:
-                out.append(NestedTensor((feat, scale), mask))
-            else:
-                out.append(NestedTensor(feat, mask))
+            out.append(NestedTensor((feat, scale), mask))
         return out
 
     def forward_export(self, tensors:torch.Tensor):
         feats = self.encoder(tensors)
-        if not self.quantize_projector:
-            feats = [feat for (feat, scale) in feats]
         feats = self.projector(feats)
         out_feats = []
         out_masks = []
@@ -181,10 +155,7 @@ class Backbone(BackboneBase):
             # x: [(B, C, H, W)]
             b, _, h, w = feat.shape
             out_masks.append(torch.zeros((b, h, w), dtype=torch.bool, device=feat.device))
-            if self.return_quant_scales:
-                out_feats.append((feat, scale))
-            else:
-                out_feats.append(feat)
+            out_feats.append((feat, scale))
         return out_feats, out_masks
 
     def get_named_param_lr_pairs(self, args, prefix:str = "backbone.0"):
