@@ -263,6 +263,8 @@ def get_args_parser():
                         help='Directory to save output visualizations.')
     parser.add_argument('--confidence_threshold', type=float, default=0.5,
                         help='Minimum score for instance predictions to be shown')
+    parser.add_argument('--save_predictions', action='store_true',
+                        help='Save raw and postprocessed predictions as predictions.npz')
     
     # Observation
     parser.add_argument("--observe_stat", action="store_true")
@@ -405,6 +407,18 @@ def main(args):
     boxes = predictions[0]['boxes'].cpu().numpy()
     labels = predictions[0]['labels'].cpu().numpy()
     scores = predictions[0]['scores'].cpu().numpy()
+
+    if args.save_predictions:
+        prediction_path = Path(args.output_dir) / "predictions.npz"
+        np.savez(
+            prediction_path,
+            pred_logits=outputs['pred_logits'].detach().cpu().numpy(),
+            pred_boxes=outputs['pred_boxes'].detach().cpu().numpy(),
+            boxes=boxes,
+            labels=labels,
+            scores=scores,
+            original_image_size=orig_image_sizes.detach().cpu().numpy(),
+        )
 
     original_image = Image.open(args.input).convert("RGB")
     visualize_detections(

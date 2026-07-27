@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=lwdetr
-#SBATCH --time=40:00:00
-#SBATCH --partition=gpu40G
+#SBATCH --time=150:00:00
+#SBATCH --partition=gpu80G
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 
@@ -50,8 +50,8 @@ Factory AI environment overrides:
   CONDA_ENV             Conda environment. Default: lwdetr2
   REPO_ROOT             Repository root override
   FACTORY_SETUP         Optional site-specific shell script to source
-  NPROC_PER_NODE        GPU worker count. Default: SLURM allocation or 4
-  MASTER_PORT           Distributed master port. Default: 29500
+  NPROC_PER_NODE        GPU worker count. Default: SLURM allocation or #SBATCH --gres GPU count
+  MASTER_PORT           Distributed master port. Default: derived from SLURM_JOB_ID
   PYTORCH_CUDA_ALLOC_CONF
   SLURM_WRAPPER_DRY_RUN Print dispatch command without calling srun
 
@@ -145,15 +145,45 @@ if [[ -f "$conda_sh" ]]; then
   conda activate "$conda_env"
 fi
 
-allocated_gpus="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-4}}"
-if [[ "$allocated_gpus" =~ ([0-9]+)$ ]]; then
-  allocated_gpus="${BASH_REMATCH[1]}"
+extract_gpu_count() {
+  local value="$1"
+  if [[ "$value" =~ gpu(:[^,:[:space:]]+)*:([0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  elif [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+  elif [[ "$value" =~ ([0-9]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+}
+
+sbatch_gres_gpus=4
+script_file="${BASH_SOURCE[0]}"
+if [[ -f "$script_file" ]]; then
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^#SBATCH[[:space:]]+--gres=([^[:space:]]+) ]]; then
+      if parsed_gpus="$(extract_gpu_count "${BASH_REMATCH[1]}")"; then
+        sbatch_gres_gpus="$parsed_gpus"
+      fi
+      break
+    fi
+  done < "$script_file"
+fi
+
+allocated_gpus="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-$sbatch_gres_gpus}}"
+if parsed_gpus="$(extract_gpu_count "$allocated_gpus")"; then
+  allocated_gpus="$parsed_gpus"
 else
-  allocated_gpus=4
+  allocated_gpus="$sbatch_gres_gpus"
 fi
 
 export NPROC_PER_NODE="${NPROC_PER_NODE:-$allocated_gpus}"
-export MASTER_PORT="${MASTER_PORT:-29500}"
+default_master_port=29500
+if [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]]; then
+  default_master_port=$((10000 + SLURM_JOB_ID % 50000))
+fi
+export MASTER_PORT="${MASTER_PORT:-$default_master_port}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONUNBUFFERED=1
 
@@ -161,6 +191,7 @@ echo "workflow=$workflow"
 echo "repo_root=$repo_root"
 echo "conda_env=$conda_env"
 echo "NPROC_PER_NODE=$NPROC_PER_NODE"
+echo "MASTER_PORT=$MASTER_PORT"
 printf 'command='
 printf ' %q' "${command[@]}"
 printf '\n'

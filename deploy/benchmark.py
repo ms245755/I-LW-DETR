@@ -38,6 +38,14 @@ import tqdm
 import onnxruntime as nxrun
 
 try:
+    import aidge_core
+    import aidge_onnx
+    import aidge_backend_cpu
+except ImportError:
+    aidge_core = None
+    aidge_onnx = None
+
+try:
     import tensorrt as trt
 except ImportError:
     trt = None
@@ -50,8 +58,10 @@ except ImportError:
 
 
 def parser_args():
-    parser = argparse.ArgumentParser('performance benchmark tool for onnx/trt model')
+    parser = argparse.ArgumentParser('performance benchmark tool for onnx/trt/aidge model')
     parser.add_argument('--path', type=str, help='engine file path')
+    parser.add_argument('--backend', default='auto', choices=('auto', 'onnxruntime', 'tensorrt', 'aidge'),
+                        help='Inference backend. auto selects onnxruntime for .onnx and tensorrt for .engine.')
     parser.add_argument('--coco_path', type=str, default="data/coco", help='coco dataset path')
     parser.add_argument('--image_dir', type=str, default=None,
                         help='COCO image directory. Defaults to coco_path/val2017 or coco_path/images/val2017')
@@ -60,6 +70,7 @@ def parser_args():
     parser.add_argument('--max_images', default=None, type=int, help='limit COCO images for quick validation')
     parser.add_argument('--providers', nargs='*', default=None,
                         help='ONNX Runtime providers, e.g. CUDAExecutionProvider CPUExecutionProvider')
+    parser.add_argument('--aidge_backend', default='cpu', help='Aidge backend name passed to set_backend().')
     parser.add_argument('--disable_ort_optimizations', action='store_true',
                         help='Disable ONNX Runtime graph optimizations for troubleshooting quantized models')
     parser.add_argument('--run_benchmark', action='store_true', help='repeat the inference to benchmark the latency')
@@ -374,6 +385,83 @@ def infer_onnx(sess, coco_evaluator, time_profile, prefix, img_list, device, rep
         print(stats)
 
 
+class AidgeInference(object):
+    def __init__(self, model_path, backend='cpu'):
+        if aidge_core is None or aidge_onnx is None:
+            raise ImportError("Aidge benchmarking requires aidge_core, aidge_onnx and aidge_backend_cpu.")
+        self.model_path = model_path
+        self.backend = backend
+        aidge_core.Log.set_console_level(aidge_core.Level.Error)
+        self.model = aidge_onnx.load_onnx(model_path)
+        self.model.set_datatype(aidge_core.dtype.float32)
+        self.model.set_backend(backend)
+        self.scheduler = aidge_core.SequentialScheduler(self.model)
+
+    def __call__(self, samples):
+        aidge_input = aidge_core.Tensor(samples)
+        aidge_input.to_dtype(aidge_core.dtype.float32)
+        self.scheduler.forward(True, [aidge_input])
+
+        raw_outputs = []
+        for output in self.model.get_ordered_outputs():
+            output_node = output[0]
+            output_tensor = output_node.get_operator().get_output(0)
+            raw_outputs.append(np.array(output_tensor))
+        return self.map_outputs(raw_outputs)
+
+    @staticmethod
+    def map_outputs(raw_outputs):
+        outputs = {}
+        for output in raw_outputs:
+            if output.ndim >= 3 and output.shape[-1] == 4:
+                outputs['dets'] = output
+            elif output.ndim >= 3:
+                outputs['labels'] = output
+
+        if 'dets' not in outputs or 'labels' not in outputs:
+            if len(raw_outputs) != 2:
+                raise RuntimeError(f"Expected 2 Aidge outputs, got {len(raw_outputs)}")
+            outputs = {'dets': raw_outputs[0], 'labels': raw_outputs[1]}
+        return outputs
+
+
+def infer_aidge(model, coco_evaluator, time_profile, prefix, img_list, device, repeats=1, img_size=640):
+    time_list = []
+    for img_dict in tqdm.tqdm(img_list):
+        image = load_image(os.path.join(prefix, img_dict['file_name']))
+        width, height = image.size
+        orig_target_sizes = torch.Tensor([height, width])
+        image_tensor, _ = infer_transforms(img_size)(image, None)
+
+        samples = image_tensor[None].numpy().astype(np.float32)
+
+        time_profile.reset()
+        with time_profile:
+            for _ in range(repeats):
+                raw_outputs = model(samples)
+        time_list.append(time_profile.total / repeats)
+
+        outputs = {
+            'labels': torch.Tensor(raw_outputs['labels']).to(device),
+            'dets': torch.Tensor(raw_outputs['dets']).to(device),
+        }
+        orig_target_sizes = torch.stack([orig_target_sizes], dim=0).to(device)
+        results = post_process(outputs, orig_target_sizes)
+        res = {img_dict['id']: results[0]}
+        if coco_evaluator is not None:
+            coco_evaluator.update(res)
+
+    print("Model latency with Aidge: {}ms".format(1000 * sum(time_list) / len(img_list)))
+
+    stats = {}
+    if coco_evaluator is not None:
+        coco_evaluator.synchronize_between_processes()
+        coco_evaluator.accumulate()
+        coco_evaluator.summarize()
+        stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
+        print(stats)
+
+
 def infer_engine(model, coco_evaluator, time_profile, prefix, img_list, device, repeats=1, img_size=640):
     time_list = []
     for img_dict in tqdm.tqdm(img_list):
@@ -606,19 +694,38 @@ def main(args):
     time_profile = TimeProfiler()
     eval_device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
 
-    if args.path.endswith(".onnx"):
+    backend = args.backend
+    if backend == 'auto':
+        if args.path.endswith(".onnx"):
+            backend = 'onnxruntime'
+        elif args.path.endswith(".engine"):
+            backend = 'tensorrt'
+        else:
+            raise NotImplementedError('Auto backend only supports model file names ending with ".onnx" and ".engine".')
+
+    if backend == 'onnxruntime':
+        if not args.path.endswith(".onnx"):
+            raise ValueError("ONNX Runtime backend expects --path ending with .onnx")
         sess_options = nxrun.SessionOptions()
         if args.disable_ort_optimizations:
             sess_options.graph_optimization_level = nxrun.GraphOptimizationLevel.ORT_DISABLE_ALL
         sess = nxrun.InferenceSession(args.path, sess_options=sess_options, providers=args.providers)
         infer_onnx(sess, coco_evaluator, time_profile, prefix, img_list, device=eval_device,
                    repeats=repeats, img_size=args.img_size)
-    elif args.path.endswith(".engine"):
+    elif backend == 'aidge':
+        if not args.path.endswith(".onnx"):
+            raise ValueError("Aidge backend expects --path ending with .onnx")
+        model = AidgeInference(args.path, backend=args.aidge_backend)
+        infer_aidge(model, coco_evaluator, time_profile, prefix, img_list, device=eval_device,
+                    repeats=repeats, img_size=args.img_size)
+    elif backend == 'tensorrt':
+        if not args.path.endswith(".engine"):
+            raise ValueError("TensorRT backend expects --path ending with .engine")
         model = TRTInference(args.path, sync_mode=True, device=f'cuda:{args.device}')
         infer_engine(model, coco_evaluator, time_profile, prefix, img_list, device=f'cuda:{args.device}',
                      repeats=repeats, img_size=args.img_size)
     else:
-        raise NotImplementedError('Only model file names ending with ".onnx" and ".engine" are supported.')
+        raise NotImplementedError(f'Unsupported backend: {args.backend}')
 
 
 if __name__ == '__main__':
