@@ -1527,22 +1527,44 @@ class IViTSoftmaxV2(nn.Module):
         else:
             m, r = self.m, self.r
 
+        # Execute the denominator with signed int32 arithmetic, matching the
+        # deployed SDShiftmax kernel. The float32 branch is only an STE
+        # surrogate for backward; detach makes the forward value int32-exact.
+        exp_int_i32 = exp_int.detach().clamp(0, 2**31 - 1).to(torch.int32)
         if r > 0:
-            divisor = 2.0 ** r
-            # Float64 preserves the integer low bits used by the remainder.
-            # The fake-quant tensors are otherwise float32, which cannot
-            # represent every integer once Iexp exceeds 2^24.
-            exp_int_for_sum = exp_int.to(torch.float64)
-            exp_int_quotient = floor_ste.apply(exp_int_for_sum / divisor)
-            exp_int_remainder = (
-                exp_int_for_sum - exp_int_quotient * divisor
+            quotient_i32 = torch.bitwise_right_shift(exp_int_i32, r)
+            remainder_i32 = exp_int_i32 - torch.bitwise_left_shift(
+                quotient_i32, r
             )
-            exp_int_sum = exp_int_quotient.sum(dim=-1, keepdim=True)
-            exp_int_sum = exp_int_sum + floor_ste.apply(
-                exp_int_remainder.sum(dim=-1, keepdim=True) / divisor
+            exp_int_sum_i32 = quotient_i32.sum(
+                dim=-1, keepdim=True, dtype=torch.int32
+            )
+            exp_int_sum_i32 = exp_int_sum_i32 + torch.bitwise_right_shift(
+                remainder_i32.sum(
+                    dim=-1, keepdim=True, dtype=torch.int32
+                ),
+                r,
+            )
+
+            divisor = float(1 << r)
+            quotient_surrogate = floor_ste.apply(exp_int / divisor)
+            remainder_surrogate = exp_int - quotient_surrogate * divisor
+            exp_int_sum_surrogate = quotient_surrogate.sum(
+                dim=-1, keepdim=True
+            )
+            exp_int_sum_surrogate = exp_int_sum_surrogate + floor_ste.apply(
+                remainder_surrogate.sum(dim=-1, keepdim=True) / divisor
             )
         else:
-            exp_int_sum = exp_int.to(torch.float64).sum(dim=-1, keepdim=True)
+            exp_int_sum_i32 = exp_int_i32.sum(
+                dim=-1, keepdim=True, dtype=torch.int32
+            )
+            exp_int_sum_surrogate = exp_int.sum(dim=-1, keepdim=True)
+
+        exp_int_sum_forward = exp_int_sum_i32.to(exp_int.dtype)
+        exp_int_sum = exp_int_sum_surrogate + (
+            exp_int_sum_forward - exp_int_sum_surrogate
+        ).detach()
 
         exp_int_sum = exp_int_sum.clamp(min=1, max=2.0**m - 1)
         factor = floor_ste.apply((2.0**m - 1) / exp_int_sum.clamp_min(1))
