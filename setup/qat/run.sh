@@ -45,13 +45,15 @@ else
   )
 fi
 
-lr="${LR:-2e-5}"
-lr_encoder="${LR_ENCODER:-2e-5}"
-weight_decay="${WEIGHT_DECAY:-1e-4}"
+epochs="${EPOCHS:-20}"
+lr_drop="${LR_DROP:-5}"
+lr="${LR:-5e-7}"
+lr_encoder="${LR_ENCODER:-5e-7}"
+weight_decay="${WEIGHT_DECAY:-0}"
 master_port="${MASTER_PORT:-29500}"
 act_observer="${ACT_OBSERVER:-ema_minmax}"
 act_percentile="${ACT_PERCENTILE:-99.9}"
-qat_freeze_observers="${QAT_FREEZE_OBSERVERS:-false}"
+qat_freeze_observers="${QAT_FREEZE_OBSERVERS:-true}"
 output_root="${OUTPUT_ROOT:-output}"
 output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_qat_${scenario_label}_${model_size}}"
 resume_optimizer="${RESUME_OPTIMIZER:-false}"

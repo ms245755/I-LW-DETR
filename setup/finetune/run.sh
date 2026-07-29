@@ -13,22 +13,22 @@ Usage:
 Environment variables:
   DATASET_FILE                   coco or custom_coco. Default: custom_coco
   OUTPUT_DIR                    Default: output/lwdetr_<size>_<dataset>_finetune
-  EPOCHS                        Default: 40
+  EPOCHS                        Default: 60 for easy-quant finetune
   LR_DROP                       Default: 80% of EPOCHS
-  LR_SCHEDULER                  step or delayed_cosine. Default: step
-  LR_DECAY_START_EPOCH          Delayed cosine start epoch. Default: 25% of EPOCHS
+  LR_SCHEDULER                  step or delayed_cosine. Default: delayed_cosine for easy-quant finetune
+  LR_DECAY_START_EPOCH          Delayed cosine start epoch. Default: 10 for easy-quant finetune
   LR_MIN_FACTOR                 Final LR ratio for cosine. Default: 0.01
-  LR                            Pretrained detector LR. Default: 1e-5
-  LR_ENCODER                    Encoder LR. Default: 1.5e-5
+  LR                            Pretrained detector LR. Default: 5e-5 for easy-quant finetune
+  LR_ENCODER                    Encoder LR. Default: 1e-5 for easy-quant finetune
   LR_CLASS_HEAD                 New classification-head LR. Default: 1e-4
-  CLASS_HEAD_WARMUP_EPOCHS      Head-only training epochs. Default: 3
-  EASY_QUANTIZE                 true to use quantization-friendly float ops
+  CLASS_HEAD_WARMUP_EPOCHS      Head-only training epochs. Default: 0 for easy-quant finetune
+  EASY_QUANTIZE                 true to use quantization-friendly float ops. Default: true
   RESUME                        true to continue from a training checkpoint
   BATCH_SIZE                    Per-process batch size. Default: size-specific
   NPROC_PER_NODE                GPU process count. Default: size-specific
   MASTER_PORT                   Default: 29500
   DEVICE                        Default: cuda
-  KEEP_CLASS_HEAD               true to load existing classification heads
+  KEEP_CLASS_HEAD               true to load existing classification heads. Default: true for easy-quant finetune, else false
   DRY_RUN                       true to print the command without running it
 
 Examples:
@@ -79,28 +79,7 @@ for required_path in \
   fi
 done
 
-requested_epochs="${EPOCHS:-40}"
-requested_lr_drop="${LR_DROP:-}"
-
-export MODEL_SIZE="$model_size"
-export DATASET_FILE="$dataset_file"
-configure_model_size
-
-epochs="$requested_epochs"
-lr_drop="${requested_lr_drop:-$((epochs * 4 / 5))}"
-lr_scheduler="${LR_SCHEDULER:-step}"
-lr_decay_start_epoch="${LR_DECAY_START_EPOCH:-$((epochs / 4))}"
-lr_min_factor="${LR_MIN_FACTOR:-0.01}"
-lr="${LR:-1e-5}"
-lr_encoder="${LR_ENCODER:-1.5e-5}"
-lr_class_head="${LR_CLASS_HEAD:-1e-4}"
-class_head_warmup_epochs="${CLASS_HEAD_WARMUP_EPOCHS:-3}"
-easy_quantize="${EASY_QUANTIZE:-false}"
-resume_training="${RESUME:-false}"
-master_port="${MASTER_PORT:-29500}"
-device="${DEVICE:-cuda}"
-output_dir="${OUTPUT_DIR:-output/lwdetr_${model_size}_${dataset_file}_finetune}"
-
+easy_quantize="${EASY_QUANTIZE:-true}"
 case "$easy_quantize" in
   true|false) ;;
   *)
@@ -109,10 +88,44 @@ case "$easy_quantize" in
     ;;
 esac
 
+if [[ "$easy_quantize" == "true" && -z "${BATCH_SIZE:-}" ]]; then
+  export BATCH_SIZE=1
+fi
+
+requested_epochs="${EPOCHS:-$([[ "$easy_quantize" == "true" ]] && echo 60 || echo 40)}"
+requested_lr_drop="${LR_DROP:-}"
+
+export MODEL_SIZE="$model_size"
+export DATASET_FILE="$dataset_file"
+configure_model_size
+
+epochs="$requested_epochs"
+lr_drop="${requested_lr_drop:-$((epochs * 4 / 5))}"
+lr_scheduler="${LR_SCHEDULER:-$([[ "$easy_quantize" == "true" ]] && echo delayed_cosine || echo step)}"
+lr_decay_start_epoch="${LR_DECAY_START_EPOCH:-$([[ "$easy_quantize" == "true" ]] && echo 10 || echo $((epochs / 4)))}"
+lr_min_factor="${LR_MIN_FACTOR:-0.01}"
+lr="${LR:-$([[ "$easy_quantize" == "true" ]] && echo 5e-5 || echo 1e-5)}"
+lr_encoder="${LR_ENCODER:-$([[ "$easy_quantize" == "true" ]] && echo 1e-5 || echo 1.5e-5)}"
+lr_class_head="${LR_CLASS_HEAD:-1e-4}"
+class_head_warmup_epochs="${CLASS_HEAD_WARMUP_EPOCHS:-$([[ "$easy_quantize" == "true" ]] && echo 0 || echo 3)}"
+keep_class_head="${KEEP_CLASS_HEAD:-$([[ "$easy_quantize" == "true" ]] && echo true || echo false)}"
+resume_training="${RESUME:-false}"
+master_port="${MASTER_PORT:-29500}"
+device="${DEVICE:-cuda}"
+output_dir="${OUTPUT_DIR:-output/lwdetr_${model_size}_${dataset_file}_finetune}"
+
 case "$resume_training" in
   true|false) ;;
   *)
     echo "RESUME must be true or false, got: $resume_training" >&2
+    exit 2
+    ;;
+esac
+
+case "$keep_class_head" in
+  true|false) ;;
+  *)
+    echo "KEEP_CLASS_HEAD must be true or false, got: $keep_class_head" >&2
     exit 2
     ;;
 esac
@@ -134,7 +147,7 @@ split_args "$window_block_indexes" window_block_args
 split_args "$out_feature_indexes" out_feature_args
 
 class_head_args=()
-if [[ "${KEEP_CLASS_HEAD:-false}" != "true" ]]; then
+if [[ "$keep_class_head" != "true" ]]; then
   class_head_args=(
     --pretrain_exclude_keys
     'class_embed.*'

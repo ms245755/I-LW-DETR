@@ -8,19 +8,17 @@ source "$script_dir/../common.sh"
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  bash setup/eval/run.sh --coco-path <path> [options]
+  bash setup/eval/run.sh --checkpoint <file> --coco-path <path> [options]
 
 Options:
-  --model-size <tiny|small|medium|all>   Model size to evaluate. Default: tiny
-  --variant <original|qr|ptq|qat|all>    Checkpoint variant to evaluate:
+  --model-size <tiny|small|medium>       Model size to evaluate. Default: tiny
+  --variant <original|qr|ptq|qat>        Checkpoint variant to evaluate:
                                           original = float model
                                           qr       = easy-quantized model
                                           ptq      = calibrated PTQ model
                                           qat      = QAT-trained quantized model
-                                          all      = evaluate every variant
-                                        Default: all
-  --checkpoint-root <path>               Checkpoint root. Default: pretrain_weights
-  --checkpoint <path>                    Evaluate one explicit checkpoint file. Requires one model size and one variant
+                                        Default: qat
+  --checkpoint <file>                    Checkpoint file to evaluate. Required
   --output-root <path>                   Output root. Default: output/eval
   --summary-name <name>                  Summary basename. Default: summary
   --nproc-per-node <N>                   Number of GPU processes. Default: size-specific common.sh value
@@ -32,11 +30,9 @@ Options:
   -h, --help                             Show this help
 
 Examples:
-  bash setup/eval/run.sh --model-size all --variant all --coco-path ../../data/COCO
-  bash setup/eval/run.sh --model-size small --variant ptq --coco-path ../../data/COCO
-  bash setup/eval/run.sh --model-size medium --variant qat --checkpoint /path/to/checkpoint.pth --coco-path ../../data/COCO
-  bash setup/eval/run.sh --model-size tiny --variant original --dataset-file custom_coco --coco-path /path/to/VisDrone-coco --output-root output/eval_visdrone_float
-  bash setup/eval/run.sh --model-size tiny --variant ptq --dataset-file custom_coco --coco-path /path/to/VisDrone-coco --output-root output/eval_visdrone_ptq
+  bash setup/eval/run.sh --model-size tiny --variant qat --checkpoint /path/to/checkpoint.pth --coco-path ../../data/COCO
+  bash setup/eval/run.sh --model-size small --variant ptq --checkpoint /path/to/checkpoint.pth --coco-path ../../data/COCO
+  bash setup/eval/run.sh --model-size tiny --variant original --checkpoint /path/to/checkpoint.pth --dataset-file custom_coco --coco-path /path/to/VisDrone-coco --output-root output/eval_visdrone_float
 
 COCO path should be the COCO root, containing val2017/ and annotations/instances_val2017.json.
 Converted datasets such as VisDrone are supported when they use this COCO layout.
@@ -45,9 +41,8 @@ EOF
 }
 
 requested_model_size="tiny"
-requested_variant="all"
+requested_variant="qat"
 coco_path=""
-checkpoint_root="pretrain_weights"
 checkpoint_override=""
 output_root="output/eval"
 summary_name="summary"
@@ -70,10 +65,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --coco-path)
       coco_path="$2"
-      shift 2
-      ;;
-    --checkpoint-root)
-      checkpoint_root="$2"
       shift 2
       ;;
     --checkpoint)
@@ -131,7 +122,7 @@ if [[ -z "$coco_path" ]]; then
 fi
 
 case "$requested_model_size" in
-  tiny|small|medium|all) ;;
+  tiny|small|medium) ;;
   *)
     echo "Unsupported --model-size: $requested_model_size" >&2
     usage
@@ -140,7 +131,7 @@ case "$requested_model_size" in
 esac
 
 case "$requested_variant" in
-  original|qr|ptq|qat|all) ;;
+  original|qr|ptq|qat) ;;
   *)
     echo "Unsupported --variant: $requested_variant" >&2
     usage
@@ -157,15 +148,17 @@ case "$requested_dataset_file" in
     ;;
 esac
 
-if [[ -n "$checkpoint_override" && ( "$requested_model_size" == "all" || "$requested_variant" == "all" ) ]]; then
-  echo "--checkpoint can only be used with one explicit --model-size and one explicit --variant." >&2
+if [[ -z "$checkpoint_override" ]]; then
+  echo "--checkpoint is required." >&2
+  usage
   exit 2
 fi
 
 coco_path="$(absolute_existing_path "$coco_path")"
-checkpoint_root="$(absolute_existing_path "$checkpoint_root")"
-if [[ -n "$checkpoint_override" ]]; then
-  checkpoint_override="$(absolute_existing_path "$checkpoint_override")"
+checkpoint_override="$(absolute_existing_path "$checkpoint_override")"
+if [[ ! -f "$checkpoint_override" ]]; then
+  echo "Checkpoint is not a file: $checkpoint_override" >&2
+  exit 2
 fi
 
 mkdir -p "$output_root"
@@ -174,14 +167,7 @@ summary_xlsx="$output_root/${summary_name}.xlsx"
 printf 'model_size,variant,checkpoint,output_dir,status,mAP,mAP_50,mAP_75,mAP_small,mAP_medium,mAP_large,AR_1,AR_10,AR_100,AR_small,AR_medium,AR_large,log_file\n' > "$summary_csv"
 
 model_sizes=("$requested_model_size")
-if [[ "$requested_model_size" == "all" ]]; then
-  model_sizes=(tiny small medium)
-fi
-
 variants=("$requested_variant")
-if [[ "$requested_variant" == "all" ]]; then
-  variants=(original qr ptq qat)
-fi
 
 check_visible_gpus() {
   local nproc="$1"
@@ -200,31 +186,7 @@ PY
 }
 
 checkpoint_for_variant() {
-  local current_size="$1"
-  local current_variant="$2"
-  if [[ -n "$checkpoint_override" ]]; then
-    printf '%s\n' "$checkpoint_override"
-    return
-  fi
-
-  case "$current_variant:$current_size" in
-    original:tiny) printf '%s\n' "$checkpoint_root/tiny/LWDETR_tiny_60e_coco.pth" ;;
-    original:small) printf '%s\n' "$checkpoint_root/small/LWDETR_small_60e_coco.pth" ;;
-    original:medium) printf '%s\n' "$checkpoint_root/medium/LWDETR_medium_60e_coco.pth" ;;
-    qr:tiny) printf '%s\n' "$checkpoint_root/tiny/checkpoint_easy_quant.pth" ;;
-    qr:small) printf '%s\n' "$checkpoint_root/small/checkpoint_easy_quant_small.pth" ;;
-    qr:medium) printf '%s\n' "$checkpoint_root/medium/checkpoint_easy_quant_medium.pth" ;;
-    ptq:tiny) printf '%s\n' "$checkpoint_root/tiny/lwdetr_tiny_coco_ptq.pth" ;;
-    ptq:small) printf '%s\n' "$checkpoint_root/small/lwdetr_small_coco_ptq.pth" ;;
-    ptq:medium) printf '%s\n' "$checkpoint_root/medium/lwdetr_medium_coco_ptq.pth" ;;
-    qat:tiny) printf '%s\n' "$checkpoint_root/tiny/lwdetr_tiny_coco_qat.pth" ;;
-    qat:small) printf '%s\n' "$checkpoint_root/small/lwdetr_small_coco_qat.pth" ;;
-    qat:medium) printf '%s\n' "$checkpoint_root/medium/lwdetr_medium_coco_qat.pth" ;;
-    *)
-      echo "Unsupported variant/model-size pair: $current_variant/$current_size" >&2
-      return 2
-      ;;
-  esac
+  printf '%s\n' "$checkpoint_override"
 }
 
 append_summary_row() {
