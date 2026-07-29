@@ -33,7 +33,6 @@ else
 fi
 
 export MODEL_SIZE="${MODEL_SIZE:-small}"
-export SCENARIO="${SCENARIO:-fully_quantized}"
 export BATCH_SIZE="${BATCH_SIZE:-2}"
 export ACT_OBSERVER="${ACT_OBSERVER:-ema_minmax}"
 export ACT_PERCENTILE="${ACT_PERCENTILE:-99.9}"
@@ -41,7 +40,7 @@ export CALIB_BATCHES="${CALIB_BATCHES:-500}"
 export CALIB_EVAL="${CALIB_EVAL:-true}"
 export QAT_CALIB_BATCHES="${QAT_CALIB_BATCHES:-0}"
 export QAT_FREEZE_OBSERVERS="${QAT_FREEZE_OBSERVERS:-true}"
-qat_output_dir="${OUTPUT_DIR:-output/lwdetr_${MODEL_SIZE}_qat_${SCENARIO}}"
+qat_output_dir="${OUTPUT_DIR:-output/lwdetr_${MODEL_SIZE}_qat}"
 ptq_output_dir="${PTQ_OUTPUT_DIR:-$qat_output_dir}"
 
 coco_path="${COCO_PATH:-${1:-../../../../../data/dataset/coco}}"
@@ -55,7 +54,6 @@ fi
 echo "COCO path: $coco_path"
 echo "Checkpoint path: $checkpoint_path"
 echo "MODEL_SIZE: $MODEL_SIZE"
-echo "SCENARIO: $SCENARIO"
 echo "NPROC_PER_NODE: $NPROC_PER_NODE"
 echo "CALIB_BATCHES: $CALIB_BATCHES"
 echo "CALIB_EVAL: $CALIB_EVAL"
@@ -77,7 +75,7 @@ if [[ -n "${QAT_RESUME:-}" ]]; then
 else
   echo "Starting PTQ phase"
   export OUTPUT_DIR="$ptq_output_dir"
-  srun bash "setup/ptq/${SCENARIO}.sh" "$coco_path" "$checkpoint_path"
+  srun bash setup/ptq/run.sh "$MODEL_SIZE" "$coco_path" "$checkpoint_path"
 
   calibrated_checkpoint="$ptq_output_dir/checkpoint_calibrated.pth"
   if [[ ! -f "$calibrated_checkpoint" ]]; then
@@ -95,4 +93,4 @@ echo "SKIP_PRETRAIN for QAT phase: $SKIP_PRETRAIN"
 echo "QAT_CALIB_BATCHES for QAT phase: $QAT_CALIB_BATCHES"
 echo "Starting QAT phase"
 
-srun bash "setup/qat/${SCENARIO}.sh" "$coco_path" "$checkpoint_root"
+srun bash setup/qat/run.sh "$MODEL_SIZE" "$coco_path" "$checkpoint_root"

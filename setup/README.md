@@ -13,14 +13,17 @@ Run all commands from the repository root.
 | Float fine-tuning | `setup/finetune/run.sh` | `setup/slurm/run.sh finetune` |
 | Float/QR/PTQ/QAT evaluation | `setup/eval/run.sh` | `setup/slurm/run.sh eval` |
 | ONNX/TensorRT export | `setup/export/run.sh` | - |
-| Fully quantized PTQ | `setup/ptq/fully_quantized.sh` | `setup/slurm/run.sh ptq fully_quantized` |
-| Fully quantized QAT | `setup/qat/fully_quantized.sh` | `setup/slurm/run.sh qat fully_quantized` |
+| Fully quantized PTQ | `setup/ptq/run.sh` | `setup/slurm/run.sh ptq` |
+| Fully quantized QAT | `setup/qat/run.sh` | `setup/slurm/run.sh qat` |
 
 Model size is always one of `tiny`, `small`, or `medium`. COCO is the primary
 dataset and uses `DATASET_FILE=coco`. Other COCO-format datasets use
 `DATASET_FILE=custom_coco`.
 
-Export additionally supports the upstream `large` and `xlarge` model sizes.
+Architecture presets are defined once in `setup/common.sh`. The maintained
+fine-tuning, evaluation, inference, PTQ, QAT, and export runners all consume
+that shared definition. Files under `scripts/` and `scripts_pretrain/` are
+legacy experiment snapshots and are not the source of truth for model presets.
 
 ## 1. Prepare the dataset
 
@@ -214,7 +217,7 @@ For fully quantized checkpoints, use the quant export wrapper:
 
 ```bash
 EASY_QUANTIZE=true \
-bash setup/export/fully_quantized.sh \
+QUANT=true bash setup/export/run.sh \
   tiny \
   ../../data/COCO \
   /path/to/checkpoint_quantized.pth \
@@ -304,26 +307,20 @@ Pass the checkpoint file explicitly. The evaluation script does not infer a
 checkpoint from the model size or variant:
 
 ```bash
-bash setup/eval/run.sh \
-  --model-size tiny \
-  --variant original \
-  --dataset-file coco \
-  --checkpoint pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
-  --coco-path ../../data/COCO \
-  --output-root output/eval_coco
+DATASET_FILE=coco OUTPUT_DIR=output/eval_coco \
+bash setup/eval/run.sh tiny original \
+  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
+  ../../data/COCO
 ```
 
 Evaluate a QAT checkpoint by selecting the matching quantized variant and
 passing the exact checkpoint produced by that run:
 
 ```bash
-bash setup/eval/run.sh \
-  --model-size tiny \
-  --variant qat \
-  --dataset-file coco \
-  --checkpoint output/coco_tiny_qat/checkpoint.pth \
-  --coco-path ../../data/COCO \
-  --output-root output/eval_coco_tiny_qat
+DATASET_FILE=coco OUTPUT_DIR=output/eval_coco_tiny_qat \
+bash setup/eval/run.sh tiny qat \
+  output/coco_tiny_qat/checkpoint.pth \
+  ../../data/COCO
 ```
 
 Run the command once per checkpoint when comparing model sizes or variants.
@@ -333,25 +330,19 @@ different checkpoint with a conventional filename.
 ### Evaluate an explicit custom-dataset checkpoint
 
 ```bash
-bash setup/eval/run.sh \
-  --model-size small \
-  --variant original \
-  --dataset-file custom_coco \
-  --checkpoint pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth \
-  --coco-path /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  --output-root output/eval_visdrone
+DATASET_FILE=custom_coco OUTPUT_DIR=output/eval_visdrone \
+bash setup/eval/run.sh small original \
+  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth \
+  /home/data/dataset/Objects365/VisDrone2019-DET-coco
 ```
 
 Submit any evaluation by inserting the Slurm dispatcher:
 
 ```bash
 sbatch setup/slurm/run.sh eval \
-  --model-size tiny \
-  --variant original \
-  --dataset-file coco \
-  --checkpoint pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
-  --coco-path ../../data/COCO \
-  --output-root output/eval_coco
+  tiny original \
+  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
+  ../../data/COCO
 ```
 
 `--checkpoint` is required and must name a checkpoint file. Variants are
@@ -362,8 +353,8 @@ The `ptq` and `qat` variants are quantized-checkpoint evaluation only. They
 build the quantized model with `--quant` and do not run PTQ calibration or QAT
 training.
 
-Each run writes per-model `eval.log` and `eval.pth` files, plus
-`summary.csv` and `summary.xlsx` under the output root. Metrics are ordered:
+Each run writes `eval.log` and `eval.pth` under
+`<output-root>/<model-size>_<variant>/`. The log contains these metrics:
 
 ```text
 AP, AP50, AP75, AP-small, AP-medium, AP-large,
@@ -399,16 +390,13 @@ The quantization directories contain one supported quantized model path:
 - `setup/ptq/` runs PTQ calibration.
 - `setup/qat/` runs QAT training.
 - `setup/common.sh` owns shared model-size and workflow settings.
-- Root-level quantization scripts are compatibility wrappers. Prefer
-  `setup/ptq/fully_quantized.sh` and `setup/qat/fully_quantized.sh` for new runs.
+- `setup/ptq/run.sh` and `setup/qat/run.sh` are the direct quantization entry points.
 
 The PTQ and QAT scripts use this form:
 
 ```bash
-bash setup/<ptq|qat>/fully_quantized.sh /path/to/coco /path/to/checkpoint_or_checkpoint_dir
+bash setup/<ptq|qat>/run.sh <tiny|small|medium> /path/to/coco /path/to/checkpoint_or_checkpoint_dir
 ```
-
-Set `MODEL_SIZE=tiny|small|medium` to select the model. The default is `tiny`.
 
 COCO is the default dataset. Set `DATASET_FILE=custom_coco` for VisDrone or
 another COCO-format dataset with a different class set.
@@ -430,11 +418,11 @@ does not run a pre-training calibration pass; run PTQ first and resume from
 ### COCO PTQ example
 
 ```bash
-MODEL_SIZE=small \
 DATASET_FILE=coco \
 OUTPUT_DIR=output/coco_small_ptq \
 CALIB_BATCHES=500 \
-bash setup/ptq/fully_quantized.sh \
+bash setup/ptq/run.sh \
+  small \
   ../../data/COCO \
   pretrain_weights/coco/small/LWDETR_small_60e_coco.pth
 ```
@@ -448,12 +436,12 @@ output/coco_small_ptq/checkpoint_calibrated.pth
 ### COCO QAT example
 
 ```bash
-MODEL_SIZE=small \
 DATASET_FILE=coco \
 SKIP_PRETRAIN=true \
 RESUME=output/coco_small_ptq/checkpoint_calibrated.pth \
 OUTPUT_DIR=output/coco_small_qat \
-bash setup/qat/fully_quantized.sh \
+bash setup/qat/run.sh \
+  small \
   ../../data/COCO \
   output/coco_small_ptq/checkpoint_calibrated.pth
 ```
@@ -461,19 +449,17 @@ bash setup/qat/fully_quantized.sh \
 Use the same commands on Slurm:
 
 ```bash
-MODEL_SIZE=small \
 DATASET_FILE=coco \
 OUTPUT_DIR=output/coco_small_ptq \
-sbatch setup/slurm/run.sh ptq fully_quantized \
+sbatch setup/slurm/run.sh ptq small \
   ../../data/COCO \
   pretrain_weights/coco/small/LWDETR_small_60e_coco.pth
 
-MODEL_SIZE=small \
 DATASET_FILE=coco \
 SKIP_PRETRAIN=true \
 RESUME=output/coco_small_ptq/checkpoint_calibrated.pth \
 OUTPUT_DIR=output/coco_small_qat \
-sbatch setup/slurm/run.sh qat fully_quantized \
+sbatch setup/slurm/run.sh qat small \
   ../../data/COCO \
   output/coco_small_ptq/checkpoint_calibrated.pth
 ```
@@ -483,11 +469,11 @@ sbatch setup/slurm/run.sh qat fully_quantized \
 Calibrate a fully quantized small model from the float checkpoint:
 
 ```bash
-MODEL_SIZE=small \
 DATASET_FILE=custom_coco \
 OUTPUT_DIR=output/visdrone_small_ptq \
 CALIB_BATCHES=500 \
-bash setup/ptq/fully_quantized.sh \
+bash setup/ptq/run.sh \
+  small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
   pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
 ```
@@ -501,12 +487,11 @@ output/visdrone_small_ptq/checkpoint_calibrated.pth
 Run it through Slurm:
 
 ```bash
-MODEL_SIZE=small \
 DATASET_FILE=custom_coco \
 OUTPUT_DIR=output/visdrone_small_ptq \
 sbatch \
   -o logs/vis_drone/ptq_small_%j.txt \
-  setup/slurm/run.sh ptq fully_quantized \
+  setup/slurm/run.sh ptq small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
   pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
 ```
@@ -516,12 +501,12 @@ sbatch \
 Start QAT from the calibrated PTQ checkpoint:
 
 ```bash
-MODEL_SIZE=small \
 DATASET_FILE=custom_coco \
 SKIP_PRETRAIN=true \
 RESUME=output/visdrone_small_ptq/checkpoint_calibrated.pth \
 OUTPUT_DIR=output/visdrone_small_qat \
-bash setup/qat/fully_quantized.sh \
+bash setup/qat/run.sh \
+  small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
   output/visdrone_small_ptq/checkpoint_calibrated.pth
 ```
@@ -529,14 +514,13 @@ bash setup/qat/fully_quantized.sh \
 Slurm uses the same variables:
 
 ```bash
-MODEL_SIZE=small \
 DATASET_FILE=custom_coco \
 SKIP_PRETRAIN=true \
 RESUME=output/visdrone_small_ptq/checkpoint_calibrated.pth \
 OUTPUT_DIR=output/visdrone_small_qat \
 sbatch \
   -o logs/vis_drone/qat_small_%j.txt \
-  setup/slurm/run.sh qat fully_quantized \
+  setup/slurm/run.sh qat small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
   output/visdrone_small_ptq/checkpoint_calibrated.pth
 ```
@@ -564,7 +548,7 @@ Override paths explicitly when needed:
 RESUME=/path/to/resume.pth \
 PRETRAINED_ENCODER=/path/to/caev2_tiny_300e_objects365.pth \
 PRETRAIN_WEIGHTS=/path/to/LWDETR_tiny_30e_objects365.pth \
-bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint_dir
+bash setup/qat/run.sh tiny /path/to/coco /path/to/checkpoint_dir
 ```
 
 ### PTQ
@@ -578,13 +562,12 @@ checkpoint_calibrated.pth
 Run PTQ:
 
 ```bash
-bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoints
+bash setup/ptq/run.sh tiny /path/to/coco /path/to/checkpoints
 ```
 
 Useful PTQ overrides:
 
 ```bash
-MODEL_SIZE=small
 OUTPUT_DIR=output/my_ptq_run
 NPROC_PER_NODE=4
 BATCH_SIZE=4
@@ -597,18 +580,17 @@ ACT_PERCENTILE=99
 Example:
 
 ```bash
-MODEL_SIZE=small \
 CALIB_BATCHES=500 \
 ACT_OBSERVER=mean \
 ACT_PERCENTILE=99 \
 OUTPUT_DIR=output/small_ptq_full \
-bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoints
+bash setup/ptq/run.sh small /path/to/coco /path/to/checkpoints
 ```
 
 Skip evaluation after calibration:
 
 ```bash
-CALIB_EVAL=false bash setup/ptq/fully_quantized.sh /path/to/coco /path/to/checkpoints
+CALIB_EVAL=false bash setup/ptq/run.sh tiny /path/to/coco /path/to/checkpoints
 ```
 
 ### QAT
@@ -617,9 +599,8 @@ QAT loads a checkpoint with `--resume`, builds the quantized model, and trains i
 
 ```bash
 RESUME=/path/to/checkpoint_calibrated.pth \
-MODEL_SIZE=tiny \
 OUTPUT_DIR=output/tiny_qat_full \
-bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint_dir
+bash setup/qat/run.sh tiny /path/to/coco /path/to/checkpoint_dir
 ```
 
 Useful QAT defaults and overrides:
@@ -648,7 +629,7 @@ RESUME=/path/to/qat_output/checkpoint.pth \
 RESUME_OPTIMIZER=true \
 OUTPUT_DIR=/path/to/qat_output \
 EPOCHS=20 \
-bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint_dir
+bash setup/qat/run.sh tiny /path/to/coco /path/to/checkpoint_dir
 ```
 
 `EPOCHS` is the final total number of epochs, not the number of extra epochs. If the checkpoint saved `epoch=7`, `EPOCHS=20` resumes at epoch 8 and trains through epoch 19.

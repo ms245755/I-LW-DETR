@@ -5,18 +5,16 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../common.sh
 source "$script_dir/../common.sh"
 
-if [[ $# -ne 2 ]]; then
+if [[ $# -ne 3 ]]; then
   usage_common "setup/ptq/run.sh"
-  echo "Use setup/ptq/fully_quantized.sh for PTQ." >&2
   exit 2
 fi
 
-coco_path="$(absolute_existing_path "$1")"
-checkpoint_root="$(absolute_existing_path "$2")"
-scenario="${SCENARIO:?SCENARIO must be set by a scenario wrapper}"
+export MODEL_SIZE="$1"
+coco_path="$(absolute_existing_path "$2")"
+checkpoint_root="$(absolute_existing_path "$3")"
 
 configure_model_size
-configure_scenario
 prepare_common_args
 build_common_model_args
 
@@ -28,7 +26,7 @@ act_percentile="${ACT_PERCENTILE:-99}"
 calib_batches="${CALIB_BATCHES:-500}"
 calib_eval="${CALIB_EVAL:-true}"
 output_root="${OUTPUT_ROOT:-output}"
-output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_ptq_${scenario_label}_${model_size}}"
+output_dir="${OUTPUT_DIR:-${output_root}/${model_name}_ptq}"
 decoder_cross_attn_value_per_channel="${DECODER_CROSS_ATTN_VALUE_PER_CHANNEL:-false}"
 decoder_norm_output_qact="${DECODER_NORM_OUTPUT_QACT:-false}"
 softmax_calibrate_m="${SOFTMAX_CALIBRATE_M:-true}"

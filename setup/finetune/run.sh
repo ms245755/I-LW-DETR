@@ -141,10 +141,8 @@ else
 fi
 checkpoint="$(absolute_existing_path "$checkpoint")"
 
-window_block_args=()
-out_feature_args=()
-split_args "$window_block_indexes" window_block_args
-split_args "$out_feature_indexes" out_feature_args
+prepare_common_args
+build_architecture_model_args
 
 class_head_args=()
 if [[ "$keep_class_head" != "true" ]]; then
@@ -192,23 +190,8 @@ train_command=(
   --lr_min_factor "$lr_min_factor"
   --lr_vit_layer_decay "$lr_vit_layer_decay"
   --lr_component_decay "$lr_component_decay"
-  --encoder "$encoder"
-  --vit_encoder_num_layers "$vit_encoder_num_layers"
-  --window_block_indexes "${window_block_args[@]}"
-  --out_feature_indexes "${out_feature_args[@]}"
-  --dec_layers 3
-  --group_detr 13
-  --two_stage
-  --projector_scale P4
-  --hidden_dim 256
-  --sa_nheads 8
-  --ca_nheads 16
-  --dec_n_points 2
-  --bbox_reparam
-  --lite_refpoint_refine
+  "${architecture_model_args[@]}"
   "${easy_quantize_args[@]}"
-  --num_queries "$num_queries"
-  --num_select "$num_select"
   --ia_bce_loss
   --cls_loss_coef 1
   --dataset_file "$dataset_file"

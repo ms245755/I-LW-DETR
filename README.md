@@ -21,13 +21,13 @@ This work accompanies the arXiv paper [Enabling Fully Integer-Only Inference for
 | Workflow | Entry point | Main output |
 | --- | --- | --- |
 | Fine-tuning | `setup/finetune/run.sh` | `checkpoint.pth` |
-| PTQ calibration | `setup/ptq/fully_quantized.sh` | `checkpoint_calibrated.pth` |
-| QAT | `setup/qat/fully_quantized.sh` | training checkpoints |
-| Evaluation | `setup/eval/run.sh` | COCO metrics in CSV/XLSX |
+| PTQ calibration | `setup/ptq/run.sh` | `checkpoint_calibrated.pth` |
+| QAT | `setup/qat/run.sh` | training checkpoints |
+| Evaluation | `setup/eval/run.sh` | COCO metrics in `eval.log` |
 | Image inference | `setup/infer/run.sh` | annotated image and predictions |
 | ONNX/TensorRT export | `setup/export/run.sh` | `.onnx` and optional `.engine` |
 
-The maintained workflow wrappers support `tiny`, `small`, and `medium`. Export also supports the upstream `large` and `xlarge` configurations.
+The maintained workflow wrappers support `tiny`, `small`, and `medium`.
 
 ## 1. Installation
 
@@ -138,10 +138,10 @@ To adapt a COCO model to a dataset with different classes, use `DATASET_FILE=cus
 ### Step B — calibrate with PTQ
 
 ```bash
-MODEL_SIZE=tiny \
 DATASET_FILE=coco \
 OUTPUT_DIR=output/coco_tiny_ptq \
-bash setup/ptq/fully_quantized.sh \
+bash setup/ptq/run.sh \
+  tiny \
   /path/to/COCO \
   output/coco_tiny_easy_quant/checkpoint.pth
 ```
@@ -159,13 +159,13 @@ Useful overrides include `CALIB_BATCHES`, `ACT_OBSERVER`, `ACT_PERCENTILE`, and 
 Resume from the calibrated checkpoint and freeze its observer statistics:
 
 ```bash
-MODEL_SIZE=tiny \
 DATASET_FILE=coco \
 SKIP_PRETRAIN=true \
 RESUME=output/coco_tiny_ptq/checkpoint_calibrated.pth \
 QAT_FREEZE_OBSERVERS=true \
 OUTPUT_DIR=output/coco_tiny_qat \
-bash setup/qat/fully_quantized.sh \
+bash setup/qat/run.sh \
+  tiny \
   /path/to/COCO \
   output/coco_tiny_ptq/checkpoint_calibrated.pth
 ```
@@ -184,16 +184,17 @@ Choose the variant that matches how the checkpoint was produced:
 | `qat` | quantized graph after QAT |
 
 ```bash
+DATASET_FILE=coco OUTPUT_DIR=output/eval_tiny_qat \
 bash setup/eval/run.sh \
-  --model-size tiny \
-  --variant qat \
-  --checkpoint output/coco_tiny_qat/checkpoint.pth \
-  --dataset-file coco \
-  --coco-path /path/to/COCO \
-  --output-root output/eval_tiny_qat
+  tiny \
+  qat \
+  output/coco_tiny_qat/checkpoint.pth \
+  /path/to/COCO
 ```
 
-The evaluator writes `summary.csv`, `summary.xlsx`, and per-run logs below the output root. It deliberately requires an exact checkpoint path so a filename convention cannot silently select the wrong model.
+The evaluator writes `eval.log` and `eval.pth` under
+`output/eval_tiny_qat/`. It deliberately requires an exact checkpoint
+path so a filename convention cannot silently select the wrong model.
 
 ### Step E — export for deployment
 
@@ -247,18 +248,18 @@ Evaluation reports standard COCO mAP metrics.
 
 | Model | Setting | Precision | Integer-only | Size (MB) | BOPs (T) | mAP | APS | APM | APL |
 | --- | --- | --- | :---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Tiny | LW-DETR | FP32 | no | 44.89 | 11.48 | 15.7 | 6.9 | 24.6 | 40.5 |
-| Tiny | QR-LW-DETR | FP32 | no | 45.39 | 11.49 | 15.0 | 6.6 | 23.5 | 42.2 |
-| Tiny | PTQ | 8/8/16 | yes | 12.57 | 0.92 | 7.8 | 2.3 | 13.4 | 27.3 |
-| Tiny | QAT | 8/8/16 | yes | 12.57 | 0.92 | 10.9 | 4.1 | 17.6 | 31.9 |
-| Small | LW-DETR | FP32 | no | 54.44 | 17.0 | 18.2 | 8.1 | 28.6 | 48.1 |
-| Small | QR-LW-DETR | FP32 | no | 54.95 | 17.04 | 17.2 | 7.7 | 27.2 | 47.3 |
-| Small | PTQ | 8/8/16 | yes | 16.93 | 1.36 | 13.3 | 5.5 | 21.5 | 40.8 |
-| Small | QAT | 8/8/16 | yes | 16.93 | 1.36 | 15.6 | 6.6 | 25.0 | 43.3 |
-| Medium | LW-DETR | FP32 | no | 106.63 | 43.78 | 19.3 | 8.9 | 30.0 | 49.3 |
-| Medium | QR-LW-DETR | FP32 | no | 107.14 | 43.82 | 19.0 | 8.8 | 29.6 | 49.5 |
-| Medium | PTQ | 8/8/16 | yes | 30.16 | 3.07 | 11.4 | 4.2 | 19.6 | 37.1 |
-| Medium | QAT | 8/8/16 | yes | 30.16 | 3.07 | 15.0 | 6.1 | 24.2 | 44.4 |
+| Tiny | LW-DETR | FP32 | no | 45.98 | 11.52 | 42.6 | 22.7 | 47.4 | 60.0 |
+| Tiny | QR-LW-DETR | FP32 | no | 46.49 | 11.54 | 42.0 | 22.1 | 46.5 | 58.8 |
+| Tiny | PTQ | 8/8/16 | yes | 12.85 | 0.89 | 36.0 | 17.7 | 40.5 | 51.5 |
+| Tiny | QAT | 8/8/16 | yes | 12.85 | 0.89 | 37.9 | 19.0 | 42.1 | 54.5 |
+| Small | LW-DETR | FP32 | no | 55.54 | 17.06 | 48.0 | 26.8 | 52.5 | 65.6 |
+| Small | QR-LW-DETR | FP32 | no | 56.05 | 17.10 | 46.4 | 25.3 | 50.8 | 64.0 |
+| Small | PTQ | 8/8/16 | yes | 17.21 | 1.32 | 41.6 | 21.7 | 46.5 | 57.4 |
+| Small | QAT | 8/8/16 | yes | 17.21 | 1.32 | 43.7 | 23.6 | 47.8 | 60.1 |
+| Medium | LW-DETR | FP32 | no | 107.73 | 43.84 | 52.5 | 32.7 | 57.6 | 70.6 |
+| Medium | QR-LW-DETR | FP32 | no | 108.23 | 43.88 | 50.8 | 30.2 | 55.5 | 68.8 |
+| Medium | PTQ | 8/8/16 | yes | 30.44 | 3.04 | 44.0 | 24.9 | 48.4 | 60.6 |
+| Medium | QAT | 8/8/16 | yes | 30.44 | 3.04 | 47.1 | 26.5 | 51.5 | 64.6 |
 
 Qualitative examples:
 

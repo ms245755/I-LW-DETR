@@ -36,10 +36,8 @@ Usage:
 Workflows:
   finetune              Runs setup/finetune/run.sh
   eval                  Runs setup/eval/run.sh
-  ptq <scenario>        Runs setup/ptq/<scenario>.sh
-  qat <scenario>        Runs setup/qat/<scenario>.sh
-
-PTQ/QAT supports only the fully_quantized scenario.
+  ptq                   Runs setup/ptq/run.sh
+  qat                   Runs setup/qat/run.sh
 
 Factory AI environment overrides:
   CONDA_SH              Conda initialization script
@@ -58,14 +56,12 @@ Examples:
   sbatch setup/slurm/run.sh finetune tiny /path/to/custom-coco
 
   sbatch setup/slurm/run.sh eval \
-    --model-size tiny --variant original --dataset-file custom_coco \
-    --checkpoint /path/to/checkpoint.pth --coco-path /path/to/custom-coco
+    tiny original /path/to/checkpoint.pth /path/to/custom-coco
 
-  sbatch setup/slurm/run.sh ptq fully_quantized \
+  sbatch setup/slurm/run.sh ptq tiny \
     /path/to/custom-coco /path/to/checkpoint.pth
 
-  MODEL_SIZE=small DATASET_FILE=custom_coco \
-  sbatch setup/slurm/run.sh qat fully_quantized \
+  DATASET_FILE=custom_coco sbatch setup/slurm/run.sh qat small \
     /path/to/custom-coco /path/to/checkpoint.pth
 EOF
 }
@@ -86,19 +82,7 @@ case "$workflow" in
     command=(bash setup/eval/run.sh "$@")
     ;;
   ptq|qat)
-    if [[ $# -lt 1 ]]; then
-      echo "$workflow requires a scenario." >&2
-      usage
-      exit 2
-    fi
-    scenario="$1"
-    shift
-    if [[ "$scenario" != "fully_quantized" ]]; then
-      echo "Unsupported $workflow scenario: $scenario (only fully_quantized is available)" >&2
-      usage
-      exit 2
-    fi
-    command=(bash "setup/$workflow/$scenario.sh" "$@")
+    command=(bash "setup/$workflow/run.sh" "$@")
     ;;
   -h|--help)
     usage

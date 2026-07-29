@@ -31,11 +31,11 @@ Optional environment variables:
   CHECKPOINT_ROOT=pretrain_weights      Easy-quantize checkpoint root if arg 2 is omitted
   SWEEP_OUTPUT_ROOT=<path>              Default: output/cumulative_ptq
   SWEEP_OVERWRITE=true                  Replace existing summary/log files
-  NPROC_PER_NODE=1|2|4|8                Forwarded to setup/ptq/fully_quantized.sh
-  CALIB_BATCHES=500                     Forwarded to setup/ptq/fully_quantized.sh
-  CALIB_EVAL=true                       Forwarded to setup/ptq/fully_quantized.sh
-  ACT_OBSERVER=mean|ema_minmax          Forwarded to setup/ptq/fully_quantized.sh
-  ACT_PERCENTILE=99|99.9                Forwarded to setup/ptq/fully_quantized.sh
+  NPROC_PER_NODE=1|2|4|8                Forwarded to setup/ptq/run.sh
+  CALIB_BATCHES=500                     Forwarded to setup/ptq/run.sh
+  CALIB_EVAL=true                       Forwarded to setup/ptq/run.sh
+  ACT_OBSERVER=mean|ema_minmax          Forwarded to setup/ptq/run.sh
+  ACT_PERCENTILE=99|99.9                Forwarded to setup/ptq/run.sh
 EOF
   exit 2
 fi
@@ -332,12 +332,11 @@ run_case_size() {
   echo "    output: $output_dir"
   echo "    log:    $log_file"
 
-  export MODEL_SIZE="$model_size"
   export OUTPUT_DIR="$output_dir"
   export RESUME="$resume_checkpoint"
 
   set +e
-  bash "$script_dir/fully_quantized.sh" "$coco_path" "$checkpoint_path" 2>&1 | tee "$log_file"
+  bash "$script_dir/run.sh" "$model_size" "$coco_path" "$checkpoint_path" 2>&1 | tee "$log_file"
   exit_code=${PIPESTATUS[0]}
   set -e
 

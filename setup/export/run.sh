@@ -2,12 +2,13 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/../.." && pwd)"
+# shellcheck source=../common.sh
+source "$script_dir/../common.sh"
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  bash setup/export/run.sh <tiny|small|medium|large|xlarge> <coco_path> <checkpoint> [export_model args]
+  bash setup/export/run.sh <tiny|small|medium> <coco_path> <checkpoint> [export_model args]
 
 Examples:
   bash setup/export/run.sh tiny ../../data/COCO pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
@@ -37,7 +38,7 @@ if [[ $# -lt 3 ]]; then
   exit 2
 fi
 
-model_size="$1"
+export MODEL_SIZE="$1"
 coco_path="$2"
 checkpoint="$3"
 shift 3
@@ -84,78 +85,9 @@ case "$aidge_export" in
     ;;
 esac
 
-case "$model_size" in
-  tiny)
-    encoder="vit_tiny"
-    vit_encoder_num_layers=6
-    window_block_indexes=(0 2 4)
-    out_feature_indexes=(1 3 5)
-    projector_scale=(P4)
-    hidden_dim=256
-    sa_nheads=8
-    ca_nheads=16
-    dec_n_points=2
-    num_queries_args=(--num_queries 100)
-    num_select=100
-    ;;
-  small)
-    encoder="vit_tiny"
-    vit_encoder_num_layers=10
-    window_block_indexes=(0 1 3 6 7 9)
-    out_feature_indexes=(2 4 5 9)
-    projector_scale=(P4)
-    hidden_dim=256
-    sa_nheads=8
-    ca_nheads=16
-    dec_n_points=2
-    num_queries_args=()
-    num_select=300
-    ;;
-  medium)
-    encoder="vit_small"
-    vit_encoder_num_layers=10
-    window_block_indexes=(0 1 3 6 7 9)
-    out_feature_indexes=(2 4 5 9)
-    projector_scale=(P4)
-    hidden_dim=256
-    sa_nheads=8
-    ca_nheads=16
-    dec_n_points=2
-    num_queries_args=()
-    num_select=300
-    ;;
-  large)
-    encoder="vit_small"
-    vit_encoder_num_layers=10
-    window_block_indexes=(0 1 3 6 7 9)
-    out_feature_indexes=(2 4 5 9)
-    projector_scale=(P3 P5)
-    hidden_dim=384
-    sa_nheads=12
-    ca_nheads=24
-    dec_n_points=4
-    num_queries_args=()
-    num_select=300
-    ;;
-  xlarge)
-    encoder="vit_base"
-    vit_encoder_num_layers=10
-    window_block_indexes=(0 1 3 6 7 9)
-    out_feature_indexes=(2 4 5 9)
-    projector_scale=(P3 P5)
-    hidden_dim=384
-    sa_nheads=12
-    ca_nheads=24
-    dec_n_points=4
-    num_queries_args=()
-    num_select=300
-    ;;
-  *)
-    echo "Unsupported model size: $model_size" >&2
-    usage
-    exit 2
-    ;;
-esac
+configure_model_size
+prepare_common_args
+build_architecture_model_args
 
 if [[ ! -d "$coco_path" ]]; then
   echo "COCO path does not exist or is not a directory: $coco_path" >&2
@@ -167,7 +99,6 @@ if [[ ! -f "$checkpoint" ]]; then
   exit 2
 fi
 
-model_name="lwdetr_${model_size}_${dataset_file}"
 output_dir="${OUTPUT_DIR:-output/$model_name}"
 
 bool_flag_args() {
@@ -211,24 +142,9 @@ fi
 cmd=(
   python main.py
   --batch_size 1
-  --encoder "$encoder"
-  --vit_encoder_num_layers "$vit_encoder_num_layers"
-  --window_block_indexes "${window_block_indexes[@]}"
-  --out_feature_indexes "${out_feature_indexes[@]}"
-  --dec_layers 3
-  --group_detr 13
-  --two_stage
-  --projector_scale "${projector_scale[@]}"
-  --hidden_dim "$hidden_dim"
-  --sa_nheads "$sa_nheads"
-  --ca_nheads "$ca_nheads"
-  --dec_n_points "$dec_n_points"
-  --bbox_reparam
-  --lite_refpoint_refine
+  "${architecture_model_args[@]}"
   "${easy_quantize_args[@]}"
   "${quant_args[@]}"
-  "${num_queries_args[@]}"
-  --num_select "$num_select"
   --dataset_file "$dataset_file"
   --coco_path "$coco_path"
   --square_resize_div_64
