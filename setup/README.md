@@ -84,6 +84,7 @@ COCO uses the existing COCO classification heads:
 
 ```bash
 DATASET_FILE=coco \
+EASY_QUANTIZE=false \
 KEEP_CLASS_HEAD=true \
 CLASS_HEAD_WARMUP_EPOCHS=0 \
 OUTPUT_DIR=output/coco_tiny_finetune \
@@ -94,25 +95,37 @@ bash setup/finetune/run.sh \
   pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
 ```
 
-### Custom-dataset fine-tuning
+### Custom-dataset original fine-tuning
 
-For a new class set, leave `KEEP_CLASS_HEAD` unset. The COCO classification
-heads are replaced and trained alone for the warm-up period:
+For COCO -> VisDrone original fine-tuning, disable easy quantization and use
+the original custom-dataset schedule. Leave `KEEP_CLASS_HEAD` unset so the
+COCO classification heads are replaced and trained alone for the warm-up
+period:
 
 ```bash
 DATASET_FILE=custom_coco \
-OUTPUT_DIR=output/visdrone_tiny \
-EPOCHS=100 \
+EASY_QUANTIZE=false \
+OUTPUT_DIR=output/visdrone_medium_finetune_from_coco_cosine \
+EPOCHS=200 \
+LR_SCHEDULER=delayed_cosine \
+LR_DECAY_START_EPOCH=40 \
+LR_MIN_FACTOR=0.01 \
+LR=1e-4 \
+LR_ENCODER=1e-5 \
+LR_CLASS_HEAD=2e-4 \
 CLASS_HEAD_WARMUP_EPOCHS=5 \
+BATCH_SIZE=2 \
 bash setup/finetune/run.sh \
-  tiny \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco
+  medium \
+  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  pretrain_weights/coco/medium/LWDETR_medium_60e_coco.pth
 ```
 
 To continue from a checkpoint already trained on the same custom classes:
 
 ```bash
 DATASET_FILE=custom_coco \
+EASY_QUANTIZE=false \
 KEEP_CLASS_HEAD=true \
 CLASS_HEAD_WARMUP_EPOCHS=0 \
 OUTPUT_DIR=output/visdrone_small_continue \
@@ -135,19 +148,19 @@ Common overrides:
 | --- | --- | --- |
 | `DATASET_FILE` | `custom_coco` | Set `coco` for the primary COCO dataset |
 | `OUTPUT_DIR` | generated name | Checkpoints and training logs |
-| `EPOCHS` | `40` | Total number of epochs |
-| `BATCH_SIZE` | size-specific | Batch size per GPU process |
+| `EPOCHS` | `60` | Total number of epochs for default easy-quant finetune |
+| `BATCH_SIZE` | `1` | Batch size per GPU process for default easy-quant finetune |
 | `NPROC_PER_NODE` | size-specific | Number of GPU processes |
-| `LR` | `1e-5` | Detector learning rate |
-| `LR_ENCODER` | `1.5e-5` | Encoder learning rate |
+| `LR` | `5e-5` | Detector learning rate for default easy-quant finetune |
+| `LR_ENCODER` | `1e-5` | Encoder learning rate for default easy-quant finetune |
 | `LR_CLASS_HEAD` | `1e-4` | New classification-head learning rate |
-| `CLASS_HEAD_WARMUP_EPOCHS` | `3` | Head-only epochs for a new class set |
-| `EASY_QUANTIZE` | `false` | Use quantization-friendly float operations |
-| `LR_SCHEDULER` | `step` | `step` or `delayed_cosine` |
+| `CLASS_HEAD_WARMUP_EPOCHS` | `0` | Head-only epochs for default easy-quant finetune |
+| `EASY_QUANTIZE` | `true` | Use quantization-friendly float operations |
+| `LR_SCHEDULER` | `delayed_cosine` | `step` or `delayed_cosine` |
 | `LR_DROP` | 80% of epochs | Step-scheduler decay epoch |
-| `LR_DECAY_START_EPOCH` | 25% of epochs | Start of delayed cosine decay |
+| `LR_DECAY_START_EPOCH` | `10` | Start of delayed cosine decay |
 | `LR_MIN_FACTOR` | `0.01` | Final LR / initial LR for cosine |
-| `KEEP_CLASS_HEAD` | `false` | Keep heads when checkpoint classes match |
+| `KEEP_CLASS_HEAD` | `true` | Keep heads when checkpoint classes match |
 | `DRY_RUN` | `false` | Print the generated command only |
 
 ### Fine-tune an existing checkpoint for easy quantization
@@ -157,21 +170,11 @@ learned decoder reference-position encoding and nearest-neighbor deformable
 sampling. It is normally done before PTQ or QAT.
 
 When the checkpoint already uses the target dataset classes, keep its
-classification heads and disable head-only warm-up:
+classification heads. These are now the default finetune settings:
 
 ```bash
 DATASET_FILE=custom_coco \
-EASY_QUANTIZE=true \
-KEEP_CLASS_HEAD=true \
-CLASS_HEAD_WARMUP_EPOCHS=0 \
 OUTPUT_DIR=output/visdrone_small_easy_quant \
-EPOCHS=60 \
-LR_SCHEDULER=delayed_cosine \
-LR_DECAY_START_EPOCH=10 \
-LR_MIN_FACTOR=0.01 \
-LR=5e-5 \
-LR_ENCODER=1e-5 \
-BATCH_SIZE=1 \
 bash setup/finetune/run.sh \
   small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
@@ -244,6 +247,7 @@ COCO example:
 mkdir -p logs/coco
 
 DATASET_FILE=coco \
+EASY_QUANTIZE=false \
 KEEP_CLASS_HEAD=true \
 CLASS_HEAD_WARMUP_EPOCHS=0 \
 OUTPUT_DIR=output/coco_small_finetune \
@@ -262,14 +266,23 @@ Custom-dataset example:
 mkdir -p logs/vis_drone
 
 DATASET_FILE=custom_coco \
-OUTPUT_DIR=output/visdrone_small \
-EPOCHS=100 \
+EASY_QUANTIZE=false \
+OUTPUT_DIR=output/visdrone_medium_finetune_from_coco_cosine \
+EPOCHS=200 \
+LR_SCHEDULER=delayed_cosine \
+LR_DECAY_START_EPOCH=40 \
+LR_MIN_FACTOR=0.01 \
+LR=1e-4 \
+LR_ENCODER=1e-5 \
+LR_CLASS_HEAD=2e-4 \
 CLASS_HEAD_WARMUP_EPOCHS=5 \
+BATCH_SIZE=2 \
 sbatch \
-  -o logs/vis_drone/small_%j.txt \
+  -o logs/vis_drone/medium_finetune_%j.txt \
   setup/slurm/run.sh finetune \
-  small \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco
+  medium \
+  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  pretrain_weights/coco/medium/LWDETR_medium_60e_coco.pth
 ```
 
 Override resources with normal `sbatch` options:
@@ -283,35 +296,39 @@ The wrapper activates `CONDA_ENV` (`lwdetr2` by default), derives
 Python unbuffered. It also accepts `REPO_ROOT`, `CONDA_SH`, `FACTORY_SETUP`,
 and `SLURM_WRAPPER_DRY_RUN=true`.
 
-## 4. Evaluate float and quantized checkpoints
+## 5. Evaluate float and quantized checkpoints
 
 ### Evaluate COCO checkpoints
 
-Evaluate the standard checkpoints discovered under `pretrain_weights`:
+Pass the checkpoint file explicitly. The evaluation script does not infer a
+checkpoint from the model size or variant:
 
 ```bash
 bash setup/eval/run.sh \
   --model-size tiny \
   --variant original \
   --dataset-file coco \
-  --checkpoint-root pretrain_weights/coco \
+  --checkpoint pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
   --coco-path ../../data/COCO \
   --output-root output/eval_coco
 ```
 
-Evaluate all configured model sizes and checkpoint variants:
+Evaluate a QAT checkpoint by selecting the matching quantized variant and
+passing the exact checkpoint produced by that run:
 
 ```bash
 bash setup/eval/run.sh \
-  --model-size all \
-  --variant all \
+  --model-size tiny \
+  --variant qat \
   --dataset-file coco \
-  --checkpoint-root pretrain_weights/coco \
+  --checkpoint output/coco_tiny_qat/checkpoint.pth \
   --coco-path ../../data/COCO \
-  --output-root output/eval_coco_all
+  --output-root output/eval_coco_tiny_qat
 ```
 
-This requires every checkpoint expected by `setup/eval/run.sh` to exist.
+Run the command once per checkpoint when comparing model sizes or variants.
+Requiring an explicit path prevents an evaluation from silently selecting a
+different checkpoint with a conventional filename.
 
 ### Evaluate an explicit custom-dataset checkpoint
 
@@ -332,13 +349,14 @@ sbatch setup/slurm/run.sh eval \
   --model-size tiny \
   --variant original \
   --dataset-file coco \
-  --checkpoint-root pretrain_weights/coco \
+  --checkpoint pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
   --coco-path ../../data/COCO \
   --output-root output/eval_coco
 ```
 
-Variants are `original`, `qr`, `ptq`, and `qat`. An explicit `--checkpoint`
-requires one explicit model size and one explicit variant.
+`--checkpoint` is required and must name a checkpoint file. Variants are
+`original`, `qr`, `ptq`, and `qat`; each invocation evaluates one model size
+and one variant.
 
 The `ptq` and `qat` variants are quantized-checkpoint evaluation only. They
 build the quantized model with `--quant` and do not run PTQ calibration or QAT
@@ -355,7 +373,7 @@ AR@1, AR@10, AR@100, AR-small, AR-medium, AR-large
 The size-specific AP values are conditional measurements over different
 object-size subsets; they are not components that must be below overall AP.
 
-## 5. Visualize a custom-dataset checkpoint
+## 6. Visualize a custom-dataset checkpoint
 
 The current side-by-side visualization utility is for `custom_coco`
 checkpoints. It plots ground truth on the left and predictions on the right:
@@ -434,9 +452,6 @@ MODEL_SIZE=small \
 DATASET_FILE=coco \
 SKIP_PRETRAIN=true \
 RESUME=output/coco_small_ptq/checkpoint_calibrated.pth \
-QAT_FREEZE_OBSERVERS=true \
-EPOCHS=20 \
-LR_DROP=15 \
 OUTPUT_DIR=output/coco_small_qat \
 bash setup/qat/fully_quantized.sh \
   ../../data/COCO \
@@ -457,9 +472,6 @@ MODEL_SIZE=small \
 DATASET_FILE=coco \
 SKIP_PRETRAIN=true \
 RESUME=output/coco_small_ptq/checkpoint_calibrated.pth \
-QAT_FREEZE_OBSERVERS=true \
-EPOCHS=20 \
-LR_DROP=15 \
 OUTPUT_DIR=output/coco_small_qat \
 sbatch setup/slurm/run.sh qat fully_quantized \
   ../../data/COCO \
@@ -508,9 +520,6 @@ MODEL_SIZE=small \
 DATASET_FILE=custom_coco \
 SKIP_PRETRAIN=true \
 RESUME=output/visdrone_small_ptq/checkpoint_calibrated.pth \
-QAT_FREEZE_OBSERVERS=true \
-EPOCHS=20 \
-LR_DROP=15 \
 OUTPUT_DIR=output/visdrone_small_qat \
 bash setup/qat/fully_quantized.sh \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
@@ -524,9 +533,6 @@ MODEL_SIZE=small \
 DATASET_FILE=custom_coco \
 SKIP_PRETRAIN=true \
 RESUME=output/visdrone_small_ptq/checkpoint_calibrated.pth \
-QAT_FREEZE_OBSERVERS=true \
-EPOCHS=20 \
-LR_DROP=15 \
 OUTPUT_DIR=output/visdrone_small_qat \
 sbatch \
   -o logs/vis_drone/qat_small_%j.txt \
@@ -612,26 +618,26 @@ QAT loads a checkpoint with `--resume`, builds the quantized model, and trains i
 ```bash
 RESUME=/path/to/checkpoint_calibrated.pth \
 MODEL_SIZE=tiny \
-EPOCHS=20 \
 OUTPUT_DIR=output/tiny_qat_full \
 bash setup/qat/fully_quantized.sh /path/to/coco /path/to/checkpoint_dir
 ```
 
-Useful QAT overrides:
+Useful QAT defaults and overrides:
 
 ```bash
-LR=2e-5
-LR_ENCODER=2e-5
-WEIGHT_DECAY=1e-4
+LR=5e-7
+LR_ENCODER=5e-7
+WEIGHT_DECAY=0
 EPOCHS=20
-LR_DROP=25
+LR_DROP=5
 QAT_FREEZE_OBSERVERS=true
 ACT_OBSERVER=ema_minmax
 ACT_PERCENTILE=99.9
 RESUME_OPTIMIZER=false
 ```
 
-Use `QAT_FREEZE_OBSERVERS=true` when resuming from a calibrated PTQ checkpoint and you want fixed quantization ranges during QAT.
+`QAT_FREEZE_OBSERVERS=true` is now the default, which keeps quantization
+ranges fixed when resuming from a calibrated PTQ checkpoint.
 
 #### Resume interrupted QAT
 
