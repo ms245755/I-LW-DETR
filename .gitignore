@@ -22,7 +22,7 @@ figs/
 plot*.py
 *.onnx
 *.engine
-pretrain_weights/*
+*.pth
 output/
 data/
 experiments/
