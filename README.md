@@ -138,12 +138,14 @@ To adapt a COCO model to a dataset with different classes, use `DATASET_FILE=cus
 ### Step B — calibrate with PTQ
 
 ```bash
+NPROC_PER_NODE=1 \
+CUDA_VISIBLE_DEVICES=0 \
 DATASET_FILE=coco \
 OUTPUT_DIR=output/coco_tiny_ptq \
 bash setup/ptq/run.sh \
   tiny \
   /path/to/COCO \
-  output/coco_tiny_easy_quant/checkpoint.pth
+  /path/to/checkpoint
 ```
 
 The default calibration observes 500 batches and then evaluates the model. Expected checkpoint:
@@ -159,15 +161,16 @@ Useful overrides include `CALIB_BATCHES`, `ACT_OBSERVER`, `ACT_PERCENTILE`, and 
 Resume from the calibrated checkpoint and freeze its observer statistics:
 
 ```bash
+NPROC_PER_NODE=1 \
+CUDA_VISIBLE_DEVICES=0 \
 DATASET_FILE=coco \
 SKIP_PRETRAIN=true \
-RESUME=output/coco_tiny_ptq/checkpoint_calibrated.pth \
 QAT_FREEZE_OBSERVERS=true \
 OUTPUT_DIR=output/coco_tiny_qat \
 bash setup/qat/run.sh \
   tiny \
   /path/to/COCO \
-  output/coco_tiny_ptq/checkpoint_calibrated.pth
+  /path/to/ptq/checkpoint
 ```
 
 Set `TENSORBOARD=true` to write TensorBoard events. Set `RESUME_OPTIMIZER=true` only when continuing the same QAT run with a compatible optimizer state.
@@ -184,11 +187,13 @@ Choose the variant that matches how the checkpoint was produced:
 | `qat` | quantized graph after QAT |
 
 ```bash
+NPROC_PER_NODE=1 \
+CUDA_VISIBLE_DEVICES=0 \
 DATASET_FILE=coco OUTPUT_DIR=output/eval_tiny_qat \
 bash setup/eval/run.sh \
   tiny \
   qat \
-  output/coco_tiny_qat/checkpoint.pth \
+  /path/to/checkpoint \
   /path/to/COCO
 ```
 
@@ -201,12 +206,14 @@ path so a filename convention cannot silently select the wrong model.
 Export an ONNX model from a QAT checkpoint:
 
 ```bash
+NPROC_PER_NODE=1 \
+CUDA_VISIBLE_DEVICES=0 \
 QUANT=true \
 OUTPUT_DIR=output/export_tiny_qat \
 bash setup/export/run.sh \
   tiny \
   /path/to/COCO \
-  output/coco_tiny_qat/checkpoint.pth \
+  /path/to/checkpoint \
   --simplify
 ```
 
@@ -294,17 +301,6 @@ LW-DETR/
 ```
 
 New users should start with `setup/`. The commands in `scripts/` preserve experiment configurations but contain machine- and GPU-count assumptions and are not the recommended public interface.
-
-## 7. Common problems
-
-- **CUDA out of memory:** lower `BATCH_SIZE` and/or `NPROC_PER_NODE`.
-- **Checkpoint key or shape mismatch:** confirm the same model size, dataset class IDs, graph type (`original`, `qr`, `ptq`, or `qat`), and optional quantization flags were used to create and load it.
-- **Wrong number of classes:** use `DATASET_FILE=custom_coco`; only use `NUM_CLASSES` when intentionally overriding annotation-derived metadata.
-- **Distributed port already in use:** set a different `MASTER_PORT`, for example `MASTER_PORT=29501`.
-- **TensorRT export failure:** verify that PyTorch, CUDA, ONNX, TensorRT, and the target GPU are mutually compatible.
-- **Need to inspect a generated command:** the fine-tuning and export runners support `DRY_RUN=true`.
-
-For all environment variables, Slurm examples, VisDrone conversion, observer settings, and sweeps, use the [extended setup guide](setup/README.md).
 
 ## License and citation
 
