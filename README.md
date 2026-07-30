@@ -193,8 +193,8 @@ DATASET_FILE=coco OUTPUT_DIR=output/eval_tiny_qat \
 bash setup/eval/run.sh \
   tiny \
   qat \
-  /path/to/checkpoint \
-  /path/to/COCO
+  /path/to/COCO \
+  /path/to/checkpoint
 ```
 
 The evaluator writes `eval.log` and `eval.pth` under

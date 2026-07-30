@@ -309,8 +309,8 @@ checkpoint from the model size or variant:
 ```bash
 DATASET_FILE=coco OUTPUT_DIR=output/eval_coco \
 bash setup/eval/run.sh tiny original \
-  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
-  ../../data/COCO
+  ../../data/COCO \
+  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
 ```
 
 Evaluate a QAT checkpoint by selecting the matching quantized variant and
@@ -319,8 +319,8 @@ passing the exact checkpoint produced by that run:
 ```bash
 DATASET_FILE=coco OUTPUT_DIR=output/eval_coco_tiny_qat \
 bash setup/eval/run.sh tiny qat \
-  output/coco_tiny_qat/checkpoint.pth \
-  ../../data/COCO
+  ../../data/COCO \
+  output/coco_tiny_qat/checkpoint.pth
 ```
 
 Run the command once per checkpoint when comparing model sizes or variants.
@@ -332,8 +332,8 @@ different checkpoint with a conventional filename.
 ```bash
 DATASET_FILE=custom_coco OUTPUT_DIR=output/eval_visdrone \
 bash setup/eval/run.sh small original \
-  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco
+  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
 ```
 
 Submit any evaluation by inserting the Slurm dispatcher:
@@ -341,8 +341,8 @@ Submit any evaluation by inserting the Slurm dispatcher:
 ```bash
 sbatch setup/slurm/run.sh eval \
   tiny original \
-  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth \
-  ../../data/COCO
+  ../../data/COCO \
+  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
 ```
 
 `--checkpoint` is required and must name a checkpoint file. Variants are

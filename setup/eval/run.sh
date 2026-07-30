@@ -8,7 +8,7 @@ source "$script_dir/../common.sh"
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  bash setup/eval/run.sh <tiny|small|medium> <original|qr|ptq|qat> <checkpoint> <dataset_root>
+  bash setup/eval/run.sh <tiny|small|medium> <original|qr|ptq|qat> <dataset_root> <checkpoint>
 
 Environment variables:
   DATASET_FILE       coco or custom_coco. Default: coco
@@ -20,7 +20,7 @@ Environment variables:
   DEVICE             Default: cuda
 
 Example:
-  bash setup/eval/run.sh tiny qat /path/to/checkpoint.pth /path/to/COCO
+  bash setup/eval/run.sh tiny qat /path/to/COCO /path/to/checkpoint.pth
 EOF
 }
 
@@ -31,8 +31,8 @@ fi
 
 export MODEL_SIZE="$1"
 variant="$2"
-checkpoint="$(absolute_existing_path "$3")"
-coco_path="$(absolute_existing_path "$4")"
+coco_path="$(absolute_existing_path "$3")"
+checkpoint="$(absolute_existing_path "$4")"
 export DATASET_FILE="${DATASET_FILE:-coco}"
 
 case "$variant" in

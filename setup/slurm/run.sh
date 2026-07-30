@@ -56,7 +56,7 @@ Examples:
   sbatch setup/slurm/run.sh finetune tiny /path/to/custom-coco
 
   sbatch setup/slurm/run.sh eval \
-    tiny original /path/to/checkpoint.pth /path/to/custom-coco
+    tiny original /path/to/custom-coco /path/to/checkpoint.pth
 
   sbatch setup/slurm/run.sh ptq tiny \
     /path/to/custom-coco /path/to/checkpoint.pth
