@@ -129,12 +129,8 @@ def make_coco_transforms_square_div_64(image_set, encoder="vit_tiny"):
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    if "dinov2" in encoder:
-        scales = [392, 448, 504, 560, 616, 672, 728, 784]
-        square_scale = 560
-    else:
-        scales = [448, 512, 576, 640, 704, 768, 832, 896]
-        square_scale = 640
+    scales = [448, 512, 576, 640, 704, 768, 832, 896]
+    square_scale = 640
 
     if image_set == 'train':
         return T.Compose([

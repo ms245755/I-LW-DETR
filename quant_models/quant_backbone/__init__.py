@@ -6,7 +6,6 @@ from torch import nn
 from util.misc import NestedTensor
 from ..position_encoding import build_position_encoding
 from .quant_backbone import *
-# from .backbone_dinov2 import BackboneDinoV2
 
 
 class Joiner(nn.Sequential):
@@ -63,6 +62,8 @@ def build_backbone(args):
             projector_scale=args.projector_scale,
             observe_stat=args.observe_stat,
         )
+    else:
+        raise ValueError(f"Unsupported encoder: {args.encoder}")
 
     model = Joiner(backbone, position_embedding)
     return model

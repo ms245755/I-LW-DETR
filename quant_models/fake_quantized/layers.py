@@ -7,7 +7,6 @@ torch.set_printoptions(precision=10)
 from .utils import *
 from util.decorators import *
 from dataclasses import dataclass
-from transformers.utils import ModelOutput
 from typing import Optional, Tuple
 
 enable_assert = False
@@ -1657,22 +1656,6 @@ def quant_ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_loca
     sampling_value_list = torch.stack(sampling_value_list, dim=-2).flatten(-2)
     output = (sampling_value_list * attention_weights).sum(-1).view(B, n_heads * head_dim, Len_q)
     return output.transpose(1, 2).contiguous()
- 
-
-@dataclass
-class QuantizedBaseModelOutput(ModelOutput):
-    last_hidden_state: torch.Tensor = None
-    act_scaling_factor: torch.Tensor = None      # ← added
-    hidden_states: Optional[tuple] = None
-    attentions: Optional[tuple] = None
-
-@dataclass
-class QuantizedBaseModelOutputWithPooling(ModelOutput):
-    act_scaling_factor: torch.Tensor = None      # ← added
-    last_hidden_state: torch.FloatTensor = None
-    pooler_output: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
 
 @track_init_args
 class IViTExp(nn.Module):
