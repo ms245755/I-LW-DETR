@@ -24,8 +24,8 @@ Optional environment variables:
   CONFIDENCE_THRESHOLD         Default: 0.5
 
 Examples:
-  bash setup/infer/run.sh tiny qr pretrain_weights/coco/tiny/checkpoint_easy_quant.pth demo/images/catdog.jpg
-  bash setup/infer/run.sh tiny qat pretrain_weights/coco/tiny/lwdetr_tiny_coco_qat.pth demo/images/catdog.jpg
+  bash setup/infer/run.sh tiny qr pretrain_weights/coco/tiny/qrdetr_fp32.pth demo/images/catdog.jpg
+  bash setup/infer/run.sh tiny qat pretrain_weights/coco/tiny/ilwdetr_qat.pth demo/images/catdog.jpg
 EOF
 }
 
@@ -74,12 +74,8 @@ if [[ -f "$checkpoint_root" ]]; then
   checkpoint="$checkpoint_root"
 else
   case "$variant:$model_size" in
-    qr:tiny) checkpoint_name="checkpoint_easy_quant.pth" ;;
-    qr:small) checkpoint_name="checkpoint_easy_quant_small.pth" ;;
-    qr:medium) checkpoint_name="checkpoint_easy_quant_medium.pth" ;;
-    qat:tiny) checkpoint_name="lwdetr_tiny_coco_qat.pth" ;;
-    qat:small) checkpoint_name="lwdetr_small_coco_qat.pth" ;;
-    qat:medium) checkpoint_name="lwdetr_medium_coco_qat.pth" ;;
+    qr:tiny|qr:small|qr:medium) checkpoint_name="qrdetr_fp32.pth" ;;
+    qat:tiny|qat:small|qat:medium) checkpoint_name="ilwdetr_qat.pth" ;;
   esac
   checkpoint="$(resolve_path "$checkpoint_root" "$checkpoint_name" "$variant checkpoint")"
 fi

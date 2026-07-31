@@ -83,10 +83,32 @@ Store checkpoints anywhere outside Git and pass their exact paths to the workflo
 pretrain_weights/
 └── coco/
     └── tiny/
-        └── LWDETR_tiny_60e_coco.pth
+        ├── lwdetr_fp32.pth
+        ├── qrdetr_fp32.pth
+        ├── ilwdetr_ptq.pth
+        └── ilwdetr_qat.pth
 ```
 
 `pretrain_weights/`, `data/`, and `output/` are ignored by Git. They are runtime assets and are not delivered by this repository.
+
+Published COCO and VisDrone checkpoints are available from the
+[I-LW-DETR checkpoint repository](https://huggingface.co/ltc286648/i-lw-detr-checkpoints):
+
+| Dataset | Tiny | Small | Medium |
+| --- | --- | --- | --- |
+| COCO | [Files](https://huggingface.co/ltc286648/i-lw-detr-checkpoints/tree/main/coco/tiny) | [Files](https://huggingface.co/ltc286648/i-lw-detr-checkpoints/tree/main/coco/small) | [Files](https://huggingface.co/ltc286648/i-lw-detr-checkpoints/tree/main/coco/medium) |
+| VisDrone | [Files](https://huggingface.co/ltc286648/i-lw-detr-checkpoints/tree/main/visdrone/tiny) | [Files](https://huggingface.co/ltc286648/i-lw-detr-checkpoints/tree/main/visdrone/small) | [Files](https://huggingface.co/ltc286648/i-lw-detr-checkpoints/tree/main/visdrone/medium) |
+
+Each directory uses the same filenames where the corresponding checkpoint is
+available: `lwdetr_fp32.pth` for the original float model, `qrdetr_fp32.pth`
+for the quantization-ready float model, `ilwdetr_ptq.pth` for PTQ, and
+`ilwdetr_qat.pth` for QAT. Download a file with:
+
+```bash
+hf download ltc286648/i-lw-detr-checkpoints \
+  coco/tiny/lwdetr_fp32.pth \
+  --local-dir pretrain_weights
+```
 
 For VisDrone conversion and class-ID details, see the [extended setup guide](setup/README.md#custom-coco-format-datasets).
 
@@ -98,7 +120,7 @@ The shortest validation path uses a quantization-ready (`qr`) or QAT checkpoint:
 bash setup/infer/run.sh \
   tiny \
   qat \
-  /path/to/lwdetr_tiny_qat.pth \
+  /path/to/ilwdetr_qat.pth \
   demo/images/objects.jpg
 ```
 
@@ -128,7 +150,7 @@ OUTPUT_DIR=output/coco_tiny_easy_quant \
 bash setup/finetune/run.sh \
   tiny \
   /path/to/COCO \
-  /path/to/LWDETR_tiny_60e_coco.pth
+  /path/to/lwdetr_fp32.pth
 ```
 
 Expected output: `output/coco_tiny_easy_quant/checkpoint.pth`, periodic checkpoints, and `log.txt` after at least one epoch finishes. Console output is captured by your terminal or Slurm `-o` file.
@@ -221,9 +243,27 @@ Expected output: `output/export_tiny_qat/inference_model.onnx` and, when simplif
 
 ### Optional — adapt COCO to VisDrone first
 
-For a custom dataset such as VisDrone, first fine-tune the original COCO
-checkpoint on the custom COCO-format annotations. This creates the float
-VisDrone checkpoint that becomes the starting point for Step A:
+First convert the original VisDrone DET train and validation splits to the
+COCO directory structure expected by LW-DETR. Use `--class-mode visdrone` to
+preserve all ten native VisDrone classes:
+
+```bash
+python3 util/convert_visdrone_to_coco.py \
+  /path/to/VisDrone2019-DET-val \
+  /path/to/VisDrone2019-DET-coco \
+  --train-root /path/to/VisDrone2019-DET-train \
+  --class-mode visdrone
+```
+
+Each source split must contain `images/` and `annotations/`. The command
+creates `train2017/`, `val2017/`, `annotations/instances_train2017.json`, and
+`annotations/instances_val2017.json` under the output path. It uses image
+symlinks by default; add `--image-mode copy` if the converted dataset must be
+self-contained, or `--overwrite` to replace an existing output directory.
+
+Then fine-tune the original COCO checkpoint on the converted dataset. This
+creates the float VisDrone checkpoint that becomes the starting point for
+Step A:
 
 ```bash
 DATASET_FILE=custom_coco \
@@ -241,7 +281,7 @@ BATCH_SIZE=2 \
 bash setup/finetune/run.sh \
   medium \
   /path/to/VisDrone2019-DET-coco \
-  /path/to/LWDETR_medium_60e_coco.pth
+  /path/to/lwdetr_fp32.pth
 ```
 
 After this finishes, repeat Steps A through E with
@@ -249,7 +289,89 @@ After this finishes, repeat Steps A through E with
 `output/visdrone_medium_finetune_from_coco_cosine/checkpoint.pth` as the
 starting checkpoint.
 
-## 5. Results and reproducibility
+## 5. Run the workflows with Slurm
+
+`setup/slurm/run.sh` dispatches the same fine-tuning, PTQ, QAT, and evaluation
+commands through `srun`. Submit jobs from the repository root so the wrapper
+can find `main.py`, and create the directory used by `sbatch -o` first:
+
+```bash
+mkdir -p logs/coco
+```
+
+### Fine-tuning
+
+```bash
+CONDA_ENV=lwdetr \
+DATASET_FILE=coco \
+EASY_QUANTIZE=true \
+KEEP_CLASS_HEAD=true \
+OUTPUT_DIR=output/coco_tiny_easy_quant \
+sbatch -o logs/coco/tiny_finetune_%j.log \
+  setup/slurm/run.sh finetune \
+  tiny \
+  /path/to/COCO \
+  /path/to/lwdetr_fp32.pth
+```
+
+### PTQ calibration
+
+```bash
+CONDA_ENV=lwdetr \
+DATASET_FILE=coco \
+OUTPUT_DIR=output/coco_tiny_ptq \
+sbatch -o logs/coco/tiny_ptq_%j.log \
+  setup/slurm/run.sh ptq \
+  tiny \
+  /path/to/COCO \
+  output/coco_tiny_easy_quant/checkpoint.pth
+```
+
+### QAT
+
+```bash
+CONDA_ENV=lwdetr \
+DATASET_FILE=coco \
+SKIP_PRETRAIN=true \
+QAT_FREEZE_OBSERVERS=true \
+OUTPUT_DIR=output/coco_tiny_qat \
+sbatch -o logs/coco/tiny_qat_%j.log \
+  setup/slurm/run.sh qat \
+  tiny \
+  /path/to/COCO \
+  output/coco_tiny_ptq/checkpoint_calibrated.pth
+```
+
+### Evaluation
+
+```bash
+CONDA_ENV=lwdetr \
+DATASET_FILE=coco \
+OUTPUT_DIR=output/eval_tiny_qat \
+sbatch -o logs/coco/tiny_eval_%j.log \
+  setup/slurm/run.sh eval \
+  tiny \
+  qat \
+  /path/to/COCO \
+  output/coco_tiny_qat/checkpoint.pth
+```
+
+The wrapper derives `NPROC_PER_NODE` from the Slurm GPU allocation and derives
+`MASTER_PORT` from the job ID. Override cluster resources with ordinary Slurm
+options, for example:
+
+```bash
+sbatch --partition=gpu80G --gres=gpu:4 \
+  setup/slurm/run.sh ptq tiny /path/to/COCO /path/to/checkpoint.pth
+```
+
+Useful wrapper settings are `CONDA_ENV`, `CONDA_SH`, `REPO_ROOT`,
+`FACTORY_SETUP`, and `SLURM_WRAPPER_DRY_RUN=true`. If the repository is not the
+submission directory, set `REPO_ROOT=/absolute/path/to/LW-DETR`. See the
+[extended Slurm guide](setup/README.md#4-run-through-slurm) for custom-dataset
+examples and cluster-specific details.
+
+## 6. Results and reproducibility
 
 Evaluation reports standard COCO mAP metrics.
 
@@ -282,7 +404,7 @@ Before external release, tie each row to the exact checkpoint hash, dataset vers
 
 The original LW-DETR architecture and upstream results are summarized in [figures/LW_DETR_main_results.pdf](figures/LW_DETR_main_results.pdf).
 
-## 6. Repository map
+## 7. Repository map
 
 ```text
 LW-DETR/

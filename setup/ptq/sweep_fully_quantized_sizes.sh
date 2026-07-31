@@ -282,9 +282,7 @@ easy_quant_checkpoint_for_size() {
   fi
 
   case "$model_size" in
-    tiny) filename="checkpoint_easy_quant.pth" ;;
-    small) filename="checkpoint_easy_quant_small.pth" ;;
-    medium) filename="checkpoint_easy_quant_medium.pth" ;;
+    tiny|small|medium) filename="qrdetr_fp32.pth" ;;
     *)
       echo "Unsupported MODEL_SIZE for easy-quant checkpoint: $model_size" >&2
       return 2

@@ -95,7 +95,7 @@ EPOCHS=40 \
 bash setup/finetune/run.sh \
   tiny \
   ../../data/COCO \
-  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
+  pretrain_weights/coco/tiny/lwdetr_fp32.pth
 ```
 
 ### Custom-dataset original fine-tuning
@@ -121,7 +121,7 @@ BATCH_SIZE=2 \
 bash setup/finetune/run.sh \
   medium \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  pretrain_weights/coco/medium/LWDETR_medium_60e_coco.pth
+  pretrain_weights/coco/medium/lwdetr_fp32.pth
 ```
 
 To continue from a checkpoint already trained on the same custom classes:
@@ -181,7 +181,7 @@ OUTPUT_DIR=output/visdrone_small_easy_quant \
 bash setup/finetune/run.sh \
   small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
+  pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
 The existing classification and box heads are loaded. The newly introduced
@@ -195,7 +195,7 @@ Use the generic export wrapper instead of the model-specific scripts:
 bash setup/export/run.sh \
   tiny \
   ../../data/COCO \
-  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
+  pretrain_weights/coco/tiny/lwdetr_fp32.pth
 ```
 
 Pass normal `export_model` options after the checkpoint:
@@ -210,7 +210,7 @@ variant:
 
 ```bash
 EASY_QUANTIZE=true \
-bash setup/export/run.sh tiny ../../data/COCO /path/to/checkpoint_easy_quant.pth --simplify
+bash setup/export/run.sh tiny ../../data/COCO /path/to/qrdetr_fp32.pth --simplify
 ```
 
 For fully quantized checkpoints, use the quant export wrapper:
@@ -260,7 +260,7 @@ sbatch \
   setup/slurm/run.sh finetune \
   small \
   ../../data/COCO \
-  pretrain_weights/coco/small/LWDETR_small_60e_coco.pth
+  pretrain_weights/coco/small/lwdetr_fp32.pth
 ```
 
 Custom-dataset example:
@@ -285,7 +285,7 @@ sbatch \
   setup/slurm/run.sh finetune \
   medium \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  pretrain_weights/coco/medium/LWDETR_medium_60e_coco.pth
+  pretrain_weights/coco/medium/lwdetr_fp32.pth
 ```
 
 Override resources with normal `sbatch` options:
@@ -310,7 +310,7 @@ checkpoint from the model size or variant:
 DATASET_FILE=coco OUTPUT_DIR=output/eval_coco \
 bash setup/eval/run.sh tiny original \
   ../../data/COCO \
-  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
+  pretrain_weights/coco/tiny/lwdetr_fp32.pth
 ```
 
 Evaluate a QAT checkpoint by selecting the matching quantized variant and
@@ -333,7 +333,7 @@ different checkpoint with a conventional filename.
 DATASET_FILE=custom_coco OUTPUT_DIR=output/eval_visdrone \
 bash setup/eval/run.sh small original \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
+  pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
 Submit any evaluation by inserting the Slurm dispatcher:
@@ -342,7 +342,7 @@ Submit any evaluation by inserting the Slurm dispatcher:
 sbatch setup/slurm/run.sh eval \
   tiny original \
   ../../data/COCO \
-  pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
+  pretrain_weights/coco/tiny/lwdetr_fp32.pth
 ```
 
 `--checkpoint` is required and must name a checkpoint file. Variants are
@@ -372,7 +372,7 @@ checkpoints. It plots ground truth on the left and predictions on the right:
 ```bash
 python demo/visualize_custom_detections.py \
   --model-size small \
-  --checkpoint pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth \
+  --checkpoint pretrain_weights/visdrone/small/lwdetr_fp32.pth \
   --data-path /home/data/dataset/Objects365/VisDrone2019-DET-coco \
   --num-images 10 \
   --score-threshold 0.5
@@ -424,7 +424,7 @@ CALIB_BATCHES=500 \
 bash setup/ptq/run.sh \
   small \
   ../../data/COCO \
-  pretrain_weights/coco/small/LWDETR_small_60e_coco.pth
+  pretrain_weights/coco/small/lwdetr_fp32.pth
 ```
 
 The calibrated checkpoint is written to:
@@ -453,7 +453,7 @@ DATASET_FILE=coco \
 OUTPUT_DIR=output/coco_small_ptq \
 sbatch setup/slurm/run.sh ptq small \
   ../../data/COCO \
-  pretrain_weights/coco/small/LWDETR_small_60e_coco.pth
+  pretrain_weights/coco/small/lwdetr_fp32.pth
 
 DATASET_FILE=coco \
 SKIP_PRETRAIN=true \
@@ -475,7 +475,7 @@ CALIB_BATCHES=500 \
 bash setup/ptq/run.sh \
   small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
+  pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
 The default output checkpoint is:
@@ -493,7 +493,7 @@ sbatch \
   -o logs/vis_drone/ptq_small_%j.txt \
   setup/slurm/run.sh ptq small \
   /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  pretrain_weights/visdrone/small/lwdetr_small_visdrone_original.pth
+  pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
 ### Custom-dataset QAT example
@@ -538,9 +538,9 @@ If it is a directory, the scripts look for these files:
 
 | Model size | Resume checkpoint | Pretrained encoder | Pretrain weights |
 | --- | --- | --- | --- |
-| `tiny` | `LWDETR_tiny_60e_coco.pth` | `caev2_tiny_300e_objects365.pth` | `LWDETR_tiny_30e_objects365.pth` |
-| `small` | `LWDETR_small_60e_coco.pth` | `caev2_tiny_300e_objects365.pth` | `LWDETR_small_60e_coco.pth` |
-| `medium` | `LWDETR_medium_60e_coco.pth` | `caev2_small_300e_objects365.pth` | `LWDETR_medium_60e_coco.pth` |
+| `tiny` | `lwdetr_fp32.pth` | `caev2_tiny_300e_objects365.pth` | `LWDETR_tiny_30e_objects365.pth` |
+| `small` | `lwdetr_fp32.pth` | `caev2_tiny_300e_objects365.pth` | `lwdetr_fp32.pth` |
+| `medium` | `lwdetr_fp32.pth` | `caev2_small_300e_objects365.pth` | `lwdetr_fp32.pth` |
 
 Override paths explicitly when needed:
 

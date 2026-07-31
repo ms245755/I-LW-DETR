@@ -11,7 +11,7 @@ Usage:
   bash setup/export/run.sh <tiny|small|medium> <coco_path> <checkpoint> [export_model args]
 
 Examples:
-  bash setup/export/run.sh tiny ../../data/COCO pretrain_weights/coco/tiny/LWDETR_tiny_60e_coco.pth
+  bash setup/export/run.sh tiny ../../data/COCO pretrain_weights/coco/tiny/lwdetr_fp32.pth
   bash setup/export/run.sh small ../../data/COCO /path/to/checkpoint.pth --simplify
   bash setup/export/run.sh medium ../../data/COCO /path/to/checkpoint.pth --simplify --trt
 

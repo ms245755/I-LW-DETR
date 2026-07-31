@@ -45,7 +45,7 @@ configure_model_size() {
       lr_vit_layer_decay="${LR_VIT_LAYER_DECAY:-0.8}"
       lr_component_decay="${LR_COMPONENT_DECAY:-0.7}"
       nproc_per_node="${NPROC_PER_NODE:-4}"
-      resume_name="LWDETR_tiny_60e_coco.pth"
+      resume_name="lwdetr_fp32.pth"
       pretrained_encoder_name="caev2_tiny_300e_objects365.pth"
       pretrain_weights_name="LWDETR_tiny_30e_objects365.pth"
       ;;
@@ -67,9 +67,9 @@ configure_model_size() {
       lr_vit_layer_decay="${LR_VIT_LAYER_DECAY:-0.8}"
       lr_component_decay="${LR_COMPONENT_DECAY:-0.7}"
       nproc_per_node="${NPROC_PER_NODE:-8}"
-      resume_name="LWDETR_small_60e_coco.pth"
+      resume_name="lwdetr_fp32.pth"
       pretrained_encoder_name="caev2_tiny_300e_objects365.pth"
-      pretrain_weights_name="LWDETR_small_60e_coco.pth"
+      pretrain_weights_name="lwdetr_fp32.pth"
       ;;
     medium)
       encoder="vit_small"
@@ -89,9 +89,9 @@ configure_model_size() {
       lr_vit_layer_decay="${LR_VIT_LAYER_DECAY:-0.7}"
       lr_component_decay="${LR_COMPONENT_DECAY:-0.7}"
       nproc_per_node="${NPROC_PER_NODE:-8}"
-      resume_name="LWDETR_medium_60e_coco.pth"
+      resume_name="lwdetr_fp32.pth"
       pretrained_encoder_name="caev2_small_300e_objects365.pth"
-      pretrain_weights_name="LWDETR_medium_60e_coco.pth"
+      pretrain_weights_name="lwdetr_fp32.pth"
       ;;
     *)
       echo "Unsupported MODEL_SIZE: $model_size" >&2
