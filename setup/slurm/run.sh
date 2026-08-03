@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=lwdetr
 #SBATCH --time=150:00:00
-#SBATCH --partition=gpu80G
+#SBATCH --partition=gpu40G
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 
