@@ -1,0 +1,14 @@
+numpy
+onnx
+onnxsim
+onnxruntime
+onnx_graphsurgeon
+Pillow
+polygraphy
+pycocotools
+torch>=1.13.0
+torchvision>=0.14.0
+tqdm
+
+# Required for TensorRT engine build/benchmarking:
+tensorrt>=8.6.1
