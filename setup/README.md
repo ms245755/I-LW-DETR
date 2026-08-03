@@ -57,12 +57,16 @@ from the category IDs and verifies that train and validation IDs agree.
 VisDrone is one example. To preserve its ten native classes:
 
 ```bash
-python util/convert_visdrone_to_coco.py \
-  /home/data/dataset/Objects365/VisDrone2019-DET-test-dev \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
-  --train-root /home/data/dataset/Objects365/VisDrone2019-DET-train/VisDrone2019-DET-train \
+python3 util/convert_visdrone_to_coco.py \
+  /path/to/detection/VisDrone_original/VisDrone2019-DET-test-dev \
+  /path/to/detection/VisDrone-coco-style \
+  --train-root /path/to/detection/VisDrone_original/VisDrone2019-DET-train/VisDrone2019-DET-train \
   --class-mode visdrone
 ```
+
+When the adapted converter is stored directly under `detection/`, run
+`python3 convert_visdrone_to_coco.py --overwrite` from that directory to use
+its relative defaults.
 
 Add `--overwrite` to regenerate an existing output. Native VisDrone category
 IDs are `1` through `10`, so the model uses an 11-logit head with unused ID
@@ -120,7 +124,7 @@ CLASS_HEAD_WARMUP_EPOCHS=5 \
 BATCH_SIZE=2 \
 bash setup/finetune/run.sh \
   medium \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   pretrain_weights/coco/medium/lwdetr_fp32.pth
 ```
 
@@ -134,7 +138,7 @@ CLASS_HEAD_WARMUP_EPOCHS=0 \
 OUTPUT_DIR=output/visdrone_small_continue \
 bash setup/finetune/run.sh \
   small \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   /path/to/visdrone_checkpoint.pth
 ```
 
@@ -180,7 +184,7 @@ DATASET_FILE=custom_coco \
 OUTPUT_DIR=output/visdrone_small_easy_quant \
 bash setup/finetune/run.sh \
   small \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
@@ -284,7 +288,7 @@ sbatch \
   -o logs/vis_drone/medium_finetune_%j.txt \
   setup/slurm/run.sh finetune \
   medium \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   pretrain_weights/coco/medium/lwdetr_fp32.pth
 ```
 
@@ -332,7 +336,7 @@ different checkpoint with a conventional filename.
 ```bash
 DATASET_FILE=custom_coco OUTPUT_DIR=output/eval_visdrone \
 bash setup/eval/run.sh small original \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
@@ -373,7 +377,7 @@ checkpoints. It plots ground truth on the left and predictions on the right:
 python demo/visualize_custom_detections.py \
   --model-size small \
   --checkpoint pretrain_weights/visdrone/small/lwdetr_fp32.pth \
-  --data-path /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  --data-path /path/to/detection/VisDrone-coco-style \
   --num-images 10 \
   --score-threshold 0.5
 ```
@@ -474,7 +478,7 @@ OUTPUT_DIR=output/visdrone_small_ptq \
 CALIB_BATCHES=500 \
 bash setup/ptq/run.sh \
   small \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
@@ -492,7 +496,7 @@ OUTPUT_DIR=output/visdrone_small_ptq \
 sbatch \
   -o logs/vis_drone/ptq_small_%j.txt \
   setup/slurm/run.sh ptq small \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   pretrain_weights/visdrone/small/lwdetr_fp32.pth
 ```
 
@@ -507,7 +511,7 @@ RESUME=output/visdrone_small_ptq/checkpoint_calibrated.pth \
 OUTPUT_DIR=output/visdrone_small_qat \
 bash setup/qat/run.sh \
   small \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   output/visdrone_small_ptq/checkpoint_calibrated.pth
 ```
 
@@ -521,7 +525,7 @@ OUTPUT_DIR=output/visdrone_small_qat \
 sbatch \
   -o logs/vis_drone/qat_small_%j.txt \
   setup/slurm/run.sh qat small \
-  /home/data/dataset/Objects365/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   output/visdrone_small_ptq/checkpoint_calibrated.pth
 ```
 

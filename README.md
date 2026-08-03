@@ -249,10 +249,18 @@ preserve all ten native VisDrone classes:
 
 ```bash
 python3 util/convert_visdrone_to_coco.py \
-  /path/to/VisDrone2019-DET-val \
-  /path/to/VisDrone2019-DET-coco \
-  --train-root /path/to/VisDrone2019-DET-train \
+  /path/to/detection/VisDrone_original/VisDrone2019-DET-test-dev \
+  /path/to/detection/VisDrone-coco-style \
+  --train-root /path/to/detection/VisDrone_original/VisDrone2019-DET-train/VisDrone2019-DET-train \
   --class-mode visdrone
+```
+
+If the adapted converter is stored directly in the `detection/` directory,
+its relative defaults provide the same result:
+
+```bash
+cd /path/to/detection
+python3 convert_visdrone_to_coco.py --overwrite
 ```
 
 Each source split must contain `images/` and `annotations/`. The command
@@ -280,7 +288,7 @@ CLASS_HEAD_WARMUP_EPOCHS=5 \
 BATCH_SIZE=2 \
 bash setup/finetune/run.sh \
   medium \
-  /path/to/VisDrone2019-DET-coco \
+  /path/to/detection/VisDrone-coco-style \
   /path/to/lwdetr_fp32.pth
 ```
 

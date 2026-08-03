@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert VisDrone DET annotations to the COCO layout expected by LW-DETR.
 
-The default ``coco`` mode maps only reasonably compatible COCO classes:
+The optional ``coco`` mode maps only reasonably compatible COCO classes:
 
     pedestrian, people -> person
     bicycle            -> bicycle
@@ -13,13 +13,11 @@ The default ``coco`` mode maps only reasonably compatible COCO classes:
 VisDrone's tricycle and awning-tricycle classes are ignored by default. Pass
 --map-tricycles-to-motorcycle to include them as COCO motorcycle instances.
 
-Use ``--class-mode visdrone`` for native VisDrone training/evaluation. That
-keeps all ten evaluated VisDrone classes with IDs 1 through 10.
-
-By default, this produces both train2017 and val2017 from the positional
-VisDrone split because LW-DETR constructs both datasets even with --eval.
-Pass --train-root to use a separate VisDrone train split for train2017 while
-the positional split (normally val or test-dev) becomes val2017.
+Native VisDrone mode is the default and keeps all ten evaluated classes with
+IDs 1 through 10. With the standard project layout, the default paths convert
+``data/detection/VisDrone_original`` into
+``data/detection/VisDrone-coco-style``. Set ``DETECTION_DATA_ROOT`` or pass
+explicit paths when the data directory is elsewhere.
 """
 
 import argparse
@@ -76,34 +74,58 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
 def parse_args():
+    repository_root = Path(__file__).resolve().parent.parent
+    configured_data_root = os.environ.get("DETECTION_DATA_ROOT")
+    detection_root = (
+        Path(configured_data_root).expanduser()
+        if configured_data_root
+        else repository_root.parent.parent / "data" / "detection"
+    )
+    original_root = detection_root / "VisDrone_original"
+    default_validation_root = original_root / "VisDrone2019-DET-test-dev"
+    default_train_root = (
+        original_root
+        / "VisDrone2019-DET-train"
+        / "VisDrone2019-DET-train"
+    )
+    default_output_root = detection_root / "VisDrone-coco-style"
+
     parser = argparse.ArgumentParser(
         description="Convert VisDrone DET labels to an LW-DETR-compatible COCO dataset."
     )
     parser.add_argument(
         "visdrone_root",
+        nargs="?",
         type=Path,
-        help="VisDrone validation/test-dev split containing images/ and annotations/.",
+        default=default_validation_root,
+        help=(
+            "VisDrone validation/test-dev split containing images/ and annotations/ "
+            f"(default: {default_validation_root})."
+        ),
     )
     parser.add_argument(
         "output_root",
+        nargs="?",
         type=Path,
-        help="Destination COCO root to create.",
+        default=default_output_root,
+        help=f"Destination COCO root to create (default: {default_output_root}).",
     )
     parser.add_argument(
         "--class-mode",
         choices=("coco", "visdrone"),
-        default="coco",
+        default="visdrone",
         help=(
             "Use overlapping COCO classes or all 10 native VisDrone classes "
-            "(default: coco)."
+            "(default: visdrone)."
         ),
     )
     parser.add_argument(
         "--train-root",
         type=Path,
+        default=default_train_root,
         help=(
-            "Optional VisDrone train split containing images/ and annotations/. "
-            "Without this, the positional split is reused for train2017."
+            "VisDrone train split containing images/ and annotations/ "
+            f"(default: {default_train_root})."
         ),
     )
     parser.add_argument(
