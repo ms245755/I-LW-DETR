@@ -439,14 +439,17 @@ The code is released under the [Apache License 2.0](LICENSE).
 If this repository is useful for your work, please cite:
 
 ```bibtex
-@misc{le2026enablingfullyintegeronlyinference,
-      title={Enabling Fully Integer-Only Inference for Lightweight Detection Transformers}, 
-      author={Thanh Cong Le and Michal Szczepanski and Martyna Poreba},
-      year={2026},
-      eprint={2607.24981},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2607.24981}, 
+@article{LE2026104092,
+  title = {Enabling fully integer-only inference for lightweight detection transformers},
+  journal = {Journal of Systems Architecture},
+  pages = {104092},
+  year = {2026},
+  issn = {1383-7621},
+  doi = {10.1016/j.sysarc.2026.104092},
+  url = {https://www.sciencedirect.com/science/article/pii/S1383762126004108},
+  author = {Thanh Cong Le and Michal Szczepanski and Martyna Poreba},
+  keywords = {ViT, Object detection, DETR, Quantization, Integer},
+  abstract = {Vision Transformer detectors now approach the accuracy of CNNs but remain difficult to deploy on NPUs and microcontrollers because key components, including deformable attention, feature fusion, and nonlinear activation functions, are not natively compatible with integer arithmetic. Existing quantized detectors often retain operators such as Softmax, GELU, and LayerNorm in floating point Deformable, multi-scale detection transformers therefore still lack an end-to-end integer implementation. We address this gap with I-LW-DETR, the first fully integer-only lightweight DETR, in which every operation in the forward pass, including transformer nonlinearities, is executed in integer arithmetic. I-LW-DETR is built upon three key components: a scale-preserving split convolution that assigns independent activation scale to each branch of the multi-scale projector; SD-ShiftGELU, a sign-dependent GELU approximation that preserves element-wise behavior the accuracy collapse of the original ShiftGELU; and a constrained Shiftmax that maintains stable Softmax normalization. Experimental results demonstrate that the proposed quantization pipeline consistently produces efficient fully integer-only models across different model scales. Across all model scales, the proposed pipeline incurs only a moderate accuracy degradation while reducing the model size by approximately 3.6× and the computational cost by more than one order of magnitude. Code will be available at github.com/ltc286648/I-LW-DETR}
 }
 ```
 
