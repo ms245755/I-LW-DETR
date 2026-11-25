@@ -1,5 +1,4 @@
 .nfs*
-*.ipynb
 *.pyc
 .dumbo.json
 .DS_Store
@@ -25,5 +24,5 @@ plot*.py
 *.pth
 output/
 data/
-experiments/
 observation/
+experiments/sd_components/
